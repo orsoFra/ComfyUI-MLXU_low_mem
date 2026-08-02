@@ -29,6 +29,7 @@ _WEB_DIRECTORY = "web"
 _DISPLAY = {
     # Core
     "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
+    "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
     "ASDX_DualCLIPLoader": "🍏 ASDX Dual CLIP Loader",
     "ASDX_CLIPTextEncodeFlux": "🍏 ASDX CLIP Text Encode FLUX",
     "ASDX_MLXSampler": "🍏 ASDX MLX Native Sampler",

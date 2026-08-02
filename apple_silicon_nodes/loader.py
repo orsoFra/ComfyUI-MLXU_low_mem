@@ -20,7 +20,7 @@ import mlx.core as mx
 import torch
 
 from . import bridge
-from .native import FluxConfig, FluxTransformer
+from .native import FluxConfig, FluxTransformer, load_transformer
 
 
 # ── Globals ───────────────────────────────────────────────────────────
@@ -106,9 +106,8 @@ class ASDX_DiffusionLoader:
             guidance_embed=(model_type == "dev"),
         )
 
-        # For now, create an empty transformer (weights loaded separately)
-        # In production, this would call native.load_transformer(path)
-        transformer = FluxTransformer(config)
+        # Load transformer weights from checkpoint
+        transformer = load_transformer(path, dtype=precision)
 
         # Create model descriptor
         model_desc = {
@@ -159,8 +158,126 @@ class ASDX_DiffusionLoader:
 
 NODE_CLASS_MAPPINGS = {
     "ASDX_DiffusionLoader": ASDX_DiffusionLoader,
+    "ASDX_CheckpointLoader": ASDX_CheckpointLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
+    "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
 }
+
+
+# ── Checkpoint Loader ────────────────────────────────────────────────────
+
+class ASDX_CheckpointLoader:
+    """Load a full checkpoint (VAE + CLIP + Diffusion) into MLX.
+
+    Reads the checkpoint, creates MLX model handles for the diffusion
+    transformer, text encoders, and VAE. Returns handles that can be
+    passed to the sampler and conditioning nodes.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ckpt_name": (cls._get_checkpoints(),),
+                "precision": (["float16", "bfloat16"], {"default": "float16"}),
+            },
+        }
+
+    RETURN_TYPES = ("asdx_model", "mlx_clip", "mlx_vae")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load"
+    CATEGORY = "ASDX/Loaders"
+
+    @staticmethod
+    def _get_checkpoints() -> list[str]:
+        """Get list of available checkpoint files."""
+        try:
+            import folder_paths
+            checkpoints = []
+            for folder in ("checkpoints", "diffusion_models"):
+                try:
+                    checkpoints.extend(folder_paths.get_filename_list(folder))
+                except Exception:
+                    pass
+            if checkpoints:
+                return checkpoints
+        except Exception:
+            pass
+        return ["flux1-dev-fp16.safetensors"]
+
+    def load(self, ckpt_name: str, precision: str) -> tuple[dict, dict, dict]:
+        t0 = time.perf_counter()
+
+        # Resolve checkpoint path
+        path = self._resolve_checkpoint_path(ckpt_name)
+        model_type = _model_type_from_path(path)
+
+        # Load diffusion model
+        config = FluxConfig(
+            dtype=precision,
+            guidance_embed=(model_type == "dev"),
+        )
+        transformer = load_transformer(path, dtype=precision)
+
+        # Create model descriptor
+        model_desc = {
+            "type": "asdx_model",
+            "name": ckpt_name,
+            "path": str(path),
+            "transformer": transformer,
+            "config": config,
+            "model_type": model_type,
+            "precision": precision,
+        }
+
+        # Create placeholder CLIP handle (text encoding handled by DualCLIPLoader)
+        clip_desc = {
+            "type": "flux1",
+            "cache_key": str(path),
+            "model_path": str(path),
+            "clip_l": None,
+            "t5xxl": None,
+        }
+
+        # Create placeholder VAE handle (VAE encode/decode handled separately)
+        vae_desc = {
+            "type": "flux_vae",
+            "cache_key": str(path),
+            "model_path": str(path),
+            "dtype": precision,
+        }
+
+        load_time = time.perf_counter() - t0
+        mem = bridge.collect_mlx_memory()
+        print(f"[ASDX] Checkpoint loaded: {ckpt_name} in {load_time:.1f}s "
+              f"(type={model_type}, precision={precision}, "
+              f"mem={mem['active_gb']:.1f}GB active, {mem['cache_gb']:.1f}GB cache)")
+
+        return (model_desc, clip_desc, vae_desc)
+
+    @staticmethod
+    def _resolve_checkpoint_path(name: str) -> Path:
+        """Resolve checkpoint name to a file path."""
+        try:
+            import folder_paths
+            for folder in ("checkpoints", "diffusion_models"):
+                try:
+                    full = folder_paths.get_full_path(folder, name)
+                    if full:
+                        return Path(full)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fallback: check common locations
+        for candidate in (
+            Path.home() / "ComfyUI" / "models" / "checkpoints" / name,
+            Path.home() / "ComfyUI" / "models" / "diffusion_models" / name,
+            Path(name),
+        ):
+            if candidate.exists():
+                return candidate
+        return Path(name)
