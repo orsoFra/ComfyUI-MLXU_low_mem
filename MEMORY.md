@@ -1,0 +1,1 @@
+- [Session state: advanced features integration] -session-state.md - Key decisions and current state
