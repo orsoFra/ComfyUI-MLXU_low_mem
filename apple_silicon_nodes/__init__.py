@@ -51,6 +51,15 @@ _DISPLAY = {
     "ASDX_IPAdapterLoader": "🍏 ASDX IP-Adapter Loader",
     "ASDX_IPAdapterCLIPVisionEncode": "🍏 ASDX CLIP Vision Encode",
     "ASDX_ApplyIPAdapter": "🍏 ASDX Apply IP-Adapter",
+    # Image Chain
+    "ASDX_ImageToLatent": "🍏 ASDX Image → Latent",
+    "ASDX_MaskFromImage": "🍏 ASDX Mask From Image",
+    "ASDX_MaskBlur": "🍏 ASDX Mask Blur",
+    "ASDX_ImageCompositor": "🍏 ASDX Image Compositor",
+    # Depth
+    "ASDX_DepthMap": "🍏 ASDX Depth Map",
+    # Utilities
+    "ASDX_LivePreview": "🍏 ASDX Live Preview",
 }
 
 # ── Lazy import with graceful fallback ────────────────────────────────
@@ -74,6 +83,28 @@ try:
     from .ip_adapter import NODE_CLASS_MAPPINGS as _ip_maps
     from .ip_adapter import NODE_DISPLAY_NAME_MAPPINGS as _ip_names
 
+    # Optional: image chain, depth map, live preview
+    try:
+        from .image_chain import NODE_CLASS_MAPPINGS as _chain_maps
+        from .image_chain import NODE_DISPLAY_NAME_MAPPINGS as _chain_names
+    except Exception:
+        _chain_maps = {}
+        _chain_names = {}
+
+    try:
+        from .depth_map import NODE_CLASS_MAPPINGS as _depth_maps
+        from .depth_map import NODE_DISPLAY_NAME_MAPPINGS as _depth_names
+    except Exception:
+        _depth_maps = {}
+        _depth_names = {}
+
+    try:
+        from .live_preview import NODE_CLASS_MAPPINGS as _preview_maps
+        from .live_preview import NODE_DISPLAY_NAME_MAPPINGS as _preview_names
+    except Exception:
+        _preview_maps = {}
+        _preview_names = {}
+
     NODE_CLASS_MAPPINGS = {
         **_loader_maps,
         **_cond_maps,
@@ -84,6 +115,9 @@ try:
         **_lora_maps,
         **_cn_maps,
         **_ip_maps,
+        **_chain_maps,
+        **_depth_maps,
+        **_preview_maps,
     }
     NODE_DISPLAY_NAME_MAPPINGS = {
         **_loader_names,
@@ -95,12 +129,15 @@ try:
         **_lora_names,
         **_cn_names,
         **_ip_names,
+        **_chain_names,
+        **_depth_names,
+        **_preview_names,
     }
 except ModuleNotFoundError as exc:
     # Allow import on non-macOS / non-MLX hosts (e.g. CI, Comfy Registry parser)
     _missing = {
         "mlx", "numpy", "torch", "PIL", "safetensors", "gguf",
-        "huggingface_hub", "transformers",
+        "huggingface_hub", "transformers", "comfy", "folder_paths",
     }
     if exc.name in _missing:
         # Provide stub nodes that error at runtime with a helpful message

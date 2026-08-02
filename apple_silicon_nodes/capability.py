@@ -1,0 +1,226 @@
+"""Capability profiles for mflux-AnyModel-inspired model dispatch.
+
+Each diffusion model family has a CapabilityProfile that declares which
+parameters its generate_image() / predict() method accepts. The sampler
+reads this profile to filter parameters, warn about dropped ones, and
+block invalid ones — mirroring the CapabilityProfile pattern from
+ComfyUI-mflux-AnyModel.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# ── CapabilityProfile ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CapabilityProfile:
+    """Describes what parameters a model family supports.
+
+    Mirrors the CapabilityProfile pattern from ComfyUI-mflux-AnyModel:
+    each model family declares which parameters its inference method
+    accepts, which should be silently dropped, and which must be blocked.
+    """
+
+    family: str  # e.g. "flux1", "flux2", "flux1_fill"
+    name: str  # Human-readable name
+    generate_params: dict[str, str] = field(default_factory=dict)
+    """param_name -> type_hint ("float", "int", "image", "mask", "latent", "string")."""
+
+    requires: frozenset[str] = field(default_factory=frozenset)
+    """Parameters that must be provided (and are not None)."""
+
+    drop_with_warning: frozenset[str] = frozenset()
+    """Params silently dropped with a log warning."""
+
+    hard_block: frozenset[str] = frozenset()
+    """Params that cause an error if forwarded."""
+
+    latent_channels: int = 16
+    supports_img2img: bool = False
+    supports_inpainting: bool = False
+    supports_depth: bool = False
+    supports_controlnet: bool = True
+    supports_mask_preserve: bool = False
+
+
+# ── Predefined profiles ───────────────────────────────────────────────
+
+CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
+    "flux1_dev": CapabilityProfile(
+        family="flux1",
+        name="FLUX.1-dev",
+        generate_params={
+            "guidance": "float",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        latent_channels=16,
+        supports_controlnet=True,
+    ),
+    "flux1_schnell": CapabilityProfile(
+        family="flux1",
+        name="FLUX.1-schnell",
+        generate_params={
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        # schnell doesn't use guidance
+        hard_block=frozenset({"guidance"}),
+        latent_channels=16,
+        supports_controlnet=False,
+    ),
+    "flux1_fill": CapabilityProfile(
+        family="flux1_fill",
+        name="FLUX.1-fill",
+        generate_params={
+            "guidance": "float",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+            "image": "image",
+            "mask": "mask",
+            "mask_blur": "int",
+            "mask_padding": "int",
+            "strength": "float",
+            "noise_aug": "float",
+        },
+        requires=frozenset(),
+        supports_img2img=True,
+        supports_inpainting=True,
+        supports_mask_preserve=True,
+        latent_channels=16,
+        supports_controlnet=False,
+    ),
+    "flux1_depth": CapabilityProfile(
+        family="flux1_depth",
+        name="FLUX.1-depth",
+        generate_params={
+            "guidance": "float",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+            "depth_image": "image",
+            "depth_strength": "float",
+        },
+        requires=frozenset(),
+        supports_depth=True,
+        supports_controlnet=False,
+        latent_channels=16,
+    ),
+    "flux2_klein": CapabilityProfile(
+        family="flux2",
+        name="FLUX.2-Klein",
+        generate_params={
+            "guidance": "float",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        latent_channels=16,
+        supports_controlnet=True,
+    ),
+}
+
+
+# ── Alias dispatch ─────────────────────────────────────────────────────
+
+# Maps filename patterns to capability profile keys.
+# Order matters: more specific patterns first.
+_CAPABILITY_DISPATCH: list[tuple[str, str]] = [
+    # FLUX.1 Fill
+    ("fill", "flux1_fill"),
+    # FLUX.1 Depth
+    ("depth", "flux1_depth"),
+    # FLUX.2
+    ("klein", "flux2_klein"),
+    # FLUX.1 Schnell
+    ("schnell", "flux1_schnell"),
+    # FLUX.1 Dev (default)
+    ("dev", "flux1_dev"),
+    ("kontext", "flux1_dev"),
+]
+
+
+def _resolve_capability(model_name: str) -> CapabilityProfile:
+    """Resolve a model name to its CapabilityProfile.
+
+    Uses the alias dispatch table: checks filename patterns in priority
+    order, falling back to flux1_dev.
+    """
+    name_lower = model_name.lower()
+
+    for pattern, profile_key in _CAPABILITY_DISPATCH:
+        if pattern in name_lower:
+            profile = CAPABILITY_PROFILES.get(profile_key)
+            if profile is not None:
+                return profile
+
+    # Default fallback
+    return CAPABILITY_PROFILES["flux1_dev"]
+
+
+def _resolve_capability_from_path(path: str | Path) -> CapabilityProfile:
+    """Resolve capability from a file path (extracts basename)."""
+    return _resolve_capability(Path(path).stem)
+
+
+# ── Parameter filtering ────────────────────────────────────────────────
+
+
+def filter_params_for_model(
+    profile: CapabilityProfile,
+    candidate_params: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Filter candidate params according to a CapabilityProfile.
+
+    Returns (valid_params, dropped_warnings).
+
+    - Params in profile.generate_params are forwarded as-is (if not None).
+    - Params in hard_block raise ValueError.
+    - Params in drop_with_warning are dropped with a log message.
+    - Unknown params are silently ignored.
+
+    Raises ValueError if any required param is missing (None or absent).
+    """
+    valid: dict[str, Any] = {}
+    dropped: list[str] = []
+
+    for name, value in candidate_params.items():
+        if value is None:
+            continue
+
+        if name in profile.generate_params:
+            valid[name] = value
+        elif name in profile.hard_block:
+            raise ValueError(
+                f"Parameter '{name}' is not supported by {profile.name}. "
+                f"Remove it from the workflow."
+            )
+        elif name in profile.drop_with_warning:
+            dropped.append(name)
+            logger.warning(
+                "ASDX: Dropped unsupported param '%s' for %s", name, profile.name
+            )
+        # else: silently ignore unknown params
+
+    # Check required
+    missing = profile.requires - set(valid.keys())
+    if missing:
+        raise ValueError(
+            f"Missing required params for {profile.name}: {sorted(missing)}"
+        )
+
+    return valid, dropped

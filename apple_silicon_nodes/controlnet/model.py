@@ -1,10 +1,9 @@
-"""
-ControlNet Union Support
-========================
-MLX-native ControlNet Union ProMax for FLUX.
+"""ControlNet Union model and weight loading.
 
-Supports 8 control types:
-  pose, depth, soft_edge, line_canny, normal, segment, tile, repaint
+Contains:
+  - ControlNetUnionModel: MLX-native ControlNet Union ProMax for FLUX
+  - load_controlnet_union: load checkpoint and cache model
+  - _assign_controlnet_weights / _set_param: weight mapping utilities
 """
 
 from __future__ import annotations
@@ -16,89 +15,12 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import torch
 
-from . import bridge
-
-
-# ── ControlNet Types ─────────────────────────────────────────────────
-
-CONTROL_NET_TYPES = {
-    "pose": 0,
-    "depth": 1,
-    "soft_edge": 2,
-    "line_canny": 3,
-    "normal": 4,
-    "segment": 5,
-    "tile": 6,
-    "repaint": 7,
-}
-
-
-# ── ControlNet Building Blocks ───────────────────────────────────────
-
-class ControlNetCondEmbedding(nn.Module):
-    """Embed control image into conditioning features."""
-
-    def __init__(self, conditioning_channels=3, block_out_channels=None,
-                 embedding_channels=320):
-        super().__init__()
-        if block_out_channels is None:
-            block_out_channels = [32, 64, 128, 256]
-        self.conv_in = nn.Conv2d(conditioning_channels, block_out_channels[0],
-                                 kernel_size=3, padding=1)
-        self.blocks = []
-        for i in range(len(block_out_channels) - 1):
-            ch_in = block_out_channels[i]
-            ch_out = block_out_channels[i + 1]
-            self.blocks.append(nn.Conv2d(ch_in, ch_in, kernel_size=3, padding=1))
-            self.blocks.append(nn.Conv2d(ch_in, ch_out, kernel_size=3,
-                                         stride=2, padding=1))
-        self.conv_out = nn.Conv2d(block_out_channels[-1], embedding_channels,
-                                  kernel_size=3, padding=1)
-
-    def __call__(self, conditioning):
-        x = nn.silu(self.conv_in(conditioning))
-        for block in self.blocks:
-            x = nn.silu(block(x))
-        return self.conv_out(x)
-
-
-class TimeEmbedding(nn.Module):
-    """Timestep embedding with optional text time augmentation."""
-
-    def __init__(self, dim_in: int, dim_out: int):
-        super().__init__()
-        self.linear = nn.Linear(dim_in, dim_out)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.linear(nn.silu(x))
-
-
-class SinusoidalPositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for timestep embeddings."""
-
-    def __init__(self, dim: int, max_freq: float = 1, min_freq: float = 0,
-                 scale: float = 1.0, cos_first: bool = True, full_turns: bool = True):
-        super().__init__()
-        self.dim = dim
-        self.max_freq = max_freq
-        self.min_freq = min_freq
-        self.scale = scale
-        self.cos_first = cos_first
-        self.full_turns = full_turns
-
-    def __call__(self, t: mx.array) -> mx.array:
-        """Compute sinusoidal encoding for timestep array."""
-        t = t.astype(mx.float32)
-        half_dim = self.dim // 2
-        exponent = -math.log(10000) * mx.arange(start=0, stop=half_dim, dtype=mx.float32) / half_dim
-        exponent = exponent + math.log(self.max_freq) - math.log(self.min_freq)
-        emb = t[:, None] * mx.exp(exponent[None, :])
-        emb = mx.concatenate([mx.cos(emb), mx.sin(emb)], axis=-1)
-        if self.cos_first:
-            emb = mx.concatenate([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
-        return emb * self.scale
+from .blocks import (
+    ControlNetCondEmbedding,
+    SinusoidalPositionalEncoding,
+    TimeEmbedding,
+)
 
 
 # ── ControlNet Union Model ───────────────────────────────────────────
@@ -190,7 +112,7 @@ class ControlNetUnionModel(nn.Module):
     def _make_transformer(self, dim: int, cross_attn_dim: int,
                           num_heads: int, num_layers: int) -> nn.Module:
         """Create a transformer block."""
-        layers = []
+        layers: list[nn.Module] = []
         for _ in range(num_layers):
             layers.extend([
                 nn.LayerNorm(dim),
@@ -372,158 +294,3 @@ def _set_param(obj: Any, key: str, value: mx.array) -> None:
     elif hasattr(current, "_parameters") and attr in current._parameters:
         if current._parameters[attr].shape == value.shape:
             current._parameters[attr] = value
-
-
-# ── Nodes ─────────────────────────────────────────────────────────────
-
-class ASDX_ControlNetUnionLoader:
-    """Load a ControlNet Union model."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "control_net_name": (cls._get_controlnets(),),
-            },
-        }
-
-    RETURN_TYPES = ("controlnet",)
-    RETURN_NAMES = ("control_net",)
-    FUNCTION = "load"
-    CATEGORY = "ASDX/ControlNet"
-
-    @staticmethod
-    def _get_controlnets() -> list[str]:
-        """Get list of available ControlNet models."""
-        try:
-            import folder_paths
-            cns = []
-            for folder in ("controlnet",):
-                try:
-                    cns.extend(folder_paths.get_filename_list(folder))
-                except Exception:
-                    pass
-            if cns:
-                return cns
-        except Exception:
-            pass
-        return ["controlnet_union.safetensors"]
-
-    def load(self, control_net_name: str) -> tuple[dict]:
-        path = self._resolve_path(control_net_name)
-        control_net = load_controlnet_union(path)
-        return ({"control_net": control_net, "name": control_net_name},)
-
-    @staticmethod
-    def _resolve_path(name: str) -> Path:
-        try:
-            import folder_paths
-            for folder in ("controlnet",):
-                try:
-                    full = folder_paths.get_full_path(folder, name)
-                    if full:
-                        return Path(full)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        for candidate in (
-            Path.home() / "ComfyUI" / "models" / "controlnet" / name,
-            Path(name),
-        ):
-            if candidate.exists():
-                return candidate
-        return Path(name)
-
-
-class ASDX_ApplyControlNet:
-    """Apply ControlNet conditioning to a diffusion model.
-
-    Injects ControlNet residuals into the transformer's attention layers.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("asdx_model",),
-                "control_net": ("controlnet",),
-                "image": ("IMAGE",),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.01}),
-                "control_type": (["pose", "depth", "soft_edge", "line_canny", "normal", "segment", "tile", "repaint"],),
-            },
-            "optional": {
-                "mask": ("MASK", {"default": None}),
-            },
-        }
-
-    RETURN_TYPES = ("asdx_model",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "apply"
-    CATEGORY = "ASDX/ControlNet"
-
-    def apply(
-        self,
-        model: dict,
-        control_net: dict,
-        image: torch.Tensor,
-        strength: float,
-        control_type: str,
-        mask: torch.Tensor | None = None,
-    ) -> tuple[dict]:
-        """Attach ControlNet conditioning to the model."""
-        type_idx = CONTROL_NET_TYPES.get(control_type, 0)
-
-        # Prepare control image: [B, H, W, 3] -> [B, 4, H, W]
-        control_img = self._prepare_control_image(image, mask)
-
-        # Store ControlNet info on the model
-        model["controlnet"] = {
-            "control_net": control_net["control_net"],
-            "image": control_img,
-            "strength": strength,
-            "control_type": type_idx,
-        }
-
-        print(f"[ASDX] ControlNet applied: {control_type} strength={strength:.2f}")
-        return (model,)
-
-    @staticmethod
-    def _prepare_control_image(image: torch.Tensor, mask: torch.Tensor | None) -> mx.array:
-        """Convert image (+ optional mask) to MLX array [B, 4, H, W]."""
-        if image.ndim == 3:
-            image = image.unsqueeze(0)
-
-        # Normalize to [-1, 1]
-        img_np = image.detach().cpu().numpy().astype(np.float32)
-        img_np = (img_np * 2.0) - 1.0
-
-        # Add mask channel if provided
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0)
-            mask_np = mask.detach().cpu().numpy().astype(np.float32)
-            # Transpose mask to [B, 1, H, W]
-            if mask_np.ndim == 3:
-                mask_np = mask_np[:, None, :, :]
-            control = np.concatenate([img_np, mask_np], axis=1)
-        else:
-            # 3 channels RGB -> add zeros for alpha
-            control = np.concatenate([img_np, np.zeros_like(img_np[:, :1])], axis=1)
-
-        control_mlx = mx.array(control)
-        mx.eval(control_mlx)
-        return control_mlx
-
-
-# ── Node Mappings ─────────────────────────────────────────────────────
-
-NODE_CLASS_MAPPINGS = {
-    "ASDX_ControlNetUnionLoader": ASDX_ControlNetUnionLoader,
-    "ASDX_ApplyControlNet": ASDX_ApplyControlNet,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_ControlNetUnionLoader": "🍏 ASDX ControlNet Union Loader",
-    "ASDX_ApplyControlNet": "🍏 ASDX Apply ControlNet",
-}

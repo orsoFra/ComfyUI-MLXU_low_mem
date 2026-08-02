@@ -20,12 +20,31 @@ import mlx.core as mx
 import torch
 
 from . import bridge
+from .capability import CAPABILITY_PROFILES, CapabilityProfile, _resolve_capability_from_path
 from .native import FluxConfig, FluxTransformer, load_transformer
 
 
 # ── Globals ───────────────────────────────────────────────────────────
 
 _MODEL_CACHE: dict[str, dict[str, Any]] = {}
+
+# Composite cache key components (set by LoRA/ControlNet nodes)
+_MODEL_EXTRA_KEYS: dict[str, str] = {}
+
+
+def _build_cache_key(base_key: str, extra: dict[str, str] | None = None) -> str:
+    """Build a composite cache key matching mflux-AnyModel pattern.
+
+    Combines the base model key with optional LoRA, ControlNet, and
+    base model identifiers for fine-grained cache management.
+    """
+    if extra:
+        parts = [base_key]
+        for k in ("lora", "controlnet", "base_model"):
+            if k in extra and extra[k]:
+                parts.append(f"{k}:{extra[k]}")
+        return ":".join(parts)
+    return base_key
 _TYPE_HINTS = {
     "schnell": "schnell",
     "klein": "schnell",
@@ -59,6 +78,11 @@ class ASDX_DiffusionLoader:
                 "model_name": (cls._get_models(),),
                 "precision": (["float16", "bfloat16"], {"default": "float16"}),
             },
+            "optional": {
+                "lora": ("ASDX_LORA", {"default": None}),
+                "controlnet": ("ASDX_CONTROLNET", {"default": None}),
+                "base_model": ("ASDX_MODEL", {"default": None}),
+            },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
@@ -86,11 +110,28 @@ class ASDX_DiffusionLoader:
             pass
         return ["flux1-dev-fp16.safetensors"]
 
-    def load(self, model_name: str, precision: str, unique_id: int | None = None) -> tuple[dict]:
+    def load(
+        self,
+        model_name: str,
+        precision: str,
+        unique_id: int | None = None,
+        lora: str | None = None,
+        controlnet: str | None = None,
+        base_model: str | None = None,
+    ) -> tuple[dict]:
         t0 = time.perf_counter()
 
-        # Check cache
-        cache_key = f"{model_name}:{precision}"
+        # Build composite cache key
+        extra: dict[str, str] = {}
+        if lora:
+            extra["lora"] = lora
+        if controlnet:
+            extra["controlnet"] = controlnet
+        if base_model:
+            extra["base_model"] = base_model
+        base_key = f"{model_name}:{precision}"
+        cache_key = _build_cache_key(base_key, extra if extra else None)
+
         if cache_key in _MODEL_CACHE:
             cached = _MODEL_CACHE[cache_key]
             print(f"[ASDX] Model cache hit: {model_name} ({precision})")
@@ -99,6 +140,9 @@ class ASDX_DiffusionLoader:
         # Find model file
         path = self._resolve_model_path(model_name)
         model_type = _model_type_from_path(path)
+
+        # Resolve capability profile from model name
+        capability = _resolve_capability_from_path(path)
 
         # Load into MLX
         config = FluxConfig(
@@ -109,7 +153,7 @@ class ASDX_DiffusionLoader:
         # Load transformer weights from checkpoint
         transformer = load_transformer(path, dtype=precision)
 
-        # Create model descriptor
+        # Create model descriptor with capability profile
         model_desc = {
             "type": "asdx_model",
             "name": model_name,
@@ -118,6 +162,7 @@ class ASDX_DiffusionLoader:
             "config": config,
             "model_type": model_type,
             "precision": precision,
+            "capability": capability,
             "load_time": 0.0,
         }
 
@@ -154,17 +199,6 @@ class ASDX_DiffusionLoader:
             if candidate.exists():
                 return candidate
         return Path(name)
-
-
-NODE_CLASS_MAPPINGS = {
-    "ASDX_DiffusionLoader": ASDX_DiffusionLoader,
-    "ASDX_CheckpointLoader": ASDX_CheckpointLoader,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
-    "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
-}
 
 
 # ── Checkpoint Loader ────────────────────────────────────────────────────
@@ -222,6 +256,9 @@ class ASDX_CheckpointLoader:
         )
         transformer = load_transformer(path, dtype=precision)
 
+        # Resolve capability profile from checkpoint path
+        capability = _resolve_capability_from_path(path)
+
         # Create model descriptor
         model_desc = {
             "type": "asdx_model",
@@ -231,6 +268,7 @@ class ASDX_CheckpointLoader:
             "config": config,
             "model_type": model_type,
             "precision": precision,
+            "capability": capability,
         }
 
         # Create placeholder CLIP handle (text encoding handled by DualCLIPLoader)
@@ -281,3 +319,16 @@ class ASDX_CheckpointLoader:
             if candidate.exists():
                 return candidate
         return Path(name)
+
+
+# ── Node Mappings ─────────────────────────────────────────────────────
+
+NODE_CLASS_MAPPINGS = {
+    "ASDX_DiffusionLoader": ASDX_DiffusionLoader,
+    "ASDX_CheckpointLoader": ASDX_CheckpointLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
+    "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
+}

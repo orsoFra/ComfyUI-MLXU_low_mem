@@ -1,13 +1,13 @@
 {
   ".claude/settings.local.json": {
-    "mtime": 1785656475.3736944,
-    "ast_hash": "6d5c5c4a4871300d9b4d7e83f3e18eda",
-    "semantic_hash": "6d5c5c4a4871300d9b4d7e83f3e18eda"
+    "mtime": 1785677576.2831116,
+    "ast_hash": "cd571f86048f6a5834c2875719406158",
+    "semantic_hash": "cd571f86048f6a5834c2875719406158"
   },
   "apple_silicon_nodes/__init__.py": {
-    "mtime": 1785669697.669062,
-    "ast_hash": "ad1afadc97499417d6ebeccb1e6693a2",
-    "semantic_hash": "ad1afadc97499417d6ebeccb1e6693a2"
+    "mtime": 1785687101.9853382,
+    "ast_hash": "39ef1241c32aa884ece1271109c05bd0",
+    "semantic_hash": "39ef1241c32aa884ece1271109c05bd0"
   },
   "apple_silicon_nodes/bridge.py": {
     "mtime": 1785628755.259196,
@@ -18,11 +18,6 @@
     "mtime": 1785669766.4954426,
     "ast_hash": "ac3805952c1653309a5393f2caeec249",
     "semantic_hash": "ac3805952c1653309a5393f2caeec249"
-  },
-  "apple_silicon_nodes/controlnet.py": {
-    "mtime": 1785632058.9248028,
-    "ast_hash": "3e9c91eeb05d973941a77afce9e3ccb8",
-    "semantic_hash": "3e9c91eeb05d973941a77afce9e3ccb8"
   },
   "apple_silicon_nodes/ip_adapter.py": {
     "mtime": 1785632163.2396944,
@@ -35,9 +30,9 @@
     "semantic_hash": "fb5260ff4d62651846f76e4650039d95"
   },
   "apple_silicon_nodes/loader.py": {
-    "mtime": 1785656180.2304468,
-    "ast_hash": "45bbca8a20a5569afe96356e15f3895d",
-    "semantic_hash": "45bbca8a20a5569afe96356e15f3895d"
+    "mtime": 1785686931.171559,
+    "ast_hash": "5356aca1e7d6ff116a78601bab40df83",
+    "semantic_hash": "5356aca1e7d6ff116a78601bab40df83"
   },
   "apple_silicon_nodes/lora.py": {
     "mtime": 1785631491.12845,
@@ -64,11 +59,6 @@
     "ast_hash": "a71525d56092b3b9fcb4edc2d6b103b6",
     "semantic_hash": "a71525d56092b3b9fcb4edc2d6b103b6"
   },
-  "apple_silicon_nodes/sampler.py": {
-    "mtime": 1785631931.7186441,
-    "ast_hash": "cb3696e93ae8cba656705f407419a03f",
-    "semantic_hash": "cb3696e93ae8cba656705f407419a03f"
-  },
   "apple_silicon_nodes/vae.py": {
     "mtime": 1785629597.2751918,
     "ast_hash": "eb120f65a6be4838ed082de6c58acb1c",
@@ -90,9 +80,9 @@
     "semantic_hash": "b850c89a2498291a97ddcffd3d3bdc9c"
   },
   "MEMORY.md": {
-    "mtime": 1785654288.4480803,
-    "ast_hash": "00c556a3103f54a7a31b0593789c7844",
-    "semantic_hash": "00c556a3103f54a7a31b0593789c7844"
+    "mtime": 1785662379.9949317,
+    "ast_hash": "42b474ed806110e0b9fa0dce0b9e814b",
+    "semantic_hash": "42b474ed806110e0b9fa0dce0b9e814b"
   },
   "README.md": {
     "mtime": 1785653978.8679228,
@@ -100,8 +90,63 @@
     "semantic_hash": "9595a6bc18ea172ced73ccbf0f7ae07a"
   },
   "session-state.md": {
-    "mtime": 1785654373.0043635,
-    "ast_hash": "22baf4d3c31e2aa81b01bf49d78e09f3",
-    "semantic_hash": "22baf4d3c31e2aa81b01bf49d78e09f3"
+    "mtime": 1785675727.3370416,
+    "ast_hash": "beec4b1368867d52b462b85258f0c37e",
+    "semantic_hash": "beec4b1368867d52b462b85258f0c37e"
+  },
+  "apple_silicon_nodes/controlnet/__init__.py": {
+    "mtime": 1785679718.5124485,
+    "ast_hash": "65b811f9cc9d819ad485dd5977ad3dbc",
+    "semantic_hash": "65b811f9cc9d819ad485dd5977ad3dbc"
+  },
+  "apple_silicon_nodes/controlnet/blocks.py": {
+    "mtime": 1785679696.197001,
+    "ast_hash": "641fbcbd9ddb3e7e18284a891eab4066",
+    "semantic_hash": "641fbcbd9ddb3e7e18284a891eab4066"
+  },
+  "apple_silicon_nodes/controlnet/model.py": {
+    "mtime": 1785679696.4820604,
+    "ast_hash": "16dd173ca29836fa61400b48914ac22c",
+    "semantic_hash": "16dd173ca29836fa61400b48914ac22c"
+  },
+  "apple_silicon_nodes/controlnet/types.py": {
+    "mtime": 1785679695.7962413,
+    "ast_hash": "1a468f0780a4798b198b97ea07e672a2",
+    "semantic_hash": "1a468f0780a4798b198b97ea07e672a2"
+  },
+  "apple_silicon_nodes/sampler/__init__.py": {
+    "mtime": 1785686716.9872622,
+    "ast_hash": "21f55f8e27685ef3473e01572bd64e35",
+    "semantic_hash": "21f55f8e27685ef3473e01572bd64e35"
+  },
+  "apple_silicon_nodes/sampler/cache.py": {
+    "mtime": 1785679781.365282,
+    "ast_hash": "10a0153cd037c19f51379935a0335214",
+    "semantic_hash": "10a0153cd037c19f51379935a0335214"
+  },
+  "apple_silicon_nodes/sampler/core.py": {
+    "mtime": 1785686651.7140532,
+    "ast_hash": "8c67017d250968bd4f99a411d0adb561",
+    "semantic_hash": "8c67017d250968bd4f99a411d0adb561"
+  },
+  "apple_silicon_nodes/capability.py": {
+    "mtime": 1785686390.439782,
+    "ast_hash": "6122b4d99fe99874280ef5a55cd762ea",
+    "semantic_hash": "6122b4d99fe99874280ef5a55cd762ea"
+  },
+  "apple_silicon_nodes/depth_map.py": {
+    "mtime": 1785686794.3217406,
+    "ast_hash": "4e1ff7debc870f00661ac1ae02613f87",
+    "semantic_hash": "4e1ff7debc870f00661ac1ae02613f87"
+  },
+  "apple_silicon_nodes/image_chain.py": {
+    "mtime": 1785686540.1242442,
+    "ast_hash": "cf506346796e0da3ad664cbb338f4b75",
+    "semantic_hash": "cf506346796e0da3ad664cbb338f4b75"
+  },
+  "apple_silicon_nodes/live_preview.py": {
+    "mtime": 1785686824.0496132,
+    "ast_hash": "e06560f34e9a73223beefc3f26cbb2a3",
+    "semantic_hash": "e06560f34e9a73223beefc3f26cbb2a3"
   }
 }
