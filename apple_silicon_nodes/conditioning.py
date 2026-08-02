@@ -1,11 +1,13 @@
 """
 Conditioning nodes
 ==================
-CLIP text encoding and conditioning manipulation for FLUX.
+CLIP text encoding and conditioning manipulation for FLUX and SD-style models.
 
 Nodes:
-  - ASDX_DualCLIPLoader: Load CLIP-L + T5-XXL text encoders
-  - ASDX_CLIPTextEncodeFlux: Encode text to T5 + CLIP embeddings
+  - ASDX_DualCLIPLoader: Load CLIP-L + T5-XXL text encoders (FLUX)
+  - ASDX_CLIPLoader: Load a single CLIP model (SDXL, Pony, Illustrious, SD1.5...)
+  - ASDX_CLIPTextEncodeFlux: Encode text to FLUX conditioning (T5 + CLIP-L)
+  - ASDX_CLIPTextEncode: Encode text to SD-style conditioning (single CLIP)
   - ASDX_ConditioningMerger: Merge two conditioning inputs
 """
 
@@ -148,6 +150,118 @@ class ASDX_CLIPTextEncodeFlux:
         return (result,)
 
 
+# ── Generic CLIP Loader ───────────────────────────────────────────────
+
+_CLIP_TYPES = {
+    "default": None,
+    "sd1": comfy.sd.CLIPType.SD15,
+    "sd2": comfy.sd.CLIPType.SD21,
+    "sdxl": comfy.sd.CLIPType.SDXL,
+    "pony": comfy.sd.CLIPType.PONY,
+    "flux": comfy.sd.CLIPType.FLUX,
+    "flux_hybrid": comfy.sd.CLIPType.HYBRID,
+    "sd3": comfy.sd.CLIPType.SD3,
+}
+
+
+class ASDX_CLIPLoader:
+    """Load a single CLIP text encoder model.
+
+    Supports SD1.5, SDXL, Pony, SD3, and other single-CLIP architectures.
+    Returns an mlx_clip handle that can be connected to ASDX_CLIPTextEncode.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip_name": (cls._get_clip_names(),),
+                "clip_type": (list(_CLIP_TYPES.keys()), {"default": "sdxl"}),
+            },
+        }
+
+    RETURN_TYPES = ("mlx_clip",)
+    RETURN_NAMES = ("mlx_clip",)
+    FUNCTION = "load"
+    CATEGORY = "ASDX/Loaders"
+
+    @staticmethod
+    def _get_clip_names() -> list[str]:
+        try:
+            import folder_paths
+            return folder_paths.get_filename_list("text_encoders")
+        except Exception:
+            return ["clip_l.safetensors"]
+
+    def load(self, clip_name: str, clip_type: str) -> tuple[dict]:
+        cache_key = f"{clip_name}:{clip_type}"
+
+        if cache_key not in _CLIP_CACHE:
+            clip_path = self._find_file("text_encoders", clip_name)
+            clip_type_enum = _CLIP_TYPES.get(clip_type)
+
+            clip = comfy.sd.load_clip(
+                ckpt_paths=[clip_path],
+                embedding_directory=comfy.utils.get_t2ia_paths() if hasattr(comfy.utils, 'get_t2ia_paths') else [],
+                clip_type=clip_type_enum,
+            )
+
+            _CLIP_CACHE[cache_key] = clip
+            print(f"[ASDX] CLIP loaded: {clip_name} (type={clip_type})")
+
+        return (_CLIP_CACHE[cache_key],)
+
+    @staticmethod
+    def _find_file(folder: str, name: str) -> str:
+        try:
+            import folder_paths
+            return folder_paths.get_full_path(folder, name) or name
+        except Exception:
+            return name
+
+
+# ── CLIP Text Encode (generic, SD-style) ──────────────────────────────
+
+
+class ASDX_CLIPTextEncode:
+    """Encode text prompts using a single CLIP model (SDXL, Pony, SD1.5...).
+
+    Handles tokenization and encoding with the loaded CLIP.
+    Returns mlx_conditioning that can be connected to the sampler.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mlx_clip": ("mlx_clip",),
+                "text": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("mlx_conditioning",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "ASDX/Conditioning"
+
+    def encode(self, mlx_clip: Any, text: str) -> tuple[dict]:
+        if not isinstance(mlx_clip, comfy.sd.CLIP):
+            raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
+
+        tokens = mlx_clip.tokenize(text)
+        conditioning = mlx_clip.encode_from_tokens_scheduled(tokens)
+
+        result = {
+            "type": "clip",
+            "conditioning": conditioning,
+            "text": text,
+        }
+
+        print(f"[ASDX] Text encoded: {len(text)} chars, type=clip")
+
+        return (result,)
+
+
 # ── Conditioning Merger ──────────────────────────────────────────────
 
 class ASDX_ConditioningMerger:
@@ -185,12 +299,16 @@ class ASDX_ConditioningMerger:
 
 NODE_CLASS_MAPPINGS = {
     "ASDX_DualCLIPLoader": ASDX_DualCLIPLoader,
+    "ASDX_CLIPLoader": ASDX_CLIPLoader,
     "ASDX_CLIPTextEncodeFlux": ASDX_CLIPTextEncodeFlux,
+    "ASDX_CLIPTextEncode": ASDX_CLIPTextEncode,
     "ASDX_ConditioningMerger": ASDX_ConditioningMerger,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ASDX_DualCLIPLoader": "🍏 ASDX Dual CLIP Loader",
+    "ASDX_CLIPLoader": "🍏 ASDX CLIP Loader",
     "ASDX_CLIPTextEncodeFlux": "🍏 ASDX CLIP Text Encode FLUX",
+    "ASDX_CLIPTextEncode": "🍏 ASDX CLIP Text Encode",
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
 }
