@@ -1,1 +1,2 @@
 - [Session state: advanced features integration] -session-state.md - Key decisions and current state
+- [Session state 2: loader fixes + knowledge graph] -session-state.md - Checkpoint/Diffusion Loader fix + graphify analysis
