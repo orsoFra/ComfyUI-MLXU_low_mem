@@ -33,8 +33,9 @@ _CLIP_CACHE: dict[str, Any] = {}
 # ── Dual CLIP Loader ─────────────────────────────────────────────────
 
 class ASDX_DualCLIPLoader:
-    """Load CLIP-L and T5-XXL text encoders for FLUX.
+    """Load two CLIP text encoders for dual-CLIP architectures.
 
+    Supports SDXL, SD3, FLUX, Hunyuan, HiDream, Kandinsky, LTXV, Newbie, ACE.
     Returns an mlx_clip handle that can be used by the text encoder
     and sampler nodes.
     """
@@ -43,8 +44,9 @@ class ASDX_DualCLIPLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "clip_name": (cls._get_clip_names(),),
-                "t5xxl_name": (cls._get_t5_names(),),
+                "clip_name1": (cls._get_clip_names(),),
+                "clip_name2": (cls._get_clip_names(),),
+                "type": (_DUAL_CLIP_TYPES, {"default": "flux"}),
             },
         }
 
@@ -69,22 +71,23 @@ class ASDX_DualCLIPLoader:
         except Exception:
             return ["t5xxl.safetensors"]
 
-    def load(self, clip_name: str, t5xxl_name: str) -> tuple[dict]:
-        cache_key = f"{clip_name}:{t5xxl_name}"
+    def load(self, clip_name1: str, clip_name2: str, type: str) -> tuple[dict]:
+        cache_key = f"{clip_name1}:{clip_name2}:{type}"
 
         if cache_key not in _CLIP_CACHE:
             # Load the CLIP
-            clip_path = self._find_file("text_encoders", clip_name)
-            t5_path = self._find_file("text_encoders", t5xxl_name)
+            clip_path1 = self._find_file("text_encoders", clip_name1)
+            clip_path2 = self._find_file("text_encoders", clip_name2)
+            clip_type_enum = _clip_type_from_string(type)
 
             clip = comfy.sd.load_clip(
-                ckpt_paths=[clip_path, t5_path],
+                ckpt_paths=[clip_path1, clip_path2],
                 embedding_directory=comfy.utils.get_t2ia_paths() if hasattr(comfy.utils, 'get_t2ia_paths') else [],
-                clip_type=comfy.sd.CLIPType.FLUX,
+                clip_type=clip_type_enum,
             )
 
             _CLIP_CACHE[cache_key] = clip
-            print(f"[ASDX] CLIP loaded: {clip_name} + {t5xxl_name}")
+            print(f"[ASDX] Dual CLIP loaded: {clip_name1} + {clip_name2} (type={type})")
 
         return (_CLIP_CACHE[cache_key],)
 
@@ -150,24 +153,87 @@ class ASDX_CLIPTextEncodeFlux:
         return (result,)
 
 
-# ── Generic CLIP Loader ───────────────────────────────────────────────
+# ── CLIP Types ────────────────────────────────────────────────────────
+# Complete mapping of ComfyUI's CLIPType enum to human-readable strings.
+# Single types (CLIPLoader node): all 33 CLIPType values + "mage" alias
+# Dual types (DualCLIPLoader node): 9 types for two-CLIP architectures
 
-_CLIP_TYPES = {
-    "default": None,
-    "sd1": comfy.sd.CLIPType.SD15,
-    "sd2": comfy.sd.CLIPType.SD21,
-    "sdxl": comfy.sd.CLIPType.SDXL,
-    "pony": comfy.sd.CLIPType.PONY,
-    "flux": comfy.sd.CLIPType.FLUX,
-    "flux_hybrid": comfy.sd.CLIPType.HYBRID,
-    "sd3": comfy.sd.CLIPType.SD3,
-}
+_SINGLE_CLIP_TYPES: list[str] = [
+    "stable_diffusion",   # SD1.5 — clip-l
+    "stable_cascade",     # Stable Cascade — clip-g
+    "sd3",                # SD3 — clip-g + clip-l + t5
+    "stable_audio",       # Stable Audio — t5 base
+    "hunyuan_dit",        # Hunyuan DiT
+    "flux",               # FLUX — clip-l + t5
+    "mochi",              # Mochi — t5 xxl
+    "ltxv",               # LTX-Video
+    "hunyuan_video",      # Hunyuan Video
+    "pixart",             # PixArt — gemma 2 2B
+    "cosmos",             # Cosmos — old t5 xxl
+    "lumina2",            # Lumina2 — gemma 2 2B
+    "wan",                # Wan — umt5 xxl
+    "hidream",            # HiDream — t5 + llama
+    "chroma",             # Chroma
+    "ace",                # ACE
+    "omnigen2",           # OmniGen2 — qwen vl 2.5 3B
+    "qwen_image",         # Qwen Image
+    "hunyuan_image",      # Hunyuan Image — qwen2.5vl + byt5
+    "hunyuan_video_15",   # Hunyuan Video 1.5
+    "ovis",               # OVIS
+    "kandinsky5",         # Kandinsky 5
+    "kandinsky5_image",   # Kandinsky 5 Image
+    "newbie",             # Newbie — gemma-3-4b-it + jina
+    "flux2",              # FLUX 2
+    "longcat_image",      # LongCat Image
+    "cogvideox",          # CogVideoX — t5 xxl (226-token)
+    "lens",               # Lens — gpt-oss-20b
+    "pixeldit",           # PixelDIT — gemma 2 2B elm
+    "ideogram4",          # Ideogram 4
+    "boogu",              # Boogu
+    "krea2",              # Krea2
+    "joyimage",           # JoyImage — qwen3-vl 8B
+    "mage",               # Mage (alias → stable_diffusion)
+]
+
+_DUAL_CLIP_TYPES: list[str] = [
+    "sdxl",               # clip-l + clip-g
+    "sd3",                # clip-l + clip-g / clip-l + t5 / clip-g + t5
+    "flux",               # clip-l + t5
+    "hunyuan_video",      # hunyuan video dual
+    "hidream",            # t5 + llama
+    "hunyuan_image",      # qwen2.5vl + byt5
+    "hunyuan_video_15",   # hunyuan video 1.5 dual
+    "kandinsky5",         # kandinsky 5 dual
+    "kandinsky5_image",   # kandinsky 5 image dual
+    "ltxv",               # ltxv dual
+    "newbie",             # gemma-3-4b-it + jina
+    "ace",                # ace dual
+]
+
+
+def _clip_type_from_string(s: str) -> Any:
+    """Convert a string name to the corresponding CLIPType enum value.
+
+    Matches ComfyUI's CLIPLoader.load_clip() behavior: getattr(CLIPType, name.upper()).
+    Falls back to STABLE_DIFFUSION for unknown types.
+    """
+    # Map special aliases
+    alias_map = {
+        "mage": "STABLE_DIFFUSION",
+        "sd1": "SD15",
+        "sd2": "SD21",
+        "flux_hybrid": "HYBRID",
+        "pony": "PONY",
+    }
+    key = alias_map.get(s, s.upper())
+    return getattr(comfy.sd.CLIPType, key, comfy.sd.CLIPType.STABLE_DIFFUSION)
 
 
 class ASDX_CLIPLoader:
     """Load a single CLIP text encoder model.
 
-    Supports SD1.5, SDXL, Pony, SD3, and other single-CLIP architectures.
+    Supports all ComfyUI CLIP types: SD1.5, SDXL, Pony, SD3, FLUX, FLUX2,
+    Hunyuan, Mochi, Wan, PixArt, Kandinsky, Krea2, JoyImage, and more.
     Returns an mlx_clip handle that can be connected to ASDX_CLIPTextEncode.
     """
 
@@ -176,7 +242,7 @@ class ASDX_CLIPLoader:
         return {
             "required": {
                 "clip_name": (cls._get_clip_names(),),
-                "clip_type": (list(_CLIP_TYPES.keys()), {"default": "sdxl"}),
+                "type": (_SINGLE_CLIP_TYPES, {"default": "stable_diffusion"}),
             },
         }
 
@@ -193,12 +259,12 @@ class ASDX_CLIPLoader:
         except Exception:
             return ["clip_l.safetensors"]
 
-    def load(self, clip_name: str, clip_type: str) -> tuple[dict]:
-        cache_key = f"{clip_name}:{clip_type}"
+    def load(self, clip_name: str, type: str) -> tuple[dict]:
+        cache_key = f"{clip_name}:{type}"
 
         if cache_key not in _CLIP_CACHE:
             clip_path = self._find_file("text_encoders", clip_name)
-            clip_type_enum = _CLIP_TYPES.get(clip_type)
+            clip_type_enum = _clip_type_from_string(type)
 
             clip = comfy.sd.load_clip(
                 ckpt_paths=[clip_path],
@@ -207,7 +273,7 @@ class ASDX_CLIPLoader:
             )
 
             _CLIP_CACHE[cache_key] = clip
-            print(f"[ASDX] CLIP loaded: {clip_name} (type={clip_type})")
+            print(f"[ASDX] CLIP loaded: {clip_name} (type={type})")
 
         return (_CLIP_CACHE[cache_key],)
 
