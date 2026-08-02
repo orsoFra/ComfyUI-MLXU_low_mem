@@ -32,7 +32,6 @@ _DISPLAY = {
     "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
     "ASDX_DualCLIPLoader": "🍏 ASDX Dual CLIP Loader",
     "ASDX_CLIPLoader": "🍏 ASDX CLIP Loader",
-    "ASDX_CLIPTextEncodeFlux": "🍏 ASDX CLIP Text Encode FLUX",
     "ASDX_CLIPTextEncode": "🍏 ASDX CLIP Text Encode",
     "ASDX_MLXSampler": "🍏 ASDX MLX Native Sampler",
     "ASDX_VAEDecode": "🍏 ASDX VAE Decode (MLX)",

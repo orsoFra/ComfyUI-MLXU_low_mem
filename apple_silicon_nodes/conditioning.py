@@ -4,10 +4,9 @@ Conditioning nodes
 CLIP text encoding and conditioning manipulation for FLUX and SD-style models.
 
 Nodes:
-  - ASDX_DualCLIPLoader: Load CLIP-L + T5-XXL text encoders (FLUX)
-  - ASDX_CLIPLoader: Load a single CLIP model (SDXL, Pony, Illustrious, SD1.5...)
-  - ASDX_CLIPTextEncodeFlux: Encode text to FLUX conditioning (T5 + CLIP-L)
-  - ASDX_CLIPTextEncode: Encode text to SD-style conditioning (single CLIP)
+  - ASDX_DualCLIPLoader: Load two CLIP text encoders (SDXL, FLUX, SD3...)
+  - ASDX_CLIPLoader: Load a single CLIP model (SD1.5, Pony, Illustrious...)
+  - ASDX_CLIPTextEncode: Encode text to conditioning (auto-detect FLUX/SD mode)
   - ASDX_ConditioningMerger: Merge two conditioning inputs
 """
 
@@ -102,11 +101,12 @@ class ASDX_DualCLIPLoader:
 
 # ── CLIP Text Encode ─────────────────────────────────────────────────
 
-class ASDX_CLIPTextEncodeFlux:
-    """Encode text prompts to FLUX conditioning (T5 + CLIP-L embeddings).
+class ASDX_CLIPTextEncode:
+    """Encode text prompts to conditioning for any model type.
 
-    Handles both CLIP-L and T5-XXL tokenization, returns mlx_conditioning
-    that can be connected to the sampler.
+    Auto-detects FLUX vs SD-style encoding:
+    - If t5xxl is provided → FLUX mode (separate clip_l + t5xxl + guidance)
+    - Otherwise → SD/SDXL/Pony mode (single CLIP encode)
     """
 
     @classmethod
@@ -114,7 +114,9 @@ class ASDX_CLIPTextEncodeFlux:
         return {
             "required": {
                 "mlx_clip": ("mlx_clip",),
-                "clip_l": ("STRING", {"multiline": True, "default": ""}),
+                "text": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
                 "t5xxl": ("STRING", {"multiline": True, "default": ""}),
                 "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1}),
             },
@@ -125,30 +127,43 @@ class ASDX_CLIPTextEncodeFlux:
     FUNCTION = "encode"
     CATEGORY = "ASDX/Conditioning"
 
-    def encode(self, mlx_clip: Any, clip_l: str, t5xxl: str, guidance: float) -> tuple[dict]:
+    def encode(
+        self,
+        mlx_clip: Any,
+        text: str,
+        t5xxl: str = "",
+        guidance: float = 3.5,
+    ) -> tuple[dict]:
         if not isinstance(mlx_clip, comfy.sd.CLIP):
             raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
 
-        # Tokenize both text encoders
-        tokens_l = mlx_clip.tokenize(clip_l)
-        tokens_t5 = mlx_clip.tokenize(t5xxl)
-
-        # Encode with scheduling
-        conditioning = mlx_clip.encode_from_tokens_scheduled(
-            {"l": tokens_l, "t5xxl": tokens_t5},
-            add_dict={"guidance": float(guidance)},
-        )
-
-        result = {
-            "type": "flux1",
-            "conditioning": conditioning,
-            "clip_l": clip_l,
-            "t5xxl": t5xxl,
-            "guidance": float(guidance),
-        }
-
-        print(f"[ASDX] Text encoded: clip_l={len(clip_l)} chars, t5xxl={len(t5xxl)} chars, "
-              f"guidance={guidance:.1f}")
+        if t5xxl:
+            # FLUX mode: separate clip_l + t5xxl inputs
+            tokens_l = mlx_clip.tokenize(text)
+            tokens_t5 = mlx_clip.tokenize(t5xxl)
+            conditioning = mlx_clip.encode_from_tokens_scheduled(
+                {"l": tokens_l, "t5xxl": tokens_t5},
+                add_dict={"guidance": float(guidance)},
+            )
+            result = {
+                "type": "flux1",
+                "conditioning": conditioning,
+                "text": text,
+                "t5xxl": t5xxl,
+                "guidance": float(guidance),
+            }
+            print(f"[ASDX] Text encoded (FLUX): text={len(text)} chars, "
+                  f"t5xxl={len(t5xxl)} chars, guidance={guidance:.1f}")
+        else:
+            # SD / SDXL / Pony mode: single CLIP encode
+            tokens = mlx_clip.tokenize(text)
+            conditioning = mlx_clip.encode_from_tokens_scheduled(tokens)
+            result = {
+                "type": "clip",
+                "conditioning": conditioning,
+                "text": text,
+            }
+            print(f"[ASDX] Text encoded (SD-style): {len(text)} chars, type=clip")
 
         return (result,)
 
@@ -286,48 +301,6 @@ class ASDX_CLIPLoader:
             return name
 
 
-# ── CLIP Text Encode (generic, SD-style) ──────────────────────────────
-
-
-class ASDX_CLIPTextEncode:
-    """Encode text prompts using a single CLIP model (SDXL, Pony, SD1.5...).
-
-    Handles tokenization and encoding with the loaded CLIP.
-    Returns mlx_conditioning that can be connected to the sampler.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mlx_clip": ("mlx_clip",),
-                "text": ("STRING", {"multiline": True, "default": ""}),
-            },
-        }
-
-    RETURN_TYPES = ("mlx_conditioning",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "encode"
-    CATEGORY = "ASDX/Conditioning"
-
-    def encode(self, mlx_clip: Any, text: str) -> tuple[dict]:
-        if not isinstance(mlx_clip, comfy.sd.CLIP):
-            raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
-
-        tokens = mlx_clip.tokenize(text)
-        conditioning = mlx_clip.encode_from_tokens_scheduled(tokens)
-
-        result = {
-            "type": "clip",
-            "conditioning": conditioning,
-            "text": text,
-        }
-
-        print(f"[ASDX] Text encoded: {len(text)} chars, type=clip")
-
-        return (result,)
-
-
 # ── Conditioning Merger ──────────────────────────────────────────────
 
 class ASDX_ConditioningMerger:
@@ -366,7 +339,6 @@ class ASDX_ConditioningMerger:
 NODE_CLASS_MAPPINGS = {
     "ASDX_DualCLIPLoader": ASDX_DualCLIPLoader,
     "ASDX_CLIPLoader": ASDX_CLIPLoader,
-    "ASDX_CLIPTextEncodeFlux": ASDX_CLIPTextEncodeFlux,
     "ASDX_CLIPTextEncode": ASDX_CLIPTextEncode,
     "ASDX_ConditioningMerger": ASDX_ConditioningMerger,
 }
@@ -374,7 +346,6 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ASDX_DualCLIPLoader": "🍏 ASDX Dual CLIP Loader",
     "ASDX_CLIPLoader": "🍏 ASDX CLIP Loader",
-    "ASDX_CLIPTextEncodeFlux": "🍏 ASDX CLIP Text Encode FLUX",
     "ASDX_CLIPTextEncode": "🍏 ASDX CLIP Text Encode",
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
 }
