@@ -38,6 +38,14 @@ class ASDX_EmptyFLUXLatent:
     for zero-copy with the MLX sampler.
     """
 
+    # (channels, spatial downscale) per model family -- FLUX.1/Krea2/Z-Image
+    # share the same 16ch/8x VAE latent; Flux2/Klein uses a distinct
+    # 128ch/16x VAE (see bridge.py::FLUX2_LATENT_CHANNELS/FLUX2_VAE_DOWNSCALE).
+    _LATENT_FORMATS = {
+        "flux": (16, 8),
+        "flux2": (128, 16),
+    }
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -48,6 +56,7 @@ class ASDX_EmptyFLUXLatent:
             },
             "optional": {
                 "aspect_ratio": (["auto"] + list(_RESOLUTION_PRESETS.keys()), {"default": "auto"}),
+                "latent_format": (list(cls._LATENT_FORMATS.keys()), {"default": "flux"}),
             },
         }
 
@@ -62,6 +71,7 @@ class ASDX_EmptyFLUXLatent:
         height: int,
         batch_size: int,
         aspect_ratio: str = "auto",
+        latent_format: str = "flux",
     ) -> tuple[dict]:
         # Apply aspect ratio preset if selected
         if aspect_ratio != "auto" and aspect_ratio in _RESOLUTION_PRESETS:
@@ -71,18 +81,20 @@ class ASDX_EmptyFLUXLatent:
         width = (width // 16) * 16
         height = (height // 16) * 16
 
+        channels, downscale = self._LATENT_FORMATS.get(latent_format, self._LATENT_FORMATS["flux"])
+
         # Create latent on MPS device for zero-copy with sampler
         device = self._get_device()
         latent = torch.zeros(
-            [batch_size, 16, height // 8, width // 8],
+            [batch_size, channels, height // downscale, width // downscale],
             device=device,
             dtype=comfy.model_management.intermediate_dtype(),
         )
 
-        print(f"[ASDX] Empty FLUX Latent: {width}x{height}, batch={batch_size}, "
-              f"latent_shape=[{batch_size}, 16, {height//8}, {width//8}]")
+        print(f"[ASDX] Empty FLUX Latent ({latent_format}): {width}x{height}, batch={batch_size}, "
+              f"latent_shape=[{batch_size}, {channels}, {height//downscale}, {width//downscale}]")
 
-        return ({"samples": latent, "downscale_ratio_spacial": 8},)
+        return ({"samples": latent, "downscale_ratio_spacial": downscale},)
 
     @staticmethod
     def _get_device() -> torch.device:
