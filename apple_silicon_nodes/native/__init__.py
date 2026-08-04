@@ -723,7 +723,7 @@ def load_transformer(
     matched = 0
     for flat_key, value in model_flat:
         if flat_key in normalized:
-            new_flat.append((flat_key, normalized[flat_key]))
+            new_flat.append((flat_key, normalized[flat_key].astype(config.mlx_dtype)))
             matched += 1
         else:
             new_flat.append((flat_key, value))

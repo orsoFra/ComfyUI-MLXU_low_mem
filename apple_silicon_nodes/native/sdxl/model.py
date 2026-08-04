@@ -425,7 +425,7 @@ def load_sdxl_unet(path, dtype: str = "float16") -> UNetModel:
                 # Every 4D tensor in this checkpoint is a Conv2d kernel:
                 # PyTorch [out, in, kh, kw] -> MLX [out, kh, kw, in].
                 loaded = loaded.transpose(0, 2, 3, 1)
-            new_flat.append((flat_key, loaded))
+            new_flat.append((flat_key, loaded.astype(config.mlx_dtype)))
             matched += 1
         else:
             new_flat.append((flat_key, value))
