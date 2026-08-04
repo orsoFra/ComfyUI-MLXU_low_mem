@@ -67,14 +67,21 @@ def conditioning_to_mlx(
     """
     guidance = None
 
-    # Handle wrapper dict (type="flux1")
+    # Handle ASDX_CLIPTextEncode's wrapper dict. It's produced for both the
+    # FLUX ("type": "flux1", t5xxl filled) and single-CLIP ("type": "clip",
+    # t5xxl left blank -- text is then reused for every sub-tokenizer) modes,
+    # so unwrap on the "conditioning" key itself rather than gating on
+    # "type" == "flux1" -- otherwise a FLUX-type dual CLIP with an empty
+    # t5xxl field falls through and the wrapper dict gets indexed like a
+    # list below (KeyError: 0).
     if isinstance(conditioning, dict):
-        if conditioning.get("type") == "flux1":
+        if "guidance" in conditioning:
             try:
                 guidance = float(conditioning["guidance"]) if conditioning.get("guidance") is not None else None
             except Exception:
                 guidance = None
-            conditioning = conditioning.get("conditioning", conditioning)
+        if "conditioning" in conditioning:
+            conditioning = conditioning["conditioning"]
 
         if "cond" in conditioning:
             cond = conditioning.get("cond")
