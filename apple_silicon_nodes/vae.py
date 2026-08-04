@@ -16,9 +16,6 @@ import mlx.core as mx
 import numpy as np
 import torch
 
-import comfy.latent_formats
-from . import bridge
-
 
 # ── Globals ───────────────────────────────────────────────────────────
 
@@ -49,41 +46,20 @@ class ASDX_VAEDecode:
     CATEGORY = "ASDX/Latent"
 
     def decode(self, samples: dict, vae: Any) -> tuple[torch.Tensor]:
-        t0 = time.perf_counter()
-
         # Get latent samples
         if not isinstance(samples, dict) or "samples" not in samples:
             raise RuntimeError("ASDX VAE Decode: expected LATENT input.")
 
         latent = samples["samples"]
-        is_flux = (tuple(latent.shape)[1] == bridge.FLUX_LATENT_CHANNELS)
 
-        if not is_flux:
-            # Fallback to standard PyTorch VAE decode for non-FLUX
-            return self._fallback_decode(latent, vae)
-
-        # FLUX path: convert latent to MLX, decode, convert back
-        # First, process through FLUX latent format
-        model_space = comfy.latent_formats.Flux().process_in(latent.detach().cpu().float())
-        latent_np = model_space.numpy().astype(np.float32, copy=False)
-
-        # Convert to MLX
-        latent_mlx = mx.array(latent_np)
-        mx.eval(latent_mlx)
-
-        # Decode with MLX VAE
-        decoded = self._decode_with_mlx_vae(latent_mlx)
-        mx.eval(decoded)
-
-        # Convert to ComfyUI image
-        image = bridge.mlx_to_comfy_image(decoded)
-
-        elapsed = time.perf_counter() - t0
-        mem = bridge.collect_mlx_memory()
-        print(f"[ASDX] VAE Decode: {image.shape}, {elapsed:.2f}s, "
-              f"mem={mem['active_gb']:.1f}GB/{mem['cache_gb']:.1f}GB")
-
-        return (image,)
+        # Always use the real ComfyUI/PyTorch VAE. `_decode_with_mlx_vae()`
+        # (below) has no real weight loading — it's an untrained placeholder
+        # that silently ignores `vae` and produces noise, not an image, for
+        # any latent that used to route through it (16ch: FLUX.1/Z-Image).
+        # SDXL (4ch) and Flux2 (128ch) already always used this real path.
+        # Left `_decode_with_mlx_vae`/`mlx_vae.py` in place, just unreferenced
+        # from here — a native MLX VAE decoder remains a separate future task.
+        return self._fallback_decode(latent, vae)
 
     def _decode_with_mlx_vae(self, latent: mx.array) -> mx.array:
         """Decode using MLX VAE.
@@ -113,9 +89,12 @@ class ASDX_VAEDecode:
 
     @staticmethod
     def _fallback_decode(latent: torch.Tensor, vae: Any) -> tuple[torch.Tensor]:
-        """Standard PyTorch VAE decode fallback."""
-        # Use ComfyUI's standard VAE decode
-        image = vae.decode(latent["samples"])
+        """Standard PyTorch VAE decode fallback.
+
+        `latent` here is already the unwrapped tensor (`decode()` extracts
+        `samples["samples"]` before calling this) — do not index it again.
+        """
+        image = vae.decode(latent)
         return (image,)
 
 
