@@ -214,7 +214,19 @@ def _unpack_flux_latents(
     height: int,
     width: int,
 ) -> torch.Tensor:
-    """Unpack packed FLUX latent [B, NW*NH, 64] -> [B, 16, H/8, W/8]."""
+    """Unpack packed FLUX latent [B, NW*NH, 64] -> [B, 16, H/8, W/8].
+
+    The denoising loop runs entirely in the model's normalized latent space
+    (matching `comfy/samplers.py:1236`'s `process_latent_out`, applied once
+    at this exact sampling boundary) -- must be converted back to raw VAE
+    latent space here before the caller hands this to VAE decode, or the
+    decoded image comes out visibly grainy/speckled (fp16 VAE decoders are
+    very sensitive to latent scale). Z-Image reuses this same function and
+    is also covered: it inherits `latent_formats.Flux` unchanged (verified
+    against the real comfy source), same 0.3611/0.1159 constants.
+    """
+    from .native.config import process_flux_latent_out
+
     latent_h = height // 8
     latent_w = width // 8
 
@@ -222,7 +234,7 @@ def _unpack_flux_latents(
     unpacked = mx.reshape(latents, (1, latent_h // 2, latent_w // 2, 16, 2, 2))
     unpacked = mx.transpose(unpacked, (0, 3, 1, 4, 2, 5))
     unpacked = mx.reshape(unpacked, (1, 16, latent_h // 2 * 2, latent_w // 2 * 2))
-    unpacked = unpacked.astype(mx.float32)
+    unpacked = process_flux_latent_out(unpacked.astype(mx.float32))
     mx.eval(unpacked)
 
     return torch.from_numpy(np.array(unpacked, dtype=np.float32))
