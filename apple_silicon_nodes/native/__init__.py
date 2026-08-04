@@ -670,14 +670,20 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     """Load a safetensors file into MLX arrays.
 
     Uses safetensors.torch to support BF16 (numpy backend doesn't).
-    BF16 tensors are cast to float32 before conversion to MLX.
+    BF16 and "naive" FP8 (F8_E4M3/F8_E5M2, e.g. ComfyUI's own
+    UNETLoader/ModelSave weight_dtype="fp8_e4m3fn" -- a straight per-tensor
+    cast with no companion scale, unlike ComfyUI's separate "scaled fp8"
+    format which stores a scale_weight/input_scale per layer and needs
+    dequantizing by multiplication, NOT handled here) are upcast to
+    float32 before conversion to MLX; the caller casts back down to the
+    requested precision afterward.
     """
     import torch
     import safetensors.torch
     state = safetensors.torch.load_file(path, device="cpu")
     result = {}
     for k, v in state.items():
-        if v.dtype == torch.bfloat16:
+        if v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
             v = v.float()
         result[k] = mx.array(v.cpu().numpy())
     return result
