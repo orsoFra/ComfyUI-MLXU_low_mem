@@ -138,11 +138,19 @@ class ASDX_CLIPTextEncode:
             raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
 
         if t5xxl:
-            # FLUX mode: separate clip_l + t5xxl inputs
-            tokens_l = mlx_clip.tokenize(text)
-            tokens_t5 = mlx_clip.tokenize(t5xxl)
+            # FLUX mode: separate clip_l + t5xxl inputs. mlx_clip.tokenize(text)
+            # already returns the full {"l": [...], "t5xxl": [...]} dict (a
+            # dual-tokenizer CLIP tokenizes through every sub-tokenizer at
+            # once) -- only the "t5xxl" entry needs overriding with its own
+            # text, matching comfy's own CLIPTextEncodeFlux.execute(). Wrapping
+            # both full dicts again as {"l": tokens_l, "t5xxl": tokens_t5}
+            # (the previous code here) nests them one level too deep, so
+            # encode_token_weights() ends up iterating dict keys ("l",
+            # "t5xxl") as if they were (token, weight) pairs.
+            tokens = mlx_clip.tokenize(text)
+            tokens["t5xxl"] = mlx_clip.tokenize(t5xxl)["t5xxl"]
             conditioning = mlx_clip.encode_from_tokens_scheduled(
-                {"l": tokens_l, "t5xxl": tokens_t5},
+                tokens,
                 add_dict={"guidance": float(guidance)},
             )
             result = {
