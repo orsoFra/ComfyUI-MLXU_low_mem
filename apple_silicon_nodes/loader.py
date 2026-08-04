@@ -296,6 +296,13 @@ class ASDX_DiffusionLoader:
             path, model_type, precision
         )
 
+        # _load_safetensors() upcasts BF16 checkpoint tensors to float32 before
+        # the loader casts them down to the requested precision; the discarded
+        # float32 buffers land in MLX's cache (freed but not returned to the
+        # OS) rather than active memory. Release them now instead of letting
+        # them sit alongside the real active weights for the rest of the run.
+        bridge.clear_mlx_cache()
+
         # Create model descriptor with capability profile
         model_desc = {
             "type": "asdx_model",
@@ -397,6 +404,10 @@ class ASDX_CheckpointLoader:
         transformer, config = _load_transformer_for_type(
             path, model_type, precision
         )
+
+        # See ASDX_DiffusionLoader.load() — release the float32 buffers
+        # _load_safetensors()/the dtype cast leave behind in MLX's cache.
+        bridge.clear_mlx_cache()
 
         # Resolve capability profile (see _capability_for_model_type — this
         # loader is the one most likely to see merged SDXL/Illustrious/Pony
