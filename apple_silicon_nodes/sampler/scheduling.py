@@ -1,0 +1,459 @@
+"""Sigma scheduling for diffusion models.
+
+Adapted from DiffusionKit's FluxSampler and ModelSamplingDiscreteFlow.
+Provides sigma/timestep conversion, noise scaling, and schedule generation
+for FLUX and discrete flow models.
+
+Also includes FluxLatentFormat for FLUX latent space transformation.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+
+class FluxSampler:
+    """Sigma scheduling for FLUX models.
+
+    FLUX uses a continuous sigma schedule where:
+      - sigma(timestep) converts timestep [0, 1000] → sigma value
+      - timestep(sigma) converts sigma → timestep [0, 1000]
+      - The schedule supports a shift parameter for custom schedules
+
+    Sigmas range from 0 to 1000 (inclusive), giving 1001 values.
+    """
+
+    def __init__(self, shift: float = 1.0):
+        """
+        Args:
+            shift: Shift parameter for the sigma schedule.
+                   shift=1.0 gives the standard linear schedule.
+        """
+        self.shift = shift
+        self.num_steps = 1000
+        # Precompute sigmas for all timesteps
+        self._sigmas: list[float] = []
+        for i in range(self.num_steps + 1):
+            self._sigmas.append(self._sigma_from_timestep(i))
+
+    @property
+    def sigma_min(self) -> float:
+        """Minimum sigma value (at timestep 0)."""
+        return self._sigmas[0]
+
+    @property
+    def sigma_max(self) -> float:
+        """Maximum sigma value (at timestep 1000)."""
+        return self._sigmas[-1]
+
+    def sigma(self, timestep: float) -> float:
+        """Convert a timestep value to sigma.
+
+        Args:
+            timestep: Timestep value in [0, 1000].
+
+        Returns:
+            Sigma value.
+        """
+        t = timestep / 1000.0
+        if self.shift == 1.0:
+            return t
+        return self.shift * t / (1 + (self.shift - 1) * t)
+
+    def _sigma_from_timestep(self, i: int) -> float:
+        """Compute sigma for a specific timestep index."""
+        return self.sigma(float(i))
+
+    def timestep(self, sigma: float) -> float:
+        """Convert a sigma value to timestep.
+
+        Args:
+            sigma: Sigma value.
+
+        Returns:
+            Timestep value in [0, 1000].
+        """
+        return sigma * 1000.0
+
+    def noise_scaling(
+        self,
+        sigma: float,
+        noise: Any,
+        latent_image: Any,
+        max_denoise: bool = False,
+    ) -> Any:
+        """Scale noise for img2img or noising of latents.
+
+        Computes: sigma * noise + (1 - sigma) * latent_image
+
+        Args:
+            sigma: Current sigma value.
+            noise: Random noise tensor.
+            latent_image: Input latent image tensor.
+            max_denoise: If True, cap denoising strength.
+
+        Returns:
+            Noised latent tensor.
+        """
+        return sigma * noise + (1.0 - sigma) * latent_image
+
+    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
+        """Calculate denoised output from model prediction.
+
+        Computes: model_input - model_output * sigma
+
+        Args:
+            sigma: Current sigma value.
+            model_output: Model's noise prediction.
+            model_input: Current latent input.
+
+        Returns:
+            Denoised latent tensor.
+        """
+        # Reshape sigma to broadcast correctly
+        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
+        return model_input - model_output * sigma
+
+
+class FlowSampler:
+    """Sigma scheduling for discrete flow matching models.
+
+    Similar to FluxSampler but uses a different sigma schedule
+    (starts from 1.0 instead of 0.0).
+    """
+
+    def __init__(self, shift: float = 1.0):
+        self.shift = shift
+        self.num_steps = 1000
+        self._sigmas: list[float] = []
+        for i in range(1, self.num_steps + 1):
+            self._sigmas.append(self._sigma_from_timestep(i))
+
+    @property
+    def sigma_min(self) -> float:
+        return self._sigmas[0]
+
+    @property
+    def sigma_max(self) -> float:
+        return self._sigmas[-1]
+
+    def sigma(self, timestep: float) -> float:
+        t = timestep / 1000.0
+        if self.shift == 1.0:
+            return t
+        return self.shift * t / (1 + (self.shift - 1) * t)
+
+    def _sigma_from_timestep(self, i: int) -> float:
+        return self.sigma(float(i))
+
+    def timestep(self, sigma: float) -> float:
+        return sigma * 1000.0
+
+    def noise_scaling(
+        self,
+        sigma: float,
+        noise: Any,
+        latent_image: Any,
+        max_denoise: bool = False,
+    ) -> Any:
+        return sigma * noise + (1.0 - sigma) * latent_image
+
+    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
+        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
+        return model_input - model_output * sigma
+
+
+class Krea2Sampler:
+    """Sampler for Krea2 (SingleStreamDiT) flow-matching models.
+
+    Krea2 uses a linear flow schedule from sigma=1.0 to sigma=0.0,
+    with the same Euler update formula as FLUX:
+        noise = noise + output * (sigma_next - sigma_t)
+
+    Key differences from FLUX:
+      - No guidance embedding (CFG=1 for Turbo, CFG~3 for Raw)
+      - Text embedding from Qwen3-VL (2560-dim, not T5+CLIP)
+      - Flow matching schedule (linear 1→0)
+      - txtfusion adapter for text processing
+    """
+
+    def __init__(self):
+        self.num_steps = 1000
+
+    def sigma(self, timestep: float) -> float:
+        """Convert timestep to sigma for Krea2.
+
+        Krea2 uses a linear schedule: sigma = 1 - t/1000.
+        """
+        return 1.0 - timestep / 1000.0
+
+    def timestep(self, sigma: float) -> float:
+        """Convert sigma to timestep for Krea2."""
+        return (1.0 - sigma) * 1000.0
+
+    def noise_scaling(
+        self,
+        sigma: float,
+        noise: Any,
+        latent_image: Any,
+        max_denoise: bool = False,
+    ) -> Any:
+        """Scale noise for img2img in Krea2.
+
+        Same formula as FluxSampler: sigma * noise + (1 - sigma) * latent_image
+        """
+        return sigma * noise + (1.0 - sigma) * latent_image
+
+    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
+        """Calculate denoised output from model prediction."""
+        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
+        return model_input - model_output * sigma
+
+
+class SDXLSampling:
+    """Discrete DDPM/EPS sigma schedule for SDXL.
+
+    Fundamentally different from FLUX/Krea2's flow-matching schedule above:
+    SDXL is trained on 1000 DISCRETE diffusion steps with a fixed
+    beta/alpha_cumprod schedule, not a continuous sigma in [0,1]. Matches
+    `comfy/model_sampling.py::ModelSamplingDiscrete` + `EPS` exactly:
+
+        betas = linspace(sqrt(linear_start), sqrt(linear_end), 1000) ** 2
+        alphas_cumprod = cumprod(1 - betas)
+        sigmas[i] = sqrt((1 - alphas_cumprod[i]) / alphas_cumprod[i])
+
+    `sigma()`/`timestep()` convert between this discrete 1000-step table and
+    a continuous sigma value (needed because our Euler loop can use fewer
+    than 1000 steps): `sigma(t)` interpolates LINEARLY IN LOG-SIGMA SPACE
+    between the two nearest discrete bins (matching comfy's own
+    `ModelSamplingDiscrete.sigma`); `timestep(sigma)` finds the nearest
+    discrete bin by log-sigma distance (matching `.timestep`'s
+    `argmin(|log_sigma - log_sigmas|)` — nearest-neighbor, NOT interpolated).
+
+    `calculate_input`/`calculate_denoised` are `EPS`'s Karras preconditioning
+    (`comfy/model_sampling.py::EPS`): the UNet expects `x / sqrt(sigma^2+1)`
+    as input (not raw `x`), and predicts noise (`eps`), converted to the
+    denoised sample via `x - eps*sigma` — NOT FLUX's flow-matching formulas.
+    """
+
+    def __init__(self, linear_start: float = 0.00085, linear_end: float = 0.012,
+                 num_timesteps: int = 1000):
+        self.num_timesteps = num_timesteps
+        self.sigma_data = 1.0
+
+        sqrt_start, sqrt_end = math.sqrt(linear_start), math.sqrt(linear_end)
+        betas = [
+            (sqrt_start + (sqrt_end - sqrt_start) * i / (num_timesteps - 1)) ** 2
+            for i in range(num_timesteps)
+        ]
+        alphas_cumprod: list[float] = []
+        acc = 1.0
+        for b in betas:
+            acc *= (1.0 - b)
+            alphas_cumprod.append(acc)
+        self._sigmas = [math.sqrt((1.0 - ac) / ac) for ac in alphas_cumprod]
+        self._log_sigmas = [math.log(s) for s in self._sigmas]
+
+    @property
+    def sigma_min(self) -> float:
+        return self._sigmas[0]
+
+    @property
+    def sigma_max(self) -> float:
+        return self._sigmas[-1]
+
+    def sigma(self, timestep: float) -> float:
+        """Continuous sigma for a (possibly fractional) discrete timestep index."""
+        t = max(0.0, min(timestep, self.num_timesteps - 1))
+        low = int(math.floor(t))
+        high = min(low + 1, self.num_timesteps - 1)
+        w = t - low
+        log_sigma = (1 - w) * self._log_sigmas[low] + w * self._log_sigmas[high]
+        return math.exp(log_sigma)
+
+    def timestep(self, sigma: float) -> float:
+        """Nearest discrete timestep index for a continuous sigma (log-sigma distance)."""
+        log_sigma = math.log(max(sigma, 1e-10))
+        best_i, best_d = 0, float("inf")
+        for i, ls in enumerate(self._log_sigmas):
+            d = abs(log_sigma - ls)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return float(best_i)
+
+    def calculate_input(self, sigma: float, x: Any) -> Any:
+        """UNet input preconditioning: x / sqrt(sigma^2 + sigma_data^2)."""
+        return x / math.sqrt(sigma ** 2 + self.sigma_data ** 2)
+
+    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
+        """EPS denoise: x0 = x - eps * sigma."""
+        return model_input - model_output * sigma
+
+
+def generate_sigmas_sdxl(steps: int) -> list[float]:
+    """Generate an SDXL sigma schedule ('normal'-scheduler style, matching
+    comfy's `normal_scheduler`): linearly spaced discrete timestep indices
+    (from the last index down to 0), each converted through
+    `SDXLSampling.sigma()` (log-sigma interpolation), with an explicit 0.0
+    appended at the end — same "always end at exact 0.0" convention as
+    `generate_sigmas()` above.
+
+    NOT merged into `generate_sigmas()`'s dispatcher: SDXL's denoising loop
+    needs a genuinely different per-step shape (two-pass CFG, EPS
+    preconditioning) that the flow-matching Euler loop doesn't, so it has
+    its own dedicated entry point.
+
+    Returns:
+        List of sigma values with length steps + 1.
+    """
+    sampling = SDXLSampling()
+    start = float(sampling.num_timesteps - 1)
+    if steps <= 1:
+        timesteps = [start]
+    else:
+        timesteps = [start - i * start / (steps - 1) for i in range(steps)]
+    sigmas = [sampling.sigma(t) for t in timesteps]
+    sigmas.append(0.0)
+    return sigmas
+
+
+class FluxLatentFormat:
+    """FLUX latent space transformation parameters.
+
+    FLUX uses specific scale and shift factors for converting
+    between pixel space and latent space representations.
+
+    Attributes:
+        scale_factor: Factor to multiply latents by (default 0.3611).
+        shift_factor: Value to subtract from latents (default 0.1159).
+    """
+
+    scale_factor: float = 0.3611
+    shift_factor: float = 0.1159
+
+    @classmethod
+    def process_in(cls, latent: Any) -> Any:
+        """Process latent for model input: (latent - shift) * scale.
+
+        Args:
+            latent: Input latent tensor.
+
+        Returns:
+            Processed latent tensor.
+        """
+        return (latent - cls.shift_factor) * cls.scale_factor
+
+    @classmethod
+    def process_out(cls, latent: Any) -> Any:
+        """Process latent for model output: latent / scale + shift.
+
+        Args:
+            latent: Output latent tensor.
+
+        Returns:
+            Reconstructed latent tensor.
+        """
+        return (latent / cls.scale_factor) + cls.shift_factor
+
+
+def flux_time_shift(mu: float, sigma: float, t: float) -> float:
+    """Matches comfy.model_sampling.flux_time_shift exactly."""
+    return math.exp(mu) / (math.exp(mu) + (1.0 / t - 1.0) ** sigma)
+
+
+def time_snr_shift(shift: float, t: float) -> float:
+    """Matches comfy.model_sampling.time_snr_shift exactly.
+
+    Used by `ModelSamplingDiscreteFlow` (Lumina2/Z-Image's sampling class) —
+    a FIXED shift, unlike FLUX-dev's `flux_time_shift` which takes a
+    resolution-dependent `mu`. Z-Image's `sampling_settings = {"shift": 3.0,
+    "multiplier": 1.0}` (comfy/supported_models.py::ZImage) — multiplier=1.0
+    means `timestep(sigma)=sigma` directly (no discrete-table lookup needed
+    for our continuous-sigma Euler loop).
+    """
+    if shift == 1.0:
+        return t
+    return shift * t / (1.0 + (shift - 1.0) * t)
+
+
+def flux_resolution_shift(width: int, height: int,
+                           max_shift: float = 1.15, base_shift: float = 0.5) -> float:
+    """Resolution-dependent shift (mu), matching ComfyUI's ModelSamplingFlux node.
+
+    Interpolates linearly between base_shift (at a 256-token image, i.e.
+    16x16 latent) and max_shift (at a 4096-token image), based on the FLUX
+    packed token count (width*height / (8*8*2*2) = width*height/256).
+    """
+    x1, x2 = 256, 4096
+    mm = (max_shift - base_shift) / (x2 - x1)
+    b = base_shift - mm * x1
+    tokens = width * height / (8 * 8 * 2 * 2)
+    return tokens * mm + b
+
+
+def generate_sigmas(
+    steps: int,
+    model_type: str,
+    width: int = 1024,
+    height: int = 1024,
+) -> list[float]:
+    """Generate sigma schedule for a given model type.
+
+    FLUX dev uses ComfyUI's resolution-dependent flux_time_shift (CONST
+    sampling: sigma(t) = exp(mu) / (exp(mu) + (1/t - 1))), applied to a
+    linear t=1..~0 schedule (matching normal_scheduler + ModelSamplingFlux).
+    FLUX schnell uses uniform steps (shift=1, no resolution dependence).
+    Krea2 uses a linear flow-matching schedule from 1.0 to 0.0.
+
+    Args:
+        steps: Number of denoising steps.
+        model_type: "dev", "schnell", "krea2", or "krea2_turbo".
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        List of sigma values with length steps + 1. Always ends at exactly 0.0.
+    """
+    if model_type == "schnell":
+        return [1.0 - i / steps for i in range(steps + 1)]
+
+    if model_type in ("krea2", "krea2_turbo"):
+        # Flow matching: linear schedule from 1.0 to 0.0
+        return [1.0 - i / steps for i in range(steps + 1)]
+
+    if model_type in ("zimage", "zimage_turbo"):
+        # Flow matching with a FIXED shift (not resolution-dependent like
+        # FLUX-dev's mu) — comfy/supported_models.py::ZImage.sampling_settings.
+        shift = 3.0
+        sigmas = [time_snr_shift(shift, 1.0 - i / steps) for i in range(steps)]
+        sigmas.append(0.0)
+        return sigmas
+
+    if model_type == "flux2":
+        # Flow matching with a FIXED shift of 2.02 (not resolution-dependent
+        # like FLUX-dev's mu) — comfy/supported_models.py::Flux2.sampling_settings
+        # = {"shift": 2.02}, no base_shift/max_shift interpolation, confirmed
+        # by reading the real source rather than assuming parity with
+        # FLUX.1-dev's resolution-dependent schedule.
+        shift = 2.02
+        sigmas = [time_snr_shift(shift, 1.0 - i / steps) for i in range(steps)]
+        sigmas.append(0.0)
+        return sigmas
+
+    mu = flux_resolution_shift(width, height)
+    # normal_scheduler linspaces from timestep(sigma_max)=1.0 down to
+    # timestep(sigma_min)~=0, but since sigma_min for ModelSamplingFlux is
+    # ModelSamplingFlux.sigma(1/10000) which is not exactly 0, ComfyUI adds
+    # one extra step and appends 0.0 explicitly instead. Do the same: sample
+    # `steps` points in (0, 1], shift each through flux_time_shift, then
+    # append the exact zero endpoint — guarantees the schedule always
+    # reaches 0 regardless of resolution (fixes the old formula's bug where
+    # sub-1024x1024 images left a nonzero residual at the final step).
+    sigmas: list[float] = []
+    for i in range(steps):
+        t = 1.0 - i / steps
+        sigmas.append(flux_time_shift(mu, 1.0, t))
+    sigmas.append(0.0)
+    return sigmas

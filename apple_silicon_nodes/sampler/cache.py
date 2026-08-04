@@ -2,12 +2,10 @@
 
 Contains:
   - TeaCacheState: output-level step skipping via accumulated L1 norm
-  - KontextCache: KV cache for reference image conditioning
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import mlx.core as mx
@@ -108,73 +106,3 @@ class TeaCacheState:
         self.metrics.append({
             "step": step, "action": "real", "reason": reason,
         })
-
-
-# ── Kontext KV Cache ──────────────────────────────────────────────────
-
-class KontextCache:
-    """KV cache for reference image tokens in transformer attention.
-
-    Caches K/V pairs from a reference image's latent encoding, then
-    appends them to the attention computation at each denoising step.
-    """
-
-    def __init__(self):
-        self.enabled: bool = False
-        self.cache: dict[str, tuple[mx.array, mx.array]] = {}  # layer_idx -> (k, v)
-        self.reference_tokens: int = 0
-        self.hits: int = 0
-        self.stores: int = 0
-
-    def reset(self) -> None:
-        self.cache.clear()
-        self.hits = 0
-        self.stores = 0
-
-    def set(self, enabled: bool, reference_tokens: int) -> None:
-        self.enabled = bool(enabled and reference_tokens > 0)
-        self.reset()
-        if self.enabled:
-            self.reference_tokens = reference_tokens
-
-    def ready(self) -> bool:
-        return self.enabled and bool(self.cache)
-
-    def get_attention(
-        self,
-        layer_idx: int,
-        q: mx.array,
-        k: mx.array,
-        v: mx.array,
-    ) -> mx.array:
-        """Get attention output, using cached reference K/V if available."""
-        if not self.enabled:
-            return self._plain_attention(q, k, v)
-
-        cache_key = str(layer_idx)
-        cached = self.cache.get(cache_key)
-
-        if cached is not None:
-            # Cache hit: append cached K/V
-            self.hits += 1
-            k_full = mx.concatenate([k, cached[0]], axis=2)
-            v_full = mx.concatenate([v, cached[1]], axis=2)
-            return self._plain_attention(q, k_full, v_full)
-
-        # Cache miss: store reference K/V if we have enough tokens
-        if k.shape[2] >= self.reference_tokens:
-            ref_k = mx.contiguous(k[:, :, -self.reference_tokens:, :])
-            ref_v = mx.contiguous(v[:, :, -self.reference_tokens:, :])
-            mx.eval(ref_k, ref_v)
-            self.cache[cache_key] = (ref_k, ref_v)
-            self.stores += 1
-
-        return self._plain_attention(q, k, v)
-
-    @staticmethod
-    def _plain_attention(q: mx.array, k: mx.array, v: mx.array) -> mx.array:
-        """Standard scaled dot-product attention."""
-        head_dim = q.shape[-1]
-        scale = 1.0 / math.sqrt(head_dim)
-        attn = mx.softmax((q * scale) @ k.transpose(0, 1, 3, 2), axis=-1)
-        return attn @ v

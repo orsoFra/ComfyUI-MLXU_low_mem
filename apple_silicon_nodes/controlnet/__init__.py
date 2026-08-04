@@ -1,15 +1,17 @@
 """
 ControlNet Union Support
 ========================
-MLX-native ControlNet Union ProMax for FLUX.
+MLX-native ControlNet Union for FLUX.1, matching the reference architecture
+in `comfy/ldm/flux/controlnet.py` (ControlNetFlux): a FLUX transformer that
+shares img_in/txt_in/time_in/double_blocks/single_blocks with the base model,
+producing per-block residuals injected into the base model's forward pass.
 
-Supports 8 control types:
+Supports up to 8 control types (Union checkpoints):
   pose, depth, soft_edge, line_canny, normal, segment, tile, repaint
 
 Submodules:
   - types: CONTROL_NET_TYPES constant
-  - blocks: ControlNet building blocks (CondEmbedding, TimeEmbedding, SinusoidalPositionalEncoding)
-  - model: ControlNetUnionModel, load_controlnet_union, weight assignment
+  - model: ControlNetFlux, load_controlnet_union
 """
 
 from __future__ import annotations
@@ -21,9 +23,8 @@ import mlx.core as mx
 import numpy as np
 import torch
 
-from .. import bridge
 from .types import CONTROL_NET_TYPES
-from .model import ControlNetUnionModel, load_controlnet_union
+from .model import ControlNetFlux, load_controlnet_union
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────
@@ -91,7 +92,12 @@ class ASDX_ControlNetUnionLoader:
 class ASDX_ApplyControlNet:
     """Apply ControlNet conditioning to a diffusion model.
 
-    Injects ControlNet residuals into the transformer's attention layers.
+    VAE-encodes the control image into a latent, matching the reference
+    ControlNet forward pass (`ControlNetFlux` consumes a VAE-encoded,
+    latent-format-processed control latent — not raw pixels). The encoded
+    latent, packed the same way as the noise, is stored on the model dict;
+    the sampler computes per-step residuals and injects them into every
+    FLUX double/single block.
     """
 
     @classmethod
@@ -101,6 +107,7 @@ class ASDX_ApplyControlNet:
                 "model": ("asdx_model",),
                 "control_net": ("controlnet",),
                 "image": ("IMAGE",),
+                "vae": ("VAE",),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.01}),
                 "control_type": (["pose", "depth", "soft_edge", "line_canny", "normal", "segment", "tile", "repaint"],),
             },
@@ -119,6 +126,7 @@ class ASDX_ApplyControlNet:
         model: dict,
         control_net: dict,
         image: torch.Tensor,
+        vae: Any,
         strength: float,
         control_type: str,
         mask: torch.Tensor | None = None,
@@ -126,46 +134,27 @@ class ASDX_ApplyControlNet:
         """Attach ControlNet conditioning to the model."""
         type_idx = CONTROL_NET_TYPES.get(control_type, 0)
 
-        # Prepare control image: [B, H, W, 3] -> [B, 4, H, W]
-        control_img = self._prepare_control_image(image, mask)
+        control_image = image if mask is None else self._concat_mask(image, mask)
 
-        # Store ControlNet info on the model
+        model = dict(model)
         model["controlnet"] = {
             "control_net": control_net["control_net"],
-            "image": control_img,
+            "image": control_image,
+            "vae": vae,
             "strength": strength,
-            "control_type": type_idx,
+            "control_type": [type_idx],
         }
 
         print(f"[ASDX] ControlNet applied: {control_type} strength={strength:.2f}")
         return (model,)
 
     @staticmethod
-    def _prepare_control_image(image: torch.Tensor, mask: torch.Tensor | None) -> mx.array:
-        """Convert image (+ optional mask) to MLX array [B, 4, H, W]."""
-        if image.ndim == 3:
-            image = image.unsqueeze(0)
-
-        # Normalize to [-1, 1]
-        img_np = image.detach().cpu().numpy().astype(np.float32)
-        img_np = (img_np * 2.0) - 1.0
-
-        # Add mask channel if provided
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0)
-            mask_np = mask.detach().cpu().numpy().astype(np.float32)
-            # Transpose mask to [B, 1, H, W]
-            if mask_np.ndim == 3:
-                mask_np = mask_np[:, None, :, :]
-            control = np.concatenate([img_np, mask_np], axis=1)
-        else:
-            # 3 channels RGB -> add zeros for alpha
-            control = np.concatenate([img_np, np.zeros_like(img_np[:, :1])], axis=1)
-
-        control_mlx = mx.array(control)
-        mx.eval(control_mlx)
-        return control_mlx
+    def _concat_mask(image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Concatenate a mask as an extra image channel (inpaint ControlNet-Union)."""
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        mask = mask.unsqueeze(-1).to(image.dtype)
+        return torch.cat([image, mask], dim=-1)
 
 
 # ── Node Mappings ─────────────────────────────────────────────────────

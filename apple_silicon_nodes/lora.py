@@ -55,6 +55,22 @@ _FLUX_LORA_TARGETS: tuple[LoRATarget, ...] = (
     LoRATarget(("single_blocks", "{i}", "mlp_2"), ("weight",)),
 )
 
+# Krea2 (SingleStreamDiT) LoRA target patterns
+# Keys in checkpoint: diffusion_model.blocks.{i}.attn.wq.lora_A.weight
+# After stripping prefix: blocks.{i}.attn.wq
+_KREA2_LORA_TARGETS: tuple[LoRATarget, ...] = (
+    # Attention projections
+    LoRATarget(("blocks", "{i}", "attn", "wq"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "attn", "wk"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "attn", "wv"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "attn", "wo"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "attn", "gate_proj"), ("weight",)),
+    # MLP projections
+    LoRATarget(("blocks", "{i}", "mlp", "up"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "mlp", "gate"), ("weight",)),
+    LoRATarget(("blocks", "{i}", "mlp", "down"), ("weight",)),
+)
+
 
 # ── LoRA Adapter ─────────────────────────────────────────────────────
 
@@ -154,9 +170,14 @@ class ASDX_LoraLoader:
         name = path.stem
 
         if path.suffix == ".safetensors":
-            import safetensors
-            with open(path, "rb") as f:
-                raw = safetensors.numpy.load(f.read())
+            import torch
+            import safetensors.torch
+            state = safetensors.torch.load_file(path, device="cpu")
+            raw = {}
+            for k, v in state.items():
+                if v.dtype == torch.bfloat16:
+                    v = v.float()
+                raw[k] = v.cpu().numpy()
         elif path.suffix == ".pt" or path.suffix == ".bin":
             import torch
             state = torch.load(path, map_location="cpu")
@@ -177,11 +198,28 @@ class ASDX_LoraLoader:
             # Standard LoRA format: {prefix}.lora_A.{param} / {prefix}.lora_B.{param}
             if ".lora_A." in key:
                 prefix = key.replace(".lora_A.", ".")
+                # Strip common ComfyUI prefixes (diffusion_model., model., etc.)
+                for pfx in ("diffusion_model.", "model.", "transformer."):
+                    if prefix.startswith(pfx):
+                        prefix = prefix[len(pfx):]
+                        break
+                # Krea2 checkpoints rename attn.gate -> attn.gate_proj (see
+                # weight_map.map_krea2_to_native); LoRA files trained against the
+                # checkpoint naming need the same rename to match the live module tree.
+                if ".attn.gate.weight" in prefix:
+                    prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
                 if prefix not in deltas:
                     deltas[prefix] = (None, None)
                 deltas[prefix] = (weight_arr, deltas[prefix][1])
             elif ".lora_B." in key:
                 prefix = key.replace(".lora_B.", ".")
+                # Strip common ComfyUI prefixes
+                for pfx in ("diffusion_model.", "model.", "transformer."):
+                    if prefix.startswith(pfx):
+                        prefix = prefix[len(pfx):]
+                        break
+                if ".attn.gate.weight" in prefix:
+                    prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
                 if prefix not in deltas:
                     deltas[prefix] = (deltas[prefix][0], None)
                 deltas[prefix] = (deltas[prefix][0], weight_arr)
@@ -203,17 +241,18 @@ class ASDX_LoraLoader:
                     lora.deltas[diff_key] = (weight_arr, None)
 
         # Convert (A, B) pairs to delta = B @ A and compute rank
-        for key, (a, b) in lora.deltas.items():
+        # lora_A is [rank, in_features], lora_B is [out_features, rank]
+        for key, (a, b) in deltas.items():
             if a is not None and b is not None:
                 # Standard LoRA: delta = B @ A
                 delta = (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
                 lora.deltas[key] = delta
                 if lora.rank == 0:
-                    lora.rank = a.shape[-1]
+                    lora.rank = a.shape[0]
             elif a is not None:
                 lora.deltas[key] = a
                 if lora.rank == 0:
-                    lora.rank = a.shape[-1]
+                    lora.rank = a.shape[0]
             elif b is not None:
                 lora.deltas[key] = b
                 if lora.rank == 0:
@@ -247,14 +286,17 @@ class ASDX_LoraLoader:
             print("[ASDX] LoRA: no matching weights found")
             return
 
-        # Apply deltas to transformer weights
+        # Apply deltas to transformer weights.
+        # Navigate to the PARENT module (not the leaf mx.array) so the final
+        # attribute (usually "weight") can be reassigned via setattr — an
+        # mx.array leaf has no .value/.weight to update in place.
         applied = 0
         for key, delta in delta_map.items():
-            # Navigate to the parameter in the transformer
-            param = transformer
             parts = key.split(".")
-            for i, part in enumerate(parts):
-                # Handle numeric indices (block numbers)
+            leaf_attr = parts[-1]
+            param = transformer
+            found = True
+            for part in parts[:-1]:
                 if part.isdigit():
                     idx = int(part)
                     if hasattr(param, "__iter__") and not isinstance(param, str):
@@ -263,26 +305,18 @@ class ASDX_LoraLoader:
                         param = param[idx]
                     continue
 
-                # Handle attribute access
                 if hasattr(param, part):
                     param = getattr(param, part)
                 elif hasattr(param, "_parameters") and part in param._parameters:
                     param = param._parameters[part]
                 else:
-                    param = None
+                    found = False
                     break
 
-            if param is not None and hasattr(param, "value"):
-                # MLX nn.Parameter
-                old = param.value
+            if found and hasattr(param, leaf_attr):
+                old = getattr(param, leaf_attr)
                 delta_mapped = delta.astype(old.dtype)
-                param.value = old + delta_mapped * lora.scale
-                applied += 1
-            elif hasattr(param, "weight") and param.weight is not None:
-                # nn.Linear layer
-                old = param.weight
-                delta_mapped = delta.astype(old.dtype)
-                param.weight = old + delta_mapped * lora.scale
+                setattr(param, leaf_attr, old + delta_mapped * lora.scale)
                 applied += 1
 
         mx.eval(transformer.parameters())
@@ -370,10 +404,13 @@ class ASDX_MultiLoraLoader:
 
             lora_path = ASDX_LoraLoader._resolve_lora_path(lora_name)
             lora = ASDX_LoraLoader._load_lora_file(lora_path)
-            lora.scale = lora.alpha * strength
+            # Same alpha/rank normalization as ASDX_LoraLoader.load_lora, so a
+            # rank-N LoRA doesn't apply at N times its intended strength.
+            lora.scale = lora.alpha / max(lora.rank, 1) * strength
 
-            # Merge deltas into a single pass
-            self._apply_single_lora(transformer, lora)
+            # Reuse the (correctly parent-module-navigating) apply logic —
+            # do not duplicate it here.
+            ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora)
             applied_any = True
             print(f"[ASDX] MultiLoRA: '{lora_name}' (strength={strength:.2f})")
 
@@ -381,38 +418,6 @@ class ASDX_MultiLoraLoader:
             print("[ASDX] MultiLoRA: no LoRAs to apply")
 
         return (model,)
-
-    @staticmethod
-    def _apply_single_lora(transformer: Any, lora: LoRAAdapter) -> None:
-        """Apply a single LoRA to transformer (same as above but without logging)."""
-        for key, delta in lora.deltas.items():
-            param = transformer
-            parts = key.split(".")
-            for part in parts:
-                if part.isdigit():
-                    idx = int(part)
-                    if hasattr(param, "__iter__") and not isinstance(param, str):
-                        param = list(param)[idx]
-                    else:
-                        param = param[idx]
-                    continue
-                if hasattr(param, part):
-                    param = getattr(param, part)
-                elif hasattr(param, "_parameters") and part in param._parameters:
-                    param = param._parameters[part]
-                else:
-                    param = None
-                    break
-
-            if param is not None:
-                if hasattr(param, "value"):
-                    old = param.value
-                    param.value = old + delta.astype(old.dtype) * lora.scale
-                elif hasattr(param, "weight") and param.weight is not None:
-                    old = param.weight
-                    param.weight = old + delta.astype(old.dtype) * lora.scale
-
-        mx.eval(transformer.parameters())
 
 
 # ── LoRA Schedule (per-step strength modulation) ─────────────────────
@@ -467,8 +472,10 @@ class ASDX_LoraSchedule:
             "strength_curve": strength_curve,
         }
 
-        # Apply with start strength
-        lora.scale = lora.alpha * strength_start
+        # Apply with start strength (same alpha/rank normalization as
+        # ASDX_LoraLoader.load_lora — a rank-N LoRA must not apply at N times
+        # its intended strength)
+        lora.scale = lora.alpha / max(lora.rank, 1) * strength_start
         ASDX_LoraLoader._apply_lora_to_transformer(model["transformer"], lora)
 
         print(f"[ASDX] LoRA schedule: '{lora_name}' "

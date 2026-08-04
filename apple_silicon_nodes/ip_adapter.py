@@ -3,7 +3,7 @@ IP-Adapter Cross-Attention Injection
 =====================================
 Inject reference image features into the transformer via cross-attention.
 
-Architecture:
+Architecture (INTENDED, NOT YET FUNCTIONAL — see warning below):
   1. Pre-compute K/V from reference image tokens using CLIP-Vision encoder
   2. Cache K/V pairs per attention layer
   3. During sampling, prepend reference K/V to text K/V in attention
@@ -12,6 +12,22 @@ Supports multiple embedding scaling modes:
   - "V only": only V is scaled
   - "K+V": both K and V are scaled
   - "K+V w/ C penalty": K is penalized by cosine similarity
+
+WARNING — this module is currently a NO-OP end to end:
+  - `CLIPVisionEncoder` is defined but never instantiated or called anywhere
+    (`ASDX_IPAdapterCLIPVisionEncode.encode()` fabricates fake conditioning
+    directly from raw resized pixels instead of running it).
+  - `IPAdapterCache` is defined but never instantiated anywhere.
+  - `image_proj`/`ip_proj` weights loaded by `ASDX_IPAdapterLoader` are never
+    referenced again after loading.
+  - `ASDX_ApplyIPAdapter.apply()` only stashes metadata into the conditioning
+    dict; nothing downstream reads `conditioning["ip_adapter"]` to inject K/V
+    into any attention layer.
+  Unlike ControlNet-Union, FLUX has no IP-Adapter reference implementation in
+  ComfyUI core to verify an architecture against (only divergent third-party
+  forks: XLabs, InstantX) — a real fix needs that reference chosen and wired
+  through the FLUX attention layers, not just a syntax patch. Reference image
+  inputs currently have ZERO effect on generation, silently.
 """
 
 from __future__ import annotations
@@ -94,7 +110,7 @@ class CLIPVisionEncoder(nn.Module):
         self.pos_embed = mx.zeros((1, 197, hidden_size))
 
         # Transformer blocks
-        self.blocks = [nn.Sequential([
+        self.blocks = [nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.MultiHeadAttention(hidden_size, num_heads, bias=True),
             nn.LayerNorm(hidden_size),
@@ -102,7 +118,7 @@ class CLIPVisionEncoder(nn.Module):
             nn.Linear(hidden_size, hidden_size * 4),
             nn.GELU(),
             nn.Linear(hidden_size * 4, hidden_size),
-        ]) for _ in range(num_layers)]
+        ) for _ in range(num_layers)]
 
         # Final layer norm
         self.final_ln = nn.LayerNorm(hidden_size)

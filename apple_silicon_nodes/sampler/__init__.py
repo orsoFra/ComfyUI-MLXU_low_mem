@@ -4,7 +4,7 @@ MLX Native Sampler
 Euler sampler running entirely in MLX on Apple Silicon.
 
 Submodules:
-  - cache: TeaCacheState (output-level step skipping), KontextCache (KV cache)
+  - cache: TeaCacheState (output-level step skipping)
   - core: core denoising loop, sigma scheduling, acceleration helpers
 
 This module provides the ComfyUI node interface (ASDX_MLXSampler)
@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from .. import metadata as metadata_util
 from . import bridge
 from .core import _SamplerCore
 
@@ -49,12 +50,17 @@ class ASDX_MLXSampler:
                 "teacache": ("BOOLEAN", {"default": False}),
                 "teacache_threshold": ("FLOAT", {"default": 0.08, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "kontext": ("BOOLEAN", {"default": False}),
-                "kontext_reference_latent": ("LATENT", {"default": None}),
                 "kontext_reference_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "seacache": ("BOOLEAN", {"default": False}),
                 "preview": ("BOOLEAN", {"default": False}),
+                "low_memory_mode": ("BOOLEAN", {"default": False}),
+                "save_metadata": ("BOOLEAN", {"default": False}),
             },
             "optional": {
+                # Kontext reference — only meaningful when "kontext" above is
+                # True; must live here (not "required") so the graph doesn't
+                # force a link on every generation, including non-Kontext ones.
+                "kontext_reference_latent": ("LATENT", {"default": None}),
                 # Mode routing (Phase 2)
                 "mode": (["auto", "text2img", "img2img", "inpaint", "fill", "depth"],
                          {"default": "auto"}),
@@ -66,6 +72,11 @@ class ASDX_MLXSampler:
                 "depth_image": ("IMAGE", {"default": None}),
                 "depth_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "noise_aug": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                # Krea2 Identity Edit
+                "source_latent": ("LATENT", {"default": None}),
+                "ref_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01,
+                                          "tooltip": "reference-fidelity dial: multiplies target->source attention. "
+                                                     "1.0 = off, >1 pulls harder toward the source's appearance."}),
                 # Legacy
                 "lora_schedule": ("ASDX_LORA_SCHEDULE", {"default": None}),
             },
@@ -87,10 +98,12 @@ class ASDX_MLXSampler:
         teacache: bool,
         teacache_threshold: float,
         kontext: bool,
-        kontext_reference_latent: dict | None,
         kontext_reference_strength: float,
         seacache: bool,
         preview: bool,
+        low_memory_mode: bool,
+        save_metadata: bool,
+        kontext_reference_latent: dict | None = None,
         # Mode routing params (Phase 2)
         mode: str = "auto",
         image: torch.Tensor | None = None,
@@ -101,6 +114,9 @@ class ASDX_MLXSampler:
         depth_image: torch.Tensor | None = None,
         depth_strength: float = 1.0,
         noise_aug: float = 0.0,
+        # Krea2 Identity Edit
+        source_latent: dict | None = None,
+        ref_boost: float = 1.0,
         # Legacy
         lora_schedule: dict | None = None,
     ) -> tuple[dict]:
@@ -109,11 +125,26 @@ class ASDX_MLXSampler:
         config = model["config"]
         model_type = model.get("model_type", "dev")
         capability = model.get("capability")
+        controlnet = model.get("controlnet")
 
-        # Prepare noise
-        noise, height, width, output_shape = bridge.prepare_noise_from_latent(
-            latent_image, int(seed), config.mlx_dtype
-        )
+        # Prepare noise. SDXL's UNet consumes the latent grid directly (no
+        # 2x2 patchify like FLUX/Krea2), so it needs its own noise-prep path.
+        # Flux2/Klein has 128 channels / patch_size=1 / 16x VAE downscale
+        # (vs FLUX's 16ch/patch=2/8x) — also its own path, NOT shared with
+        # Z-Image (which reuses FLUX's path outright since it inherits the
+        # exact same 16ch/patch=2/8x latent format).
+        if model_type == "sdxl":
+            noise, height, width, output_shape = bridge.prepare_noise_from_latent_sdxl(
+                latent_image, int(seed), config.mlx_dtype
+            )
+        elif model_type == "flux2":
+            noise, height, width, output_shape = bridge.prepare_noise_from_latent_flux2(
+                latent_image, int(seed), config.mlx_dtype
+            )
+        else:
+            noise, height, width, output_shape = bridge.prepare_noise_from_latent(
+                latent_image, int(seed), config.mlx_dtype
+            )
 
         # Get previewer for real-time output
         previewer, preview_device = self._get_previewer() if preview else (None, None)
@@ -142,6 +173,8 @@ class ASDX_MLXSampler:
             capability=capability,
             # Mode routing
             mode=mode,
+            # Low memory mode
+            low_memory_mode=low_memory_mode,
             image=image,
             image_strength=image_strength,
             mask=mask,
@@ -150,10 +183,29 @@ class ASDX_MLXSampler:
             depth_image=depth_image,
             depth_strength=depth_strength,
             noise_aug=noise_aug,
+            # Krea2 Identity Edit
+            source_latent=source_latent,
+            ref_boost=ref_boost,
+            controlnet=controlnet,
         )
 
         # Run sampling
         out_latent = core.run(steps, seed)
+
+        # Attach generation metadata to the latent output
+        if save_metadata:
+            out_latent["asdx_metadata"] = metadata_util.build_generation_metadata(
+                model_name=model.get("name", "unknown"),
+                model_type=model_type,
+                precision=config.dtype,
+                seed=seed,
+                width=width,
+                height=height,
+                steps=steps,
+                cfg=guidance,
+                mode=mode,
+            )
+
         return (out_latent,)
 
     @staticmethod

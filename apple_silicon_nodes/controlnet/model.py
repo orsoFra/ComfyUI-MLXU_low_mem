@@ -1,296 +1,240 @@
-"""ControlNet Union model and weight loading.
+"""ControlNet Union model for FLUX.1, and weight loading.
+
+Matches the reference architecture in `comfy/ldm/flux/controlnet.py`
+(`ControlNetFlux`): this is NOT a separate SDXL-style UNet — it's a
+FLUX transformer that shares img_in/txt_in/time_in/double_blocks/
+single_blocks with the base FLUX model, plus a `pos_embed_input`
+projection for the (VAE-encoded) control latent and one linear
+`controlnet_blocks[i]`/`controlnet_single_blocks[i]` projection per
+block that produces the residual added into the base model's forward
+pass (see FluxTransformer.__call__'s `control` parameter).
 
 Contains:
-  - ControlNetUnionModel: MLX-native ControlNet Union ProMax for FLUX
+  - ControlNetFlux: MLX-native ControlNet Union for FLUX
   - load_controlnet_union: load checkpoint and cache model
-  - _assign_controlnet_weights / _set_param: weight mapping utilities
+  - _assign_controlnet_weights: weight mapping utilities
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
-from .blocks import (
-    ControlNetCondEmbedding,
-    SinusoidalPositionalEncoding,
-    TimeEmbedding,
+from ..native import (
+    AXES_DIM,
+    CONTEXT_IN_DIM,
+    HIDDEN_DIM,
+    ROPE_THETA,
+    VEC_IN_DIM,
+    DoubleBlock,
+    MLPEmbedder,
+    SingleBlock,
+    embed_nd,
+    timestep_embedding,
 )
+from ..native.config import FluxConfig
 
 
 # ── ControlNet Union Model ───────────────────────────────────────────
 
-class ControlNetUnionModel(nn.Module):
-    """ControlNet Union ProMax supporting 8 control types.
+class ControlNetFlux(nn.Module):
+    """ControlNet Union for FLUX.1, matching comfy.ldm.flux.controlnet.ControlNetFlux.
 
     Architecture:
-      - conv_in: Conv2d(4, 320) -- accepts RGB + mask
-      - controlnet_cond_embedding: processes control image
-      - control_type_proj: encodes which control type is active
-      - transformer_layers: 1 ResidualAttentionBlock(320, 8)
-      - down_blocks: 3 UNetBlock2D stages [320, 640, 1280]
-      - mid_block: ResNet -> Transformer2D(20 heads, 10 layers) -> ResNet
-      - controlnet_down_blocks: 9 residual projections (8 down + 1 mid)
+      pos_embed_input: Linear(control_latent_channels, hidden_dim) — projects
+                        the VAE-encoded control latent, added to img tokens
+      img_in / txt_in / time_in / vector_in / guidance_in: same as FluxTransformer
+      double_blocks / single_blocks: same as FluxTransformer (config.num_*)
+      controlnet_blocks[i]: Linear(hidden, hidden) per double block — produces
+                             the residual injected into the base model's img
+      controlnet_single_blocks[i]: same, per single block
+      controlnet_mode_embedder: optional Embedding(num_union_modes, hidden) for
+                                 ControlNet-Union's control-type conditioning
     """
 
-    def __init__(self, num_control_types: int = 8):
+    def __init__(
+        self,
+        config: FluxConfig | None = None,
+        num_union_modes: int = 0,
+        control_latent_channels: int = 16,
+    ):
         super().__init__()
-        self.num_control_type = num_control_types
+        config = config or FluxConfig()
+        self.config = config
+        self.dtype = config.mlx_dtype
+        self.num_union_modes = num_union_modes
 
-        # Timestep encoding
-        self.timesteps = SinusoidalPositionalEncoding(320, scale=1.0, cos_first=True)
-        self.time_embedding = TimeEmbedding(320, 1280)
+        self.img_in = nn.Linear(64, HIDDEN_DIM)
+        self.txt_in = nn.Linear(CONTEXT_IN_DIM, HIDDEN_DIM)
+        self.time_in = MLPEmbedder(256, HIDDEN_DIM)
+        self.vector_in = MLPEmbedder(VEC_IN_DIM, HIDDEN_DIM)
+        self.guidance_in = MLPEmbedder(256, HIDDEN_DIM) if config.guidance_embed else None
 
-        # Control type embeddings
-        self.control_type_proj = SinusoidalPositionalEncoding(256, scale=1.0, cos_first=True)
-        self.control_add_embedding = TimeEmbedding(256 * num_control_types, 1280)
+        # control_latent_channels is already *4 (2x2 patch) by the caller for
+        # the packed-latent ControlNet-Union path (latent_input=True)
+        self.pos_embed_input = nn.Linear(control_latent_channels, HIDDEN_DIM)
 
-        # Control image conditioning
-        self.conv_in = nn.Conv2d(4, 32, kernel_size=3, padding=1)
-        self.controlnet_cond_embedding = ControlNetCondEmbedding()
-        self.task_embedding = mx.zeros((num_control_types, 320))
-        self.transformer_layers = [self._make_attention_block(320, 8)]
-        self.spatial_ch_projs = nn.Linear(320, 320)
-
-        # Down blocks (simplified UNet structure)
-        self.down_blocks = [
-            self._make_unet_block(320, 320, temb_channels=1280, add_cross_attention=False),
-            self._make_unet_block(320, 640, temb_channels=1280, add_cross_attention=True),
-            self._make_unet_block(640, 1280, temb_channels=1280, add_cross_attention=True),
+        self.double_blocks = [
+            DoubleBlock() for _ in range(config.num_double_blocks)
+        ]
+        self.single_blocks = [
+            SingleBlock() for _ in range(config.num_single_blocks)
         ]
 
-        # Mid block
-        self.mid_blocks = [
-            self._make_resnet(1280, 1280, temb_channels=1280),
-            self._make_transformer(1280, 2048, 20, 10),
-            self._make_resnet(1280, 1280, temb_channels=1280),
+        self.controlnet_blocks = [
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM) for _ in range(config.num_double_blocks)
+        ]
+        self.controlnet_single_blocks = [
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM) for _ in range(config.num_single_blocks)
         ]
 
-        # Output projections
-        control_channels = [320, 320, 320, 320, 640, 640, 640, 1280, 1280]
-        self.controlnet_down_blocks = [
-            nn.Conv2d(ch, ch, kernel_size=1) for ch in control_channels
-        ]
-        self.controlnet_mid_block = nn.Conv2d(1280, 1280, kernel_size=1)
+        self.controlnet_mode_embedder = (
+            nn.Embedding(num_union_modes, HIDDEN_DIM) if num_union_modes > 0 else None
+        )
 
-    def _make_attention_block(self, dim: int, num_heads: int) -> nn.Module:
-        """Create a ResidualAttentionBlock."""
-        return nn.Sequential([
-            nn.LayerNorm(dim),
-            nn.MultiHeadAttention(dim, num_heads, bias=True),
-            nn.LayerNorm(dim),
-            nn.Sequential(
-                nn.Linear(dim, dim * 4),
-                lambda x: x * mx.sigmoid(1.702 * x),
-                nn.Linear(dim * 4, dim),
-            ),
-        ])
+    def get_rope(self, img_h: int, img_w: int, txt_len: int) -> mx.array:
+        """Same 3-axis RoPE table as FluxTransformer (shared position convention)."""
+        img_len = img_h * img_w
+        ids = mx.zeros((txt_len + img_len, 3), dtype=mx.float32)
+        if img_len > 0:
+            rows = mx.arange(img_h, dtype=mx.float32)[:, None]
+            cols = mx.arange(img_w, dtype=mx.float32)[None, :]
+            rows = mx.broadcast_to(rows, (img_h, img_w)).reshape(-1)
+            cols = mx.broadcast_to(cols, (img_h, img_w)).reshape(-1)
+            ids[txt_len:, 1] = rows
+            ids[txt_len:, 2] = cols
+        return embed_nd(ids, AXES_DIM, ROPE_THETA)
 
-    def _make_unet_block(self, in_ch: int, out_ch: int,
-                         temb_channels: int, add_cross_attention: bool) -> nn.Module:
-        """Create a simplified UNet block."""
-        return nn.Sequential([
-            self._make_resnet(in_ch, out_ch, temb_channels),
-            self._make_resnet(out_ch, out_ch, temb_channels),
-        ])
-
-    def _make_resnet(self, in_ch: int, out_ch: int,
-                     temb_channels: int) -> nn.Module:
-        """Create a ResNet block."""
-        return nn.Sequential([
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            TimeEmbedding(temb_channels, out_ch),
-            nn.SiLU(),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-        ])
-
-    def _make_transformer(self, dim: int, cross_attn_dim: int,
-                          num_heads: int, num_layers: int) -> nn.Module:
-        """Create a transformer block."""
-        layers: list[nn.Module] = []
-        for _ in range(num_layers):
-            layers.extend([
-                nn.LayerNorm(dim),
-                nn.MultiHeadAttention(dim, num_heads, bias=True),
-                nn.LayerNorm(dim),
-                nn.Linear(dim, dim * 4),
-                lambda x: x * mx.sigmoid(1.702 * x),
-                nn.Linear(dim * 4, dim),
-            ])
-        return nn.Sequential(layers)
+    def time_embed(self, t: mx.array, guidance: mx.array | None = None,
+                   pooled: mx.array | None = None) -> mx.array:
+        vec = self.time_in(timestep_embedding(t, 256).astype(self.dtype))
+        if guidance is not None and self.guidance_in is not None:
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).astype(self.dtype))
+        if pooled is not None:
+            vec = vec + self.vector_in(pooled.astype(self.dtype))
+        return vec
 
     def __call__(
         self,
-        x: mx.array,           # [B, C, H, W] noisy latent
-        timestep: mx.array,    # [B] timestep
-        encoder_x: mx.array,   # [B, T, D] text embeddings
-        control_image: mx.array,  # [B, 4, H, W] control image (RGB + mask)
-        control_type_idx: int,  # Which control type
-        conditioning_scale: float = 1.0,
-        text_time: tuple | None = None,
-    ) -> tuple[list[mx.array], mx.array]:
+        img: mx.array,               # [B, N_img, 64] packed noisy latent
+        control_latent: mx.array,    # [B, N_img, control_latent_channels] packed control latent
+        txt: mx.array,               # [B, N_txt, 4096] T5 embeddings
+        t: mx.array,                 # [B] timestep
+        img_h: int,
+        img_w: int,
+        guidance: mx.array | None = None,
+        pooled: mx.array | None = None,
+        rope: mx.array | None = None,
+        control_type: list[int] | None = None,
+    ) -> dict[str, list[mx.array]]:
         """Forward pass.
 
         Returns:
-            (down_residuals, mid_residual) each scaled by conditioning_scale
+            {"input": [...N double residuals...], "output": [...N single residuals...]}
+            matching FluxTransformer.__call__'s `control` parameter shape.
         """
-        dtype = x.dtype
-        batch = x.shape[0]
+        img = self.img_in(img.astype(self.dtype))
+        img = img + self.pos_embed_input(control_latent.astype(self.dtype))
+        txt = self.txt_in(txt.astype(self.dtype))
 
-        # Timestep embedding
-        temb = self.time_embedding(self.timesteps(timestep).astype(dtype))
+        vec = self.time_embed(t, guidance=guidance, pooled=pooled)
 
-        # Add text time
-        if text_time is not None:
-            text_emb, time_ids = text_time
-            emb = self._time_proj(time_ids).flatten(1).astype(dtype)
-            emb = mx.concatenate([text_emb, emb], axis=-1)
-            temb = temb + self.control_add_embedding(emb)
+        if self.controlnet_mode_embedder is not None and control_type:
+            mode_ids = mx.array(control_type)
+            control_cond = self.controlnet_mode_embedder(mode_ids)[None]  # [1, M, hidden]
+            control_cond = mx.broadcast_to(
+                control_cond, (txt.shape[0], control_cond.shape[1], HIDDEN_DIM)
+            )
+            txt = mx.concatenate([control_cond, txt], axis=1)
 
-        # Control type embedding
-        control_type = mx.zeros((batch, self.num_control_type), dtype=dtype)
-        control_type = control_type + mx.array(
-            [[1.0 if i == control_type_idx else 0.0 for i in range(self.num_control_type)]],
-            dtype=dtype,
-        )
-        control_embeds = self.control_type_proj(control_type.flatten()).reshape(batch, -1).astype(dtype)
-        temb = temb + self.control_add_embedding(control_embeds)
+        if rope is None:
+            rope = self.get_rope(img_h, img_w, txt.shape[1])
 
-        # Process control image
-        x = self.conv_in(x)
-        condition = self.controlnet_cond_embedding(control_image.astype(dtype))
-        feat_seq = mx.mean(condition, axis=(1, 2)) + self.task_embedding[control_type_idx].astype(dtype)
-        sample_seq = mx.mean(x, axis=(1, 2))
-        seq = mx.stack([feat_seq, sample_seq], axis=1)
+        double_residuals = []
+        for block in self.double_blocks:
+            img, txt = block(img, txt, vec, rope)
+            double_residuals.append(img)
+        double_out = [proj(r) for proj, r in zip(self.controlnet_blocks, double_residuals)]
 
-        for layer in self.transformer_layers:
-            seq = layer(seq)
+        x = mx.concatenate([txt, img], axis=1)
+        single_residuals = []
+        for block in self.single_blocks:
+            x = block(x, vec, rope)
+            single_residuals.append(x[:, txt.shape[1]:])
+        single_out = [proj(r) for proj, r in zip(self.controlnet_single_blocks, single_residuals)]
 
-        alpha = self.spatial_ch_projs(seq[:, 0])[:, None, None, :]
-        x = x + condition + alpha
-
-        # Down blocks
-        residuals = [x]
-        for block in self.down_blocks:
-            x = block[0](x, temb)
-            x = block[1](x, temb)
-            residuals.append(x)
-
-        # Mid block
-        x = self.mid_blocks[0](x[0], temb)
-        x = self.mid_blocks[1](x, encoder_x, None, None)
-        x = self.mid_blocks[2](x, temb)
-
-        # Scale residuals
-        down = [
-            block(residual) * conditioning_scale
-            for block, residual in zip(self.controlnet_down_blocks, residuals)
-        ]
-        mid = self.controlnet_mid_block(x) * conditioning_scale
-
-        return down, mid
-
-    def _time_proj(self, time_ids: mx.array) -> mx.array:
-        """Timestep projection for text_time augmentation."""
-        half_dim = 256 // 2
-        exponent = -math.log(10000) * mx.arange(start=0, stop=half_dim, dtype=mx.float32) / half_dim
-        emb = mx.exp(exponent)
-        emb = time_ids[:, None].astype(mx.float32) * emb[None, :]
-        return mx.concatenate([mx.sin(emb), mx.cos(emb)], axis=-1)
+        return {"input": double_out, "output": single_out}
 
 
 # ── Model Loader ─────────────────────────────────────────────────────
 
-_CONTROLNET_CACHE: dict[str, ControlNetUnionModel] = {}
+_CONTROLNET_CACHE: dict[str, ControlNetFlux] = {}
 
 
-def load_controlnet_union(path: str | Path) -> ControlNetUnionModel:
-    """Load a ControlNet Union model from a checkpoint file."""
+def load_controlnet_union(path: str | Path, dtype: str = "float16") -> ControlNetFlux:
+    """Load a ControlNet Union model for FLUX from a checkpoint file."""
+    from mlx.utils import tree_flatten, tree_unflatten
+
     path = Path(path)
-    cache_key = str(path)
-
+    cache_key = f"{path}:{dtype}"
     if cache_key in _CONTROLNET_CACHE:
         return _CONTROLNET_CACHE[cache_key]
 
-    # Load weights
-    import safetensors
-    with open(path, "rb") as f:
-        raw = safetensors.numpy.load(f.read())
+    from .. import native
+    state = native._load_safetensors(path)
 
-    # Create model
-    model = ControlNetUnionModel()
+    # Strip common ComfyUI prefixes (matches native/weight_map.py::normalize_flux_keys)
+    normalized: dict[str, mx.array] = {}
+    for key, value in state.items():
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "model."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        normalized[key] = value
 
-    # Map weights
-    _assign_controlnet_weights(model, raw)
+    # Same three renames as FLUX's map_flux_to_native: img_mlp./txt_mlp. -> _,
+    # QKNorm scale -> weight. ControlNet checkpoints use the identical
+    # double_blocks/single_blocks naming as the base FLUX model.
+    mapped: dict[str, mx.array] = {}
+    for key, value in normalized.items():
+        new_key = key
+        if ".img_mlp." in new_key:
+            new_key = new_key.replace(".img_mlp.", ".img_mlp_")
+        elif ".txt_mlp." in new_key:
+            new_key = new_key.replace(".txt_mlp.", ".txt_mlp_")
+        elif new_key.endswith(("query_norm.scale", "key_norm.scale")):
+            new_key = new_key[: -len("scale")] + "weight"
+        mapped[new_key] = value
 
-    mx.eval(model.parameters())
-    _CONTROLNET_CACHE[cache_key] = model
+    num_union_modes = 0
+    if "controlnet_mode_embedder.weight" in mapped:
+        num_union_modes = mapped["controlnet_mode_embedder.weight"].shape[0]
 
-    print(f"[ASDX] ControlNet Union loaded: {path.name}")
-    return model
+    control_latent_channels = 64  # default: same packed-latent width as img_in
+    if "pos_embed_input.weight" in mapped:
+        control_latent_channels = mapped["pos_embed_input.weight"].shape[1]
 
+    config = FluxConfig(dtype=dtype)
+    model = ControlNetFlux(
+        config, num_union_modes=num_union_modes,
+        control_latent_channels=control_latent_channels,
+    )
 
-def _assign_controlnet_weights(model: ControlNetUnionModel, raw: dict) -> None:
-    """Assign weights from checkpoint to model parameters."""
-    for key, value in raw.items():
-        weight = mx.array(value)
-
-        # Normalize key
-        prefix = "control_model."
-        if key.startswith(prefix):
-            key = key[len(prefix):]
-
-        # Map to model attributes
-        _set_param(model, key, weight)
-
-
-def _set_param(obj: Any, key: str, value: mx.array) -> None:
-    """Set a parameter on an MLX module, handling nested paths."""
-    parts = key.split(".")
-
-    # Handle special key transformations
-    if key.endswith(".attn.in_proj_weight"):
-        prefix = key[:-len(".attn.in_proj_weight")]
-        q, k, v = mx.split(value, 3)
-        _set_param(obj, f"{prefix}.attn.query_proj.weight", q)
-        _set_param(obj, f"{prefix}.attn.key_proj.weight", k)
-        _set_param(obj, f"{prefix}.attn.value_proj.weight", v)
-        return
-    if key.endswith(".attn.in_proj_bias"):
-        prefix = key[:-len(".attn.in_proj_bias")]
-        q, k, v = mx.split(value, 3)
-        _set_param(obj, f"{prefix}.attn.query_proj.bias", q)
-        _set_param(obj, f"{prefix}.attn.key_proj.bias", k)
-        _set_param(obj, f"{prefix}.attn.value_proj.bias", v)
-        return
-
-    # Handle ln_1 -> norm1, ln_2 -> norm2
-    key = key.replace(".ln_1.", ".norm1.")
-    key = key.replace(".ln_2.", ".norm2.")
-    key = key.replace(".transofrmer_layes.", ".transformer_layers.")
-    key = key.replace(".transformer_layes.", ".transformer_layers.")
-
-    # Navigate to parent object
-    current = obj
-    for part in parts[:-1]:
-        if hasattr(current, part):
-            current = getattr(current, part)
-        elif hasattr(current, "_parameters") and part in current._parameters:
-            current = current._parameters[part]
+    model_flat = tree_flatten(model.parameters())
+    new_flat = []
+    matched = 0
+    for flat_key, value in model_flat:
+        if flat_key in mapped:
+            new_flat.append((flat_key, mapped[flat_key]))
+            matched += 1
         else:
-            return  # Key not found
+            new_flat.append((flat_key, value))
+    model.update(tree_unflatten(new_flat))
+    mx.eval(model.parameters())
 
-    # Set the final parameter
-    attr = parts[-1]
-    if hasattr(current, attr):
-        current_val = getattr(current, attr)
-        if hasattr(current_val, "shape") and current_val.shape == value.shape:
-            setattr(current, attr, value)
-    elif hasattr(current, "_parameters") and attr in current._parameters:
-        if current._parameters[attr].shape == value.shape:
-            current._parameters[attr] = value
+    print(f"[ASDX] ControlNet Union loaded: {path.name} "
+          f"({matched}/{len(model_flat)} params matched)")
+    _CONTROLNET_CACHE[cache_key] = model
+    return model

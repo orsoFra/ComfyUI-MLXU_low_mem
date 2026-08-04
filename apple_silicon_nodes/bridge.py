@@ -25,6 +25,11 @@ import torch
 # FLUX uses 16 latent channels; SD1.5/SDXL use 4
 FLUX_LATENT_CHANNELS = 16
 SDXL_LATENT_CHANNELS = 4
+# Flux2/Klein: 128 latent channels, VAE downscales 16x spatially (vs FLUX's
+# 8x) and patch_size=1 (no further 2x2 token packing) — see
+# comfy/latent_formats.py::Flux2 (spacial_downscale_ratio=16).
+FLUX2_LATENT_CHANNELS = 128
+FLUX2_VAE_DOWNSCALE = 16
 
 # ComfyUI image format: [B, H, W, C] range [0, 1] float32
 # FLUX VAE input/output expects [B, C, H, W] range [-1, 1] float16
@@ -123,6 +128,49 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
+def conditioning_sdxl_to_mlx(
+    conditioning: Any,
+    precision: mx.Dtype,
+) -> tuple[mx.array, mx.array]:
+    """Extract cross-attn context and pooled CLIP-G from SD-style Comfy conditioning.
+
+    `ASDX_CLIPTextEncode`'s SD/SDXL/Pony path (`conditioning.py`) produces
+    `{"type": "clip", "conditioning": [[cond_tensor, {"pooled_output": ...}], ...]}`
+    via ComfyUI's own dual-CLIP object (`comfy.sd.CLIP` loaded with
+    `clip_type="sdxl"`) — `cond_tensor` is already the concatenated
+    CLIP-L(768)+CLIP-G(1280) cross-attn context (2048-dim), matching
+    `comfy/sdxl_clip.py::SDXLClipModel.encode_token_weights`.
+
+    Returns (cond, pooled). cond: [B, T, 2048]. pooled: [B, 1280] (CLIP-G only).
+    """
+    if isinstance(conditioning, dict):
+        conditioning = conditioning.get("conditioning", conditioning)
+
+    entry = conditioning[0] if conditioning else None
+    if entry is None:
+        raise RuntimeError("ASDX: SDXL conditioning is empty.")
+    cond = entry[0]
+    meta = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+    pooled = meta.get("pooled_output")
+    if pooled is None:
+        raise RuntimeError("ASDX: SDXL conditioning has no pooled_output (CLIP-G pooled).")
+
+    cond_np = _to_numpy(cond)
+    pooled_np = _to_numpy(pooled)
+
+    if cond_np.ndim != 3 or cond_np.shape[-1] != 2048:
+        raise RuntimeError(f"ASDX: expected SDXL context [B,T,2048], got {cond_np.shape}")
+    if pooled_np.ndim != 2 or pooled_np.shape[-1] != 1280:
+        raise RuntimeError(f"ASDX: expected pooled CLIP-G [B,1280], got {pooled_np.shape}")
+    if cond_np.shape[0] != 1 or pooled_np.shape[0] != 1:
+        raise RuntimeError("ASDX: currently supports batch_size=1 only.")
+
+    cond_mlx = mx.array(cond_np).astype(precision)
+    pooled_mlx = mx.array(pooled_np).astype(precision)
+    mx.eval(cond_mlx, pooled_mlx)
+    return cond_mlx, pooled_mlx
+
+
 # ── MLX -> PyTorch ───────────────────────────────────────────────────
 
 def mlx_to_comfy_image(decoded: mx.array) -> torch.Tensor:
@@ -170,8 +218,174 @@ def _unpack_flux_latents(
     unpacked = unpacked.astype(mx.float32)
     mx.eval(unpacked)
 
-    samples = torch.from_numpy(np.array(unpacked, dtype=np.float32))
-    return samples
+    return torch.from_numpy(np.array(unpacked, dtype=np.float32))
+
+
+def conditioning_zimage_to_mlx(
+    conditioning: Any,
+    precision: mx.Dtype,
+) -> mx.array:
+    """Extract the Qwen3-4B text embedding from SD-style Comfy conditioning.
+
+    Unlike Krea2 (which fuses 12 stacked Qwen3-VL layer taps into a
+    30720-dim tensor via `TxtFusionTransformer`), Z-Image's `cap_embedder`
+    consumes a SINGLE hidden layer directly — `comfy/text_encoders/
+    z_image.py::Qwen3_4BModel` uses `layer="hidden", layer_idx=-2`
+    (penultimate layer only, same convention as SDXL's CLIP-L/G) — so this
+    is a plain single-tensor extraction, no fusion bridge needed. No pooled
+    output is used (Z-Image's base config has no ADM-style pooled
+    conditioning — `clip_text_pooled_proj` stays unset unless a variant
+    declares `clip_text_dim`, which the base checkpoint on this machine
+    doesn't).
+
+    `ASDX_CLIPTextEncode`'s SD-style path (`{"type":"clip","conditioning":
+    [[cond_tensor,{...}], ...]}`) already works for Z-Image: comfy's
+    `load_clip` routes a detected Qwen3-4B checkpoint to
+    `z_image.te()`/`ZImageTokenizer` for any `clip_type` other than
+    FLUX/FLUX2 (`comfy/sd.py:1744-1750`) — no dedicated CLIPType or
+    `conditioning.py` change needed, verified against the real source.
+
+    Returns cond: [B, T, cap_feat_dim] (2560 for the real checkpoint on
+    this machine).
+    """
+    if isinstance(conditioning, dict):
+        conditioning = conditioning.get("conditioning", conditioning)
+
+    entry = conditioning[0] if conditioning else None
+    if entry is None:
+        raise RuntimeError("ASDX: Z-Image conditioning is empty.")
+    cond = entry[0]
+
+    cond_np = _to_numpy(cond)
+    if cond_np.ndim != 3:
+        raise RuntimeError(f"ASDX: expected Z-Image context [B,T,D], got {cond_np.shape}")
+    if cond_np.shape[0] != 1:
+        raise RuntimeError("ASDX: currently supports batch_size=1 only.")
+
+    cond_mlx = mx.array(cond_np).astype(precision)
+    mx.eval(cond_mlx)
+    return cond_mlx
+
+
+def conditioning_flux2_to_mlx(
+    conditioning: Any,
+    precision: mx.Dtype,
+) -> tuple[mx.array, float | None]:
+    """Extract the tapped-and-concatenated text embedding for Flux2/Klein.
+
+    `Flux2Tokenizer`/`KleinTokenizer` (`comfy/text_encoders/flux.py`) tap 3
+    hidden layers of the text encoder (Mistral3-24B for Flux2-D, Qwen3-4B/8B
+    for Klein) and concatenate them — [B,T,3*text_hidden_dim]. This is
+    already what `ASDX_CLIPTextEncode`'s SD-style conditioning path hands
+    over as `cond`; no fusion bridge needed (same situation as Z-Image).
+
+    `Flux2.extra_conds` (`comfy/model_base.py:1075-1084`) left-pads the text
+    sequence to a MINIMUM of 512 tokens with zeros
+    (`F.pad(cross_attn, (0,0, 512-len, 0))` — padding added at the START of
+    the sequence, not the end) whenever the real prompt is shorter. This is
+    NOT optional/cosmetic: skipping it changes the RoPE positions assigned
+    to the real tokens by `get_rope()` (whose txt_ids are simply
+    `arange(txt_len)`), silently diverging from what the checkpoint saw
+    during training. Longer prompts are left untouched (no truncation).
+
+    Returns (cond, guidance). guidance is None unless the conditioning
+    metadata carries one (Flux2-D's checkpoint has a guidance embedding;
+    Klein's doesn't — `Flux2Transformer` silently ignores it either way if
+    `guidance_in` wasn't allocated for the loaded checkpoint).
+    """
+    guidance = None
+
+    if isinstance(conditioning, dict):
+        conditioning = conditioning.get("conditioning", conditioning)
+
+    entry = conditioning[0] if conditioning else None
+    if entry is None:
+        raise RuntimeError("ASDX: Flux2 conditioning is empty.")
+    cond = entry[0]
+    meta = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+    if "guidance" in meta:
+        try:
+            guidance = float(meta["guidance"])
+        except Exception:
+            pass
+
+    cond_np = _to_numpy(cond)
+    if cond_np.ndim != 3:
+        raise RuntimeError(f"ASDX: expected Flux2 context [B,T,D], got {cond_np.shape}")
+    if cond_np.shape[0] != 1:
+        raise RuntimeError("ASDX: currently supports batch_size=1 only.")
+
+    target_text_len = 512
+    if cond_np.shape[1] < target_text_len:
+        pad = target_text_len - cond_np.shape[1]
+        cond_np = np.pad(cond_np, ((0, 0), (pad, 0), (0, 0)), mode="constant")
+
+    cond_mlx = mx.array(cond_np).astype(precision)
+    mx.eval(cond_mlx)
+    return cond_mlx, guidance
+
+
+def mlx_to_comfy_latent_flux2(
+    latents: mx.array,
+    height: int,
+    width: int,
+    template: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert MLX Flux2 latent to a ComfyUI LATENT dict.
+
+    Flux2 latents are flat token sequences [B, H_lat*W_lat, 128] with NO 2x2
+    patch packing (`patch_size=1`, unlike FLUX.1's 64=16*2*2) — unpacking is
+    just a reshape+transpose back to [B, 128, H_lat, W_lat], no interleaved
+    patch un-shuffle needed.
+    """
+    samples = _unpack_flux2_latents(latents, height, width)
+    out = dict(template)
+    out["samples"] = samples
+    return out
+
+
+def _unpack_flux2_latents(
+    latents: mx.array,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Unpack flat Flux2 latent [B, H_lat*W_lat, 128] -> [B, 128, H_lat, W_lat]."""
+    latent_h = height // FLUX2_VAE_DOWNSCALE
+    latent_w = width // FLUX2_VAE_DOWNSCALE
+
+    unpacked = mx.reshape(latents, (1, latent_h, latent_w, FLUX2_LATENT_CHANNELS))
+    unpacked = mx.transpose(unpacked, (0, 3, 1, 2)).astype(mx.float32)
+    mx.eval(unpacked)
+
+    return torch.from_numpy(np.array(unpacked, dtype=np.float32))
+
+
+def mlx_to_comfy_latent_sdxl(
+    latents: mx.array,
+    template: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert MLX SDXL UNet output to a ComfyUI LATENT dict.
+
+    Unlike FLUX, SDXL's UNet operates on the latent grid directly (no 2x2
+    patchify) but in MLX's channel-last layout — this only needs the NHWC
+    -> NCHW transpose plus `process_latent_out` (divide by SDXL's
+    `scale_factor`, applied once at the sampling boundary, matching
+    `comfy/samplers.py:1236`).
+    """
+    samples = _unpack_sdxl_latents(latents)
+    out = dict(template)
+    out["samples"] = samples
+    return out
+
+
+def _unpack_sdxl_latents(latents: mx.array) -> torch.Tensor:
+    """[B, H, W, 4] NHWC (MLX) -> [B, 4, H, W] NCHW (ComfyUI), unscaled."""
+    from .native.sdxl.config import process_sdxl_latent_out
+
+    unpacked = mx.transpose(latents, (0, 3, 1, 2)).astype(mx.float32)
+    unpacked = process_sdxl_latent_out(unpacked)
+    mx.eval(unpacked)
+    return torch.from_numpy(np.array(unpacked, dtype=np.float32))
 
 
 # ── Noise preparation ────────────────────────────────────────────────
@@ -220,6 +434,97 @@ def prepare_noise_from_latent(
     packed = packed.reshape(batch, (latent_h // 2) * (latent_w // 2), channels * 4)
 
     noise_mlx = mx.array(packed).astype(precision)
+    mx.eval(noise_mlx)
+
+    output_shape = (int(samples.shape[-2]), int(samples.shape[-1]))
+    return noise_mlx, height, width, output_shape
+
+
+def prepare_noise_from_latent_sdxl(
+    latent: dict[str, Any],
+    seed: int,
+    precision: mx.Dtype,
+) -> tuple[mx.array, int, int, tuple[int, int]]:
+    """Prepare unit-gaussian noise from a Comfy latent for SDXL, converted to MLX.
+
+    Unlike FLUX (packed to [B, N, 64] tokens), SDXL's UNet consumes the
+    latent grid directly — this only transposes NCHW -> NHWC (MLX's
+    channel-last convention). Returns unscaled unit-gaussian noise; the
+    caller (`_run_sdxl`) is responsible for scaling by the schedule's
+    `sigma_max` to form the initial denoising state (this function mirrors
+    `prepare_noise_from_latent`'s scope: shape/layout prep only, no
+    schedule-specific scaling).
+
+    Returns (noise, height, width, output_shape).
+    """
+    if "samples" not in latent:
+        raise RuntimeError("ASDX: latent must be a Comfy LATENT with 'samples'.")
+
+    samples = latent["samples"]
+    if tuple(samples.shape)[1] != SDXL_LATENT_CHANNELS:
+        raise RuntimeError(
+            f"ASDX: needs 4-channel SDXL latent, got {tuple(samples.shape)}"
+        )
+
+    import comfy.sample
+    batch_inds = latent.get("batch_index") if "batch_index" in latent else None
+    noise = comfy.sample.prepare_noise(samples, int(seed), batch_inds)
+    noise_np = _to_numpy(noise)
+
+    # Pad to a multiple of 4 (SDXL's UNet has 2 downsamples -> factor 4)
+    h, w = noise_np.shape[-2], noise_np.shape[-1]
+    pad_h = (-h) % 4
+    pad_w = (-w) % 4
+    if pad_h or pad_w:
+        noise_np = np.pad(noise_np, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), mode="constant")
+
+    height = noise_np.shape[-2] * 8
+    width = noise_np.shape[-1] * 8
+
+    noise_nhwc = np.transpose(noise_np, (0, 2, 3, 1))
+    noise_mlx = mx.array(noise_nhwc).astype(precision)
+    mx.eval(noise_mlx)
+
+    output_shape = (int(samples.shape[-2]), int(samples.shape[-1]))
+    return noise_mlx, height, width, output_shape
+
+
+def prepare_noise_from_latent_flux2(
+    latent: dict[str, Any],
+    seed: int,
+    precision: mx.Dtype,
+) -> tuple[mx.array, int, int, tuple[int, int]]:
+    """Prepare initial noise from a Comfy latent for Flux2/Klein, converted to MLX.
+
+    Flux2 flattens the latent grid directly to token sequence [B, H_lat*W_lat,
+    128] — no 2x2 patch packing (`patch_size=1`), so this is a plain
+    transpose+reshape rather than FLUX.1's interleaved patch-pack. No padding
+    to even dimensions is needed either, for the same reason.
+
+    Returns (noise, height, width, output_shape).
+    """
+    if "samples" not in latent:
+        raise RuntimeError("ASDX: latent must be a Comfy LATENT with 'samples'.")
+
+    samples = latent["samples"]
+    if tuple(samples.shape)[1] != FLUX2_LATENT_CHANNELS:
+        raise RuntimeError(
+            f"ASDX: needs 128-channel Flux2 latent, got {tuple(samples.shape)}"
+        )
+
+    import comfy.sample
+    batch_inds = latent.get("batch_index") if "batch_index" in latent else None
+    noise = comfy.sample.prepare_noise(samples, int(seed), batch_inds)
+    noise_np = _to_numpy(noise)
+
+    batch, channels, latent_h, latent_w = noise_np.shape
+    height = latent_h * FLUX2_VAE_DOWNSCALE
+    width = latent_w * FLUX2_VAE_DOWNSCALE
+
+    # [B, C, H, W] -> [B, H, W, C] -> flatten spatial -> [B, H*W, C]
+    flat = np.transpose(noise_np, (0, 2, 3, 1)).reshape(batch, latent_h * latent_w, channels)
+
+    noise_mlx = mx.array(flat).astype(precision)
     mx.eval(noise_mlx)
 
     output_shape = (int(samples.shape[-2]), int(samples.shape[-1]))

@@ -7,6 +7,7 @@ The ComfyUI node (sampler.py) wraps this to provide the node interface.
 from __future__ import annotations
 
 import enum
+import gc
 import math
 import time
 from typing import Any
@@ -16,8 +17,10 @@ import numpy as np
 import torch
 
 from .. import capability as cap_module
+from ..native.config import FLUX_LATENT_SCALE, FLUX_LATENT_SHIFT
 from . import bridge
-from .cache import KontextCache, TeaCacheState
+from .cache import TeaCacheState
+from .scheduling import FluxSampler, SDXLSampling, generate_sigmas, generate_sigmas_sdxl
 
 
 class SamplerMode(enum.Enum):
@@ -46,8 +49,6 @@ class _SamplerCore:
         height: int,
         width: int,
         output_shape: tuple[int, int],
-        rope: mx.array,
-        txt_projected: mx.array,
         model_type: str,
         guidance: float,
         teacache: bool,
@@ -71,6 +72,12 @@ class _SamplerCore:
         depth_image: torch.Tensor | None = None,
         depth_strength: float = 1.0,
         noise_aug: float = 0.0,
+        # Low memory mode (DiffusionKit pattern)
+        low_memory_mode: bool = False,
+        # Krea2 Identity Edit
+        source_latent: dict | None = None,
+        ref_boost: float = 1.0,
+        controlnet: dict | None = None,
     ):
         self.transformer = transformer
         self.config = config
@@ -102,11 +109,45 @@ class _SamplerCore:
         self.depth_image = depth_image
         self.depth_strength = depth_strength
         self.noise_aug = noise_aug
+        self.low_memory_mode = low_memory_mode
+        # Krea2 Identity Edit
+        self.source_latent = source_latent
+        self.ref_boost = ref_boost
+        self.controlnet = controlnet
 
     def run(self, steps: int, seed: int) -> dict:
         """Execute the MLX-native sampling loop and return the result latent."""
         precision = self.config.mlx_dtype
         model_type = self.model_type
+
+        # ── Z-Image routing ──────────────────────────────────────────
+        # Z-Image uses a different conditioning pipeline (single-layer
+        # Qwen3-4B embeddings, no txt_in) and a 3-stage transformer
+        # (context_refiner/noise_refiner/layers, encapsulated inside
+        # NextDiT.__call__). Route before any FLUX-specific calls below.
+        if model_type in ("zimage", "zimage_turbo"):
+            return self._run_zimage(steps)
+
+        # ── Flux2/Klein routing ─────────────────────────────────────────
+        # Flux2 uses its own conditioning (tapped-and-concatenated text
+        # embeddings, left-padded to 512 tokens), latent packing (128ch,
+        # patch_size=1, no 2x2 patchify, 16x VAE downscale instead of 8x),
+        # and 4-axis RoPE with a dedicated text axis. Route before any
+        # FLUX.1-specific calls below, which assume 3-axis RoPE and 64=16*2*2
+        # packed tokens that don't apply here.
+        if model_type == "flux2":
+            return self._run_flux2(steps)
+
+        # ── SDXL routing ──────────────────────────────────────────────
+        # SDXL is an EPS-prediction conv UNet on a discrete DDPM schedule,
+        # not a flow-matching DiT — completely different noise shape (NHWC
+        # grid, not packed tokens), conditioning (dual CLIP-L/G context +
+        # ADM vector, not T5+pooled-CLIP), and denoise update (two-pass true
+        # CFG + EPS x0=x-eps*sigma, not the Euler x+=pred*dt loop below).
+        # Route before mode-detection/img2img prep, which assume FLUX's
+        # packed-token noise shape (txt2img only for SDXL in this phase).
+        if model_type == "sdxl":
+            return self._run_sdxl(steps)
 
         # Detect mode and prepare noise (Phase 2: mode routing)
         self._mode = self._detect_mode()
@@ -118,6 +159,32 @@ class _SamplerCore:
                 self.noise = self._prepare_inpainting_noise()
             elif self._mode == SamplerMode.DEPTH_CONTROL:
                 self.noise = self._prepare_depth_noise()
+
+        # ── Krea2 routing ───────────────────────────────────────────
+        # Krea2 uses a different conditioning pipeline (Qwen3-VL fused embeddings,
+        # txtfusion instead of txt_in) and RoPE (3-axis grid, not FLUX's flat
+        # get_rope). Route BEFORE any FLUX-specific calls below, which assume
+        # methods (get_rope(seq,txt), txt_in) that Krea2Transformer doesn't have.
+        if model_type in ("krea2", "krea2_turbo"):
+            effective_guidance = float(self.guidance) if self.guidance > 0 else 1.0
+            if self.capability is not None:
+                candidate_params = {
+                    "guidance": self.guidance,
+                    "width": self.width,
+                    "height": self.height,
+                    "steps": steps,
+                }
+                try:
+                    valid_params, dropped = cap_module.filter_params_for_model(
+                        self.capability, candidate_params
+                    )
+                    if dropped:
+                        print(f"[ASDX] Dropped params for {self.capability.name}: {dropped}")
+                    if "guidance" in valid_params and valid_params["guidance"] is not None:
+                        effective_guidance = float(valid_params["guidance"])
+                except ValueError as e:
+                    print(f"[ASDX] Capability filter warning: {e}")
+            return self._run_krea2(steps, seed, None, None, effective_guidance)
 
         # Prepare conditioning
         prompt_embeds, pooled_embeds, cond_guidance = bridge.conditioning_to_mlx(
@@ -147,14 +214,42 @@ class _SamplerCore:
             except ValueError as e:
                 print(f"[ASDX] Capability filter warning: {e}")
 
-        # Precompute rope embeddings
-        rope = self.transformer.get_rope(self.noise.shape[1], prompt_embeds.shape[1])
+        # Precompute rope embeddings on the real 2D image token grid (FLUX packs
+        # latents as 2x2 patches, so the grid is (height//8//2) x (width//8//2))
+        img_h = (self.height // 8) // 2
+        img_w = (self.width // 8) // 2
+        if img_h * img_w != self.noise.shape[1]:
+            raise RuntimeError(
+                f"ASDX: FLUX token grid mismatch: {img_h}x{img_w}={img_h * img_w} "
+                f"vs noise token count {self.noise.shape[1]}"
+            )
 
-        # Precompute text projection through txt_in linear layer
-        txt_projected = self.transformer.txt_in(prompt_embeds)
+        # Kontext reference latent: pack it in the same raw-patch space as the
+        # main image (before img_in — FluxTransformer projects the whole
+        # [img, ref] sequence together, matching comfy's `_forward`). Must run
+        # before get_rope() below since the ref grid extends the RoPE table.
+        kontext_ref_packed: mx.array | None = None
+        kontext_ref_grid: tuple[int, int] | None = None
+        if self.kontext and self.kontext_reference_latent is not None:
+            self._prepare_kontext_reference(self.kontext_reference_latent, precision)
+            kontext_ref_packed = getattr(self, "_kontext_ref_packed", None)
+            kontext_ref_grid = getattr(self, "_kontext_ref_grid", None)
 
-        # Setup sigmas for the model type
-        sigmas = self._create_sigmas(steps, model_type, self.width, self.height)
+        rope = self.transformer.get_rope(
+            img_h, img_w, prompt_embeds.shape[1],
+            ref_grids=[kontext_ref_grid] if kontext_ref_grid is not None else None,
+        )
+
+        # ControlNet: VAE-encode + pack the control image once (the model's
+        # own weights are fixed across steps; only the residuals it produces
+        # depend on the current noisy latent, so they're recomputed per step)
+        controlnet_model = self.controlnet.get("control_net") if self.controlnet else None
+        controlnet_latent = self._prepare_controlnet_latent(precision) if controlnet_model else None
+        controlnet_strength = self.controlnet.get("strength", 1.0) if self.controlnet else 1.0
+        controlnet_type = self.controlnet.get("control_type") if self.controlnet else None
+
+        # Setup sigmas for the model type (adapted from DiffusionKit)
+        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
 
         # Setup TeaCache
         teacache_state: TeaCacheState | None = None
@@ -164,13 +259,6 @@ class _SamplerCore:
                 warmup_steps=5,
                 final_steps=3,
             )
-
-        # Setup Kontext KV cache
-        kontext_cache = KontextCache()
-        if self.kontext and self.kontext_reference_latent is not None:
-            kontext_cache.set(True, reference_tokens=0)
-            self._prepare_kontext_reference(kontext_cache, self.kontext_reference_latent,
-                                            self.transformer, precision)
 
         # SeaCache state
         seacache_enabled = self.seacache and model_type == "dev"
@@ -183,8 +271,6 @@ class _SamplerCore:
         step_times: list[float] = []
 
         t_sampling_start = time.perf_counter()
-        kontext_ref_tokens = 0
-        kontext_applied = False
 
         for t in range(steps):
             step_start = time.perf_counter()
@@ -196,17 +282,42 @@ class _SamplerCore:
             # Update LoRA schedule
             if self.lora_schedule is not None:
                 self.lora_schedule["step"] = t
-                self._update_lora_schedule(self.lora_schedule, t, steps)
+                self._update_lora_schedule(self.transformer, self.lora_schedule, t, steps)
+
+            # ControlNet: recompute residuals each step (they depend on the
+            # current noisy latent, unlike the frozen ControlNet weights).
+            # Do NOT reuse the base model's `rope`: when control_type is set,
+            # ControlNetFlux prefixes a control-mode token to txt, shifting
+            # the sequence length — let it compute its own RoPE table.
+            control = None
+            if controlnet_model is not None and controlnet_latent is not None:
+                control = controlnet_model(
+                    img=self.noise,
+                    control_latent=controlnet_latent,
+                    txt=prompt_embeds,
+                    t=mx.array([sigma_t], dtype=mx.float32),
+                    img_h=img_h,
+                    img_w=img_w,
+                    guidance=mx.array([effective_guidance], dtype=mx.float32),
+                    pooled=pooled_embeds,
+                    control_type=controlnet_type,
+                )
+                if controlnet_strength != 1.0:
+                    control = {
+                        k: [r * controlnet_strength for r in v] for k, v in control.items()
+                    }
 
             # --- Compute transformer output ---
             if teacache_state is not None:
                 current_output = self.transformer.predict(
                     img=self.noise,
-                    txt=txt_projected,
+                    txt=prompt_embeds,
                     timestep=sigma_t,
                     guidance=effective_guidance,
                     pooled=pooled_embeds,
                     rope=rope,
+                    control=control,
+                    ref_img=kontext_ref_packed,
                 )
                 mx.eval(current_output)
 
@@ -221,11 +332,13 @@ class _SamplerCore:
             else:
                 current_output = self.transformer.predict(
                     img=self.noise,
-                    txt=txt_projected,
+                    txt=prompt_embeds,
                     timestep=sigma_t,
                     guidance=effective_guidance,
                     pooled=pooled_embeds,
                     rope=rope,
+                    control=control,
+                    ref_img=kontext_ref_packed,
                 )
                 mx.eval(current_output)
                 noise_pred = current_output
@@ -270,11 +383,21 @@ class _SamplerCore:
                 cache_tag = ""
                 if skip_step:
                     cache_tag = " [cache]"
-                if self.kontext and kontext_cache.ready():
-                    cache_tag += f" [kontext:{kontext_cache.hits}h/{kontext_cache.stores}s]"
+                if kontext_ref_packed is not None:
+                    cache_tag += " [kontext]"
                 print(f"[ASDX] Step {t + 1}/{steps} - {step_time:.3f}s{cache_tag}")
 
         total_time = time.perf_counter() - t_sampling_start
+
+        # ── Low memory mode: clear transformer after denoising ──────
+        # Adapted from DiffusionKit's low_memory_mode pattern
+        if self.low_memory_mode:
+            # Clear transformer reference to allow GC
+            del self.transformer
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
+            print("[ASDX] Low memory: transformer cleared after denoising")
 
         # Convert result to ComfyUI latent
         out_latent = bridge.mlx_to_comfy_latent(self.noise, self.height, self.width,
@@ -290,8 +413,8 @@ class _SamplerCore:
         accel_parts = []
         if teacache_state is not None:
             accel_parts.append(f"TeaCache({teacache_state.hits}h/{teacache_state.real_steps}real)")
-        if kontext_cache.enabled:
-            accel_parts.append(f"Kontext({kontext_cache.hits}h/{kontext_cache.stores}s)")
+        if kontext_ref_packed is not None:
+            accel_parts.append("Kontext(ref_latents)")
         if seacache_enabled:
             accel_parts.append("SeaCache")
         accel_str = "+".join(accel_parts) if accel_parts else "standard"
@@ -316,14 +439,24 @@ class _SamplerCore:
             return True, reason
         return False, "real"
 
-    @staticmethod
     def _prepare_kontext_reference(
-        cache: KontextCache,
+        self,
         reference_latent: dict,
-        transformer: Any,
         precision: mx.Dtype,
     ) -> None:
-        """Pre-compute reference latent encoding for Kontext conditioning."""
+        """Pack the Kontext reference latent into raw 2x2-patch space.
+
+        Same patchify as the main image latent (`_prepare_krea2_identity_edit`
+        follows the identical pattern for Krea2), in FLUX model space
+        (scale/shift applied via comfy.latent_formats.Flux().process_in,
+        matching how the noise itself enters the model). Stored as raw,
+        un-projected patches: FluxTransformer.__call__ concatenates it onto
+        `img` BEFORE running `img_in`, matching comfy's `_forward`
+        (`img = torch.cat([img, kontext], dim=1)` happens on raw patches;
+        `img_in` then runs once on the whole sequence).
+        """
+        self._kontext_ref_packed: mx.array | None = None
+        self._kontext_ref_grid: tuple[int, int] | None = None
         try:
             import comfy.latent_formats
 
@@ -339,7 +472,6 @@ class _SamplerCore:
             )
             ref_np = model_space.numpy().astype(np.float32, copy=False)
 
-            # Pack reference latent
             batch, channels, ref_h, ref_w = ref_np.shape
             if channels != bridge.FLUX_LATENT_CHANNELS:
                 return
@@ -355,23 +487,28 @@ class _SamplerCore:
             ref_mlx = mx.array(packed).astype(precision)
             mx.eval(ref_mlx)
 
-            # Compute reference tokens through img_in
-            ref_tokens = transformer.img_in(ref_mlx.astype(transformer.dtype))
+            self._kontext_ref_packed = ref_mlx
+            self._kontext_ref_grid = (ref_h // 2, ref_w // 2)
 
-            # Store reference tokens in cache
-            cache.cache["reference"] = (ref_tokens, ref_mlx)
-
-            # Set reference token count (image tokens)
-            cache.reference_tokens = ref_tokens.shape[1]
-
+            print(
+                f"[ASDX] Kontext reference packed "
+                f"[1, {ref_h // 2 * ref_w // 2}, {channels * 4}] grid={ref_h // 2}x{ref_w // 2}"
+            )
         except Exception as e:
             print(f"[ASDX] Kontext reference prep failed: {e}")
 
     @staticmethod
-    def _update_lora_schedule(model: dict, step: int, total_steps: int) -> None:
-        """Update LoRA strength based on schedule."""
-        schedule = model.get("lora_schedule")
-        if not schedule:
+    def _update_lora_schedule(transformer: Any, schedule: dict, step: int, total_steps: int) -> None:
+        """Recompute this step's LoRA strength from the schedule and re-apply it.
+
+        `schedule["lora"]` is the same LoRAAdapter set up by ASDX_LoraSchedule.
+        Its deltas were already baked into the transformer once at
+        `strength_start` when the node ran; here we UNDO that previous step's
+        contribution and apply the new strength, so repeated calls don't
+        compound (delta * scale_prev, then delta * scale_new, not additive).
+        """
+        lora = schedule.get("lora")
+        if lora is None:
             return
 
         strength_curve = schedule.get("strength_curve", "linear")
@@ -403,30 +540,20 @@ class _SamplerCore:
         else:
             strength = start
 
+        from ..lora import ASDX_LoraLoader
+
+        new_scale = lora.alpha / max(lora.rank, 1) * strength
+        delta_scale = new_scale - lora.scale
+        if delta_scale != 0:
+            # Apply only the incremental change since the last step's scale,
+            # so the cumulative effect matches `deltas * new_scale` without
+            # first subtracting out the old contribution separately.
+            lora.scale = delta_scale
+            ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora)
+            lora.scale = new_scale
+
         if step % 5 == 0:
             print(f"[ASDX] LoRA schedule: step {step}/{total_steps}, strength={strength:.3f}")
-
-    @staticmethod
-    def _create_sigmas(steps: int, model_type: str, width: int = 1024,
-                       height: int = 1024) -> list[float]:
-        """Create sigma schedule for the given model type.
-
-        FLUX dev uses a shifted log-normal schedule.
-        FLUX schnell uses uniform steps.
-        """
-        if model_type == "schnell":
-            return [1.0 - i / steps for i in range(steps + 1)]
-
-        sigmas: list[float] = []
-        for i in range(steps + 1):
-            t = i / steps
-            sigma = 1.0 - t
-            area = width * height / (1024 * 1024)
-            shift = 0.15 * (area - 1.0)
-            sigma = max(0.0, sigma - shift * t)
-            sigmas.append(sigma)
-
-        return sigmas
 
     @staticmethod
     def _denoise_to_latent(
@@ -628,3 +755,694 @@ class _SamplerCore:
         # Depth conditioning will be handled in the transformer loop
         # via the depth_image passed through the model dict
         return self.noise
+
+    def _prepare_controlnet_latent(self, precision: mx.Dtype) -> mx.array | None:
+        """VAE-encode and pack the ControlNet control image into FLUX tokens.
+
+        Matches the reference (comfy/controlnet.py's ControlNet.get_control):
+        the control hint is VAE-encoded, then run through the base latent
+        format's process_in (same scale/shift as the noisy latent), then
+        packed into 2x2 patches exactly like the noise/img input.
+        """
+        if self.controlnet is None:
+            return None
+        try:
+            vae = self.controlnet.get("vae")
+            image = self.controlnet.get("image")
+            if vae is None or image is None:
+                print("[ASDX] ControlNet: missing vae or image, skipping")
+                return None
+
+            # ComfyUI's VAE.encode expects [B,H,W,C] pixels and returns the
+            # latent tensor directly (not wrapped in a dict).
+            samples = vae.encode(image)
+            ctrl_np = (
+                samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
+                if hasattr(samples, "detach")
+                else np.asarray(samples, dtype=np.float32)
+            )
+            ctrl_np = (ctrl_np - FLUX_LATENT_SHIFT) * FLUX_LATENT_SCALE
+
+            batch, channels, ctrl_h, ctrl_w = ctrl_np.shape
+            packed = ctrl_np.reshape(batch, channels, ctrl_h // 2, 2, ctrl_w // 2, 2)
+            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+            packed = packed.reshape(batch, (ctrl_h // 2) * (ctrl_w // 2), channels * 4)
+
+            ctrl_mlx = mx.array(packed).astype(precision)
+            mx.eval(ctrl_mlx)
+            return ctrl_mlx
+        except Exception as e:
+            print(f"[ASDX] ControlNet latent prep failed: {e}")
+            return None
+
+    def _prepare_krea2_identity_edit(self) -> None:
+        """Prepare Identity Edit source latent for Krea2.
+
+        Prepends source image tokens (frame=1) to the image latent.
+        The source latent is VAE-encoded and packed in the same format
+        as the noise, then prepended to the image tokens in the transformer.
+
+        The frame index in RoPE distinguishes source (frame=1) from
+        target (frame=0) tokens for identity preservation.
+        """
+        if self.source_latent is None:
+            return
+
+        try:
+            source_samples = self.source_latent.get("samples")
+            if source_samples is None:
+                return
+
+            # Encode source image to latent (same as _encode_image_to_latent)
+            source_np = (
+                source_samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
+                if hasattr(source_samples, "detach")
+                else np.asarray(source_samples, dtype=np.float32)
+            )
+
+            # [B, C, H, W] -> pack to [B, NH*NW, 64]
+            batch, channels, src_h, src_w = source_np.shape
+            packed = source_np.reshape(
+                batch, channels, src_h // 2, 2, src_w // 2, 2
+            )
+            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+            packed = packed.reshape(
+                batch, (src_h // 2) * (src_w // 2), channels * 4
+            )
+
+            precision = self.config.mlx_dtype
+            source_packed = mx.array(packed).astype(precision)
+            mx.eval(source_packed)
+
+            # Store source tokens for prepending in transformer, along with the
+            # source token grid (needed by get_rope_grid to place frame=1 positions)
+            self._identity_edit_source = source_packed
+            self._identity_edit_src_grid = (src_h // 2, src_w // 2)
+
+            print(
+                f"[ASDX] Identity Edit: source latent packed "
+                f"[1, {src_h//2*src_w//2}, {channels*4}] grid={src_h//2}x{src_w//2}"
+            )
+        except Exception as e:
+            print(f"[ASDX] Identity Edit prep failed: {e}")
+            self._identity_edit_source = None
+            self._identity_edit_src_grid = None
+
+    def _krea2_ref_attn_bias(
+        self, txt_len: int, src_h: int, src_w: int, tgt_h: int, tgt_w: int, boost: float
+    ) -> mx.array:
+        """Additive attention-logit bias on the [text | source | target] sequence.
+
+        Matches the ComfyUI reference `_ref_attn_bias`: only target rows get a
+        log(boost) bias added on source columns (equivalent to multiplying the
+        post-softmax target->source attention weight by `boost` before
+        renormalization). All other entries are 0.
+        """
+        src_len = src_h * src_w
+        tgt_len = tgt_h * tgt_w
+        total = txt_len + src_len + tgt_len
+        bias = mx.zeros((1, 1, total, total), dtype=mx.float32)
+        log_boost = math.log(max(boost, 1e-4))
+        bias[:, :, txt_len + src_len:, txt_len:txt_len + src_len] = log_boost
+        return bias
+
+    def _run_krea2(
+        self,
+        steps: int,
+        seed: int,
+        prompt_embeds: mx.array | None,
+        pooled_embeds: mx.array | None,
+        guidance: float,
+    ) -> dict:
+        """Run the Krea2 (SingleStreamDiT) sampling loop.
+
+        Krea2 differs from FLUX:
+          - Uses Qwen3-VL text embeddings (12-layer fused, 30720-dim)
+          - txtfusion adapter fuses layers internally
+          - txtmlp projects to hidden_dim (6144)
+          - 3-axis RoPE (frame, height, width) for Identity Edit, on a real 2D
+            token grid (not a flat sequential index)
+          - Flow matching schedule (linear 1→0)
+          - DoubleSharedModulation: timestep vec → 6 params, SHARED across the
+            whole sequence (text, source, target) — source/target are
+            distinguished only by the RoPE frame index, matching the ComfyUI
+            reference `krea2_edit_forward`
+          - GQA attention with per-head QK norm + sigmoid gate
+          - SwiGLU MLP
+          - Same Euler update: noise += output * (sigma_next - sigma_t)
+        """
+        from .bridge import conditioning_krea2_to_mlx
+
+        precision = self.config.mlx_dtype
+        model_type = self.model_type
+
+        # ── Krea2 conditioning ──────────────────────────────────────
+        # Krea2 expects fused Qwen3-VL embeddings [B, T, 12*2560] = [B, T, 30720]
+        # The bridge handles single-layer → fused conversion
+        txt_fused = conditioning_krea2_to_mlx(self.positive, precision)
+        txt_len = txt_fused.shape[1]
+
+        # Target image token grid (in patches): latent is height//8 x width//8,
+        # each Krea2 token packs a 2x2 patch, so the grid is (latent//2) x (latent//2).
+        img_h = (self.height // 8) // 2
+        img_w = (self.width // 8) // 2
+        if img_h * img_w != self.noise.shape[1]:
+            raise RuntimeError(
+                f"ASDX: Krea2 token grid mismatch: {img_h}x{img_w}={img_h * img_w} "
+                f"vs noise token count {self.noise.shape[1]}"
+            )
+
+        # Setup sigmas (flow matching: linear 1→0)
+        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+
+        # Setup TeaCache
+        teacache_state: TeaCacheState | None = None
+        if self.teacache:
+            teacache_state = TeaCacheState(
+                threshold=self.teacache_threshold,
+                warmup_steps=5,
+                final_steps=3,
+            )
+
+        # SeaCache state (not supported for Krea2)
+        previous_output: mx.array | None = None
+
+        # Memory profiling
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+
+        t_sampling_start = time.perf_counter()
+
+        # Source latent prepending for Identity Edit
+        if self.source_latent is not None and self.source_latent.get("samples") is not None:
+            self._prepare_krea2_identity_edit()
+
+        src_tokens = getattr(self, "_identity_edit_source", None)
+        src_grid = getattr(self, "_identity_edit_src_grid", None)
+        src_h, src_w = src_grid if src_grid is not None else (None, None)
+
+        # RoPE is the same at every step (text/source/target positions don't
+        # change across the denoising loop) — precompute once.
+        src_grids = [(src_h, src_w)] if src_tokens is not None else None
+        rope_freqs = self.transformer.get_rope_grid(img_h, img_w, txt_len, src_grids)
+
+        # ref_boost: additive attention-logit bias favoring source tokens,
+        # only meaningful (and only computable) when Identity Edit is active.
+        ref_boost = None
+        if src_tokens is not None and self.ref_boost and self.ref_boost != 1.0:
+            ref_boost = self._krea2_ref_attn_bias(
+                txt_len, src_h, src_w, img_h, img_w, self.ref_boost
+            )
+
+        for t in range(steps):
+            step_start = time.perf_counter()
+
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            # ── Compute transformer output ──────────────────────────
+            if teacache_state is not None:
+                current_output = self.transformer.predict(
+                    img=self.noise,
+                    txt=txt_fused,
+                    timestep=sigma_t,
+                    img_h=img_h,
+                    img_w=img_w,
+                    freqs=rope_freqs,
+                    ref_boost=ref_boost,
+                    src=src_tokens,
+                    src_h=src_h,
+                    src_w=src_w,
+                )
+                mx.eval(current_output)
+
+                reused, reason = self._teacache_check(
+                    teacache_state, current_output, t, steps
+                )
+
+                if reused:
+                    noise_pred = (
+                        teacache_state.last_feature
+                        if teacache_state.last_feature is not None
+                        else current_output
+                    )
+                    skip_step = True
+                else:
+                    skip_step = False
+                    noise_pred = current_output
+            else:
+                current_output = self.transformer.predict(
+                    img=self.noise,
+                    txt=txt_fused,
+                    timestep=sigma_t,
+                    img_h=img_h,
+                    img_w=img_w,
+                    freqs=rope_freqs,
+                    ref_boost=ref_boost,
+                    src=src_tokens,
+                    src_h=src_h,
+                    src_w=src_w,
+                )
+                mx.eval(current_output)
+                noise_pred = current_output
+                skip_step = False
+
+            # SeaCache: not supported for Krea2 (skip)
+
+            if skip_step and previous_output is not None:
+                noise_pred = previous_output
+
+            if not skip_step:
+                previous_output = current_output
+
+            # Euler update (same as FLUX): x += noise_pred * dt
+            dt = sigma_next - sigma_t
+            self.noise = self.noise + noise_pred * dt
+            mx.eval(self.noise)
+
+            step_time = time.perf_counter() - step_start
+            step_times.append(step_time)
+
+            # Preview
+            if self.preview and self.previewer is not None:
+                preview_latent = self._denoise_to_latent(
+                    self.noise, self.height, self.width, self.output_shape
+                )
+                if preview_latent is not None:
+                    preview_bytes = self.previewer.decode_latent_to_preview_image(
+                        "JPEG", preview_latent
+                    )
+                    if preview_bytes:
+                        import comfy.utils
+                        comfy.utils.ProgressBar(steps).update_absolute(
+                            t + 1, steps, preview_bytes
+                        )
+
+            # Progress logging
+            if (t + 1) % 5 == 0 or t == 0:
+                cache_tag = ""
+                if skip_step:
+                    cache_tag = " [cache]"
+                print(f"[ASDX] Step {t + 1}/{steps} - {step_time:.3f}s{cache_tag}")
+
+        total_time = time.perf_counter() - t_sampling_start
+
+        # ── Low memory mode ─────────────────────────────────────────
+        if self.low_memory_mode:
+            del self.transformer
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
+            print("[ASDX] Low memory: transformer cleared after denoising")
+
+        # Convert result to ComfyUI latent
+        out_latent = bridge.mlx_to_comfy_latent(
+            self.noise, self.height, self.width, {"samples": self.noise}
+        )
+        out_latent["sdmlx_model_type"] = model_type
+        out_latent["sdmlx_model_name"] = "unknown"
+
+        # Memory stats
+        mem = bridge.collect_mlx_memory()
+        avg_step = sum(step_times) / len(step_times) if step_times else 0
+
+        print(
+            f"[ASDX] Krea2 Sampling complete: {total_time:.1f}s total, "
+            f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak"
+        )
+
+        bridge.clear_mlx_cache()
+
+        return out_latent
+
+    def _run_sdxl(self, steps: int) -> dict:
+        """Run the SDXL (conv UNet, EPS/discrete-DDPM) sampling loop.
+
+        Fundamentally different from the flow-matching DiT loop above:
+          - True classifier-free guidance: two forward passes per step
+            (positive + negative conditioning), combined via
+            `noise_pred = uncond + cfg_scale*(cond-uncond)` — the FLUX/Krea2
+            loop only ever does a single conditional pass (guidance is baked
+            into the model via an embedding, not sampled twice). This is the
+            first real consumer of `_negative` (stored by
+            `ASDX_ConditioningMerger` but never read before this).
+          - EPS preconditioning (`SDXLSampling.calculate_input`): the UNet
+            input is `x / sqrt(sigma^2+1)`, not raw `x`; its output is a
+            noise (eps) prediction, denoised via `x - eps*sigma`.
+          - ADM/"y" vector (pooled CLIP-G + size/crop sinusoidal embeddings)
+            drives an additive embedding branch, not cross-attention.
+          - `self.guidance` is reused as the CFG scale (no separate node
+            input) — same pattern as Krea2 reusing it for its own guidance.
+
+        Scope: txt2img only. img2img/inpainting/depth/ControlNet mode
+        routing (`_detect_mode()` and friends) is FLUX-specific and not
+        wired up for SDXL in this phase — `run()` dispatches here before
+        reaching that code.
+        """
+        from ..native.sdxl.model import encode_adm
+
+        precision = self.config.mlx_dtype
+        sampling = SDXLSampling()
+
+        negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
+        if negative is None:
+            raise RuntimeError(
+                "ASDX: SDXL requires a negative prompt for true classifier-free "
+                "guidance. Provide one via ASDX_ConditioningMerger (merge the "
+                "positive and negative ASDX_CLIPTextEncode outputs before the sampler)."
+            )
+
+        cond_pos, pooled_pos = bridge.conditioning_sdxl_to_mlx(self.positive, precision)
+        cond_neg, pooled_neg = bridge.conditioning_sdxl_to_mlx(negative, precision)
+
+        y_pos = encode_adm(pooled_pos, height=self.height, width=self.width).astype(precision)
+        y_neg = encode_adm(pooled_neg, height=self.height, width=self.width).astype(precision)
+
+        cfg_scale = float(self.guidance) if self.guidance and self.guidance > 0 else 7.0
+
+        sigmas = generate_sigmas_sdxl(steps)
+
+        # Initial state: sigma_max * unit-gaussian noise (txt2img: no seed
+        # latent to add, matching EPS.noise_scaling at sigma=sigma_max).
+        x = self.noise * sigmas[0]
+
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+        t_sampling_start = time.perf_counter()
+
+        for t in range(steps):
+            step_start = time.perf_counter()
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            xc = sampling.calculate_input(sigma_t, x)
+            timestep = mx.array([sampling.timestep(sigma_t)], dtype=mx.float32)
+
+            eps_pos = self.transformer(xc, timestep, cond_pos, y_pos)
+            eps_neg = self.transformer(xc, timestep, cond_neg, y_neg)
+            mx.eval(eps_pos, eps_neg)
+
+            eps = eps_neg + cfg_scale * (eps_pos - eps_neg)
+
+            denoised = sampling.calculate_denoised(sigma_t, eps, x)
+            d = (x - denoised) / sigma_t
+            x = x + d * (sigma_next - sigma_t)
+            mx.eval(x)
+
+            step_time = time.perf_counter() - step_start
+            step_times.append(step_time)
+
+            if (t + 1) % 5 == 0 or t == 0:
+                print(f"[ASDX] SDXL Step {t + 1}/{steps} - {step_time:.3f}s")
+
+        total_time = time.perf_counter() - t_sampling_start
+
+        if self.low_memory_mode:
+            del self.transformer
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
+            print("[ASDX] Low memory: transformer cleared after denoising")
+
+        out_latent = bridge.mlx_to_comfy_latent_sdxl(x, {"samples": x})
+        out_latent["sdmlx_model_type"] = "sdxl"
+        out_latent["sdmlx_model_name"] = "unknown"
+
+        mem = bridge.collect_mlx_memory()
+        avg_step = sum(step_times) / len(step_times) if step_times else 0
+
+        print(
+            f"[ASDX] SDXL Sampling complete: {total_time:.1f}s total, "
+            f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, cfg={cfg_scale:.1f}"
+        )
+
+        bridge.clear_mlx_cache()
+
+        return out_latent
+
+    def _run_zimage(self, steps: int) -> dict:
+        """Run the Z-Image (NextDiT) sampling loop.
+
+        Flow-matching, same Euler update as FLUX/Krea2 (`sampler/
+        scheduling.py::time_snr_shift` — a FIXED shift, not FLUX-dev's
+        resolution-dependent `mu`). Reuses FLUX's exact latent packing
+        (`bridge.mlx_to_comfy_latent`/`prepare_noise_from_latent`,
+        `_denoise_to_latent` for preview) since Z-Image inherits the same
+        16-channel/patch=2 `latent_formats.Flux` VAE space (verified via
+        comfy's class chain: `ZImage(Lumina2)`, `Lumina2.latent_format =
+        latent_formats.Flux`) — no new bridge functions needed for that part.
+
+        Single conditional forward pass per step: `NextDiT` has no built-in
+        guidance-embedding mechanism (unlike FLUX-dev's `guidance_in`), and
+        no CFG is wired here — if the base (non-turbo) checkpoint is found
+        to need it for quality, add the same two-pass cond/uncond approach
+        `_run_sdxl()` uses, driven by `positive["_negative"]`.
+        """
+        precision = self.config.mlx_dtype
+        model_type = self.model_type
+
+        context = bridge.conditioning_zimage_to_mlx(self.positive, precision)
+
+        img_h = (self.height // 8) // 2
+        img_w = (self.width // 8) // 2
+        if img_h * img_w != self.noise.shape[1]:
+            raise RuntimeError(
+                f"ASDX: Z-Image token grid mismatch: {img_h}x{img_w}={img_h * img_w} "
+                f"vs noise token count {self.noise.shape[1]}"
+            )
+
+        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+
+        teacache_state: TeaCacheState | None = None
+        if self.teacache:
+            teacache_state = TeaCacheState(
+                threshold=self.teacache_threshold, warmup_steps=5, final_steps=3,
+            )
+
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+        t_sampling_start = time.perf_counter()
+
+        for t in range(steps):
+            step_start = time.perf_counter()
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            current_output = self.transformer.predict(self.noise, context, sigma_t, img_h, img_w)
+            mx.eval(current_output)
+
+            if teacache_state is not None:
+                reused, reason = self._teacache_check(teacache_state, current_output, t, steps)
+                if reused:
+                    noise_pred = (
+                        teacache_state.last_feature
+                        if teacache_state.last_feature is not None
+                        else current_output
+                    )
+                    skip_step = True
+                else:
+                    skip_step = False
+                    noise_pred = current_output
+            else:
+                noise_pred = current_output
+                skip_step = False
+
+            dt = sigma_next - sigma_t
+            self.noise = self.noise + noise_pred * dt
+            mx.eval(self.noise)
+
+            step_time = time.perf_counter() - step_start
+            step_times.append(step_time)
+
+            if self.preview and self.previewer is not None:
+                preview_latent = self._denoise_to_latent(
+                    self.noise, self.height, self.width, self.output_shape
+                )
+                if preview_latent is not None:
+                    preview_bytes = self.previewer.decode_latent_to_preview_image(
+                        "JPEG", preview_latent
+                    )
+                    if preview_bytes:
+                        import comfy.utils
+                        comfy.utils.ProgressBar(steps).update_absolute(t + 1, steps, preview_bytes)
+
+            if (t + 1) % 5 == 0 or t == 0:
+                cache_tag = " [cache]" if skip_step else ""
+                print(f"[ASDX] Z-Image Step {t + 1}/{steps} - {step_time:.3f}s{cache_tag}")
+
+        total_time = time.perf_counter() - t_sampling_start
+
+        if self.low_memory_mode:
+            del self.transformer
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
+            print("[ASDX] Low memory: transformer cleared after denoising")
+
+        out_latent = bridge.mlx_to_comfy_latent(
+            self.noise, self.height, self.width, {"samples": self.noise}
+        )
+        out_latent["sdmlx_model_type"] = model_type
+        out_latent["sdmlx_model_name"] = "unknown"
+
+        mem = bridge.collect_mlx_memory()
+        avg_step = sum(step_times) / len(step_times) if step_times else 0
+        accel = (
+            f"TeaCache({teacache_state.hits}h/{teacache_state.real_steps}real)"
+            if teacache_state is not None else "standard"
+        )
+
+        print(
+            f"[ASDX] Z-Image Sampling complete: {total_time:.1f}s total, "
+            f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel}"
+        )
+
+        bridge.clear_mlx_cache()
+
+        return out_latent
+
+    def _run_flux2(self, steps: int) -> dict:
+        """Run the Flux2/Klein sampling loop.
+
+        Flow-matching, same Euler update as FLUX.1/Krea2/Z-Image, but with a
+        FIXED shift of 2.02 (`sampler/scheduling.py::generate_sigmas`'s
+        `model_type == "flux2"` branch) — not FLUX-dev's resolution-dependent
+        mu. Latent packing is Flux2-specific (128ch, patch_size=1, 16x VAE
+        downscale — `bridge.prepare_noise_from_latent_flux2`/
+        `mlx_to_comfy_latent_flux2`), NOT reused from FLUX.1 (unlike
+        Z-Image, which shares FLUX.1's exact 16ch/patch=2/8x-downscale
+        latent space — Flux2's VAE is architecturally different, confirmed
+        via `comfy/latent_formats.py::Flux2.spacial_downscale_ratio=16`).
+
+        Single conditional forward pass per step (no two-pass CFG) — same
+        as Z-Image. `guidance` is threaded through regardless of whether the
+        loaded checkpoint has a `guidance_in` (Klein doesn't; the larger
+        Flux2-D does): `Flux2Transformer.time_embed` silently ignores it
+        when `guidance_in` wasn't allocated for this checkpoint, so passing
+        a value is always safe.
+        """
+        precision = self.config.mlx_dtype
+        model_type = self.model_type
+
+        context, cond_guidance = bridge.conditioning_flux2_to_mlx(self.positive, precision)
+        txt_len = context.shape[1]
+
+        effective_guidance = float(self.guidance) if self.guidance and self.guidance > 0 else (
+            cond_guidance if cond_guidance is not None else 3.5
+        )
+
+        if self.capability is not None:
+            candidate_params = {
+                "guidance": self.guidance,
+                "width": self.width,
+                "height": self.height,
+                "steps": steps,
+            }
+            try:
+                valid_params, dropped = cap_module.filter_params_for_model(
+                    self.capability, candidate_params
+                )
+                if dropped:
+                    print(f"[ASDX] Dropped params for {self.capability.name}: {dropped}")
+                if "guidance" in valid_params and valid_params["guidance"] is not None:
+                    effective_guidance = float(valid_params["guidance"])
+            except ValueError as e:
+                print(f"[ASDX] Capability filter warning: {e}")
+
+        # Flux2's VAE downscales 16x spatially with patch_size=1 (no further
+        # 2x2 token packing) — the image token grid IS the latent grid,
+        # unlike FLUX.1/Z-Image's extra //2 for their 2x2 patchify.
+        img_h = self.height // bridge.FLUX2_VAE_DOWNSCALE
+        img_w = self.width // bridge.FLUX2_VAE_DOWNSCALE
+        if img_h * img_w != self.noise.shape[1]:
+            raise RuntimeError(
+                f"ASDX: Flux2 token grid mismatch: {img_h}x{img_w}={img_h * img_w} "
+                f"vs noise token count {self.noise.shape[1]}"
+            )
+
+        rope = self.transformer.get_rope(img_h, img_w, txt_len)
+
+        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+
+        teacache_state: TeaCacheState | None = None
+        if self.teacache:
+            teacache_state = TeaCacheState(
+                threshold=self.teacache_threshold, warmup_steps=5, final_steps=3,
+            )
+
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+        t_sampling_start = time.perf_counter()
+
+        for t in range(steps):
+            step_start = time.perf_counter()
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            current_output = self.transformer.predict(
+                img=self.noise,
+                txt=context,
+                timestep=sigma_t,
+                guidance=effective_guidance,
+                rope=rope,
+            )
+            mx.eval(current_output)
+
+            if teacache_state is not None:
+                reused, reason = self._teacache_check(teacache_state, current_output, t, steps)
+                if reused:
+                    noise_pred = (
+                        teacache_state.last_feature
+                        if teacache_state.last_feature is not None
+                        else current_output
+                    )
+                    skip_step = True
+                else:
+                    skip_step = False
+                    noise_pred = current_output
+            else:
+                noise_pred = current_output
+                skip_step = False
+
+            dt = sigma_next - sigma_t
+            self.noise = self.noise + noise_pred * dt
+            mx.eval(self.noise)
+
+            step_time = time.perf_counter() - step_start
+            step_times.append(step_time)
+
+            if (t + 1) % 5 == 0 or t == 0:
+                cache_tag = " [cache]" if skip_step else ""
+                print(f"[ASDX] Flux2 Step {t + 1}/{steps} - {step_time:.3f}s{cache_tag}")
+
+        total_time = time.perf_counter() - t_sampling_start
+
+        if self.low_memory_mode:
+            del self.transformer
+            self.transformer = None
+            gc.collect()
+            mx.clear_cache()
+            print("[ASDX] Low memory: transformer cleared after denoising")
+
+        out_latent = bridge.mlx_to_comfy_latent_flux2(
+            self.noise, self.height, self.width, {"samples": self.noise}
+        )
+        out_latent["sdmlx_model_type"] = model_type
+        out_latent["sdmlx_model_name"] = "unknown"
+
+        mem = bridge.collect_mlx_memory()
+        avg_step = sum(step_times) / len(step_times) if step_times else 0
+        accel = (
+            f"TeaCache({teacache_state.hits}h/{teacache_state.real_steps}real)"
+            if teacache_state is not None else "standard"
+        )
+
+        print(
+            f"[ASDX] Flux2 Sampling complete: {total_time:.1f}s total, "
+            f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel}, "
+            f"guidance={effective_guidance:.1f}"
+        )
+
+        bridge.clear_mlx_cache()
+
+        return out_latent
