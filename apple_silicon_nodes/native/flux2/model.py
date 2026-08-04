@@ -488,7 +488,7 @@ def load_flux2_transformer(
     from .weight_map import normalize_flux2_keys, map_flux2_to_native
 
     path = Path(path)
-    from apple_silicon_nodes.native import _load_safetensors
+    from .. import _load_safetensors
     state = _load_safetensors(path)
 
     normalized = normalize_flux2_keys(state)
