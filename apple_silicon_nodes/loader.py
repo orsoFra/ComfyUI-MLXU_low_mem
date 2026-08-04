@@ -284,6 +284,19 @@ class ASDX_DiffusionLoader:
             print(f"[ASDX] Model cache hit: {model_name} ({precision})")
             return (cached,)
 
+        # _MODEL_CACHE never evicted past entries -- switching the checkpoint
+        # or precision across separate prompt runs in the same ComfyUI session
+        # kept every previously loaded transformer resident (each one is
+        # several GB to tens of GB), silently accumulating until unified
+        # memory was exhausted. Only one model is meaningfully "current" for
+        # this node at a time, so drop everything else before loading the
+        # new one -- matches how switching a checkpoint dropdown is expected
+        # to free the old model.
+        if _MODEL_CACHE:
+            print(f"[ASDX] Evicting {len(_MODEL_CACHE)} cached model(s) before loading {model_name}")
+            _MODEL_CACHE.clear()
+            bridge.clear_mlx_cache()
+
         # Find model file
         path = self._resolve_model_path(model_name)
         model_type = _detect_model_type(path)
