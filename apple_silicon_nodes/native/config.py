@@ -7,6 +7,7 @@ Centralizes hyperparameters and provides validation helpers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 
@@ -60,3 +61,37 @@ class FluxConfig:
 
     def __post_init__(self) -> None:
         self.validate()
+
+
+# ── FLUX latent space constants ──────────────────────────────────────────
+# Adapted from DiffusionKit's FluxLatentFormat
+
+FLUX_LATENT_SCALE: float = 0.3611
+"""Scale factor for FLUX latent space transformation."""
+
+FLUX_LATENT_SHIFT: float = 0.1159
+"""Shift factor for FLUX latent space transformation."""
+
+
+def process_flux_latent_in(latent: Any) -> Any:
+    """Process latent for model input: (latent - shift) * scale.
+
+    Args:
+        latent: Input latent tensor (any array-like).
+
+    Returns:
+        Processed latent tensor.
+    """
+    return (latent - FLUX_LATENT_SHIFT) * FLUX_LATENT_SCALE
+
+
+def process_flux_latent_out(latent: Any) -> Any:
+    """Process latent for model output: latent / scale + shift.
+
+    Args:
+        latent: Output latent tensor (any array-like).
+
+    Returns:
+        Reconstructed latent tensor.
+    """
+    return (latent / FLUX_LATENT_SCALE) + FLUX_LATENT_SHIFT

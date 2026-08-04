@@ -119,9 +119,17 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         supports_controlnet=False,
         latent_channels=16,
     ),
+    # Covers both Klein (Qwen3 text encoder, no guidance embed on this
+    # machine's checkpoint) and Flux2-D (Mistral3, HAS a guidance embed) —
+    # `guidance` is left as an optional (not required, not hard-blocked)
+    # param because whether it's actually used is a per-checkpoint runtime
+    # fact (`Flux2Config.guidance_embed`, detected from the checkpoint by
+    # `detect_flux2_config`), not something the capability layer can know
+    # ahead of load time; Flux2Transformer silently ignores `guidance` when
+    # its checkpoint has no `guidance_in`.
     "flux2_klein": CapabilityProfile(
         family="flux2",
-        name="FLUX.2-Klein",
+        name="Flux2/Klein",
         generate_params={
             "guidance": "float",
             "width": "int",
@@ -129,8 +137,94 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
             "steps": "int",
         },
         requires=frozenset(),
+        latent_channels=128,
+        # No ControlNet-Flux2 architecture ported yet (Phase E, optional).
+        supports_controlnet=False,
+    ),
+    # ── Krea2 ──────────────────────────────────────────────────────
+    "krea2_base": CapabilityProfile(
+        family="krea2",
+        name="Krea2-Base",
+        generate_params={
+            "guidance": "float",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+            "source_latent": "latent",
+            "ref_boost": "float",
+        },
+        requires=frozenset(),
         latent_channels=16,
-        supports_controlnet=True,
+        supports_controlnet=False,
+        supports_inpainting=True,
+        supports_depth=True,
+    ),
+    "krea2_turbo": CapabilityProfile(
+        family="krea2",
+        name="Krea2-Turbo",
+        generate_params={
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+            "source_latent": "latent",
+            "ref_boost": "float",
+        },
+        requires=frozenset(),
+        # Turbo uses CFG=1, guidance is blocked
+        hard_block=frozenset({"guidance"}),
+        latent_channels=16,
+        supports_controlnet=False,
+        supports_inpainting=True,
+        supports_depth=True,
+    ),
+    # ── SDXL (also covers Illustrious/Pony/NoobAI — same UNet, different weights) ──
+    "sdxl_base": CapabilityProfile(
+        family="sdxl",
+        name="SDXL",
+        generate_params={
+            "cfg_scale": "float",
+            "negative": "string",
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        # SDXL needs true classifier-free guidance (two-pass cond/uncond),
+        # unlike FLUX/Krea2's single-pass guidance-embedding — a negative
+        # prompt is not optional here.
+        requires=frozenset({"negative"}),
+        # SDXL has no guidance-embedding mechanism (unlike FLUX-dev/Krea2-raw)
+        hard_block=frozenset({"guidance"}),
+        latent_channels=4,
+        supports_controlnet=False,
+    ),
+    # ── Z-Image (NextDiT/Lumina2 family) ──────────────────────────────
+    "zimage_base": CapabilityProfile(
+        family="zimage",
+        name="Z-Image",
+        generate_params={
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        # NextDiT has no guidance-embedding mechanism and no CFG is wired
+        # in _run_zimage() yet — see sampler/core.py::_run_zimage docstring.
+        hard_block=frozenset({"guidance"}),
+        latent_channels=16,
+        supports_controlnet=False,
+    ),
+    "zimage_turbo": CapabilityProfile(
+        family="zimage",
+        name="Z-Image-Turbo",
+        generate_params={
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        hard_block=frozenset({"guidance"}),
+        latent_channels=16,
+        supports_controlnet=False,
     ),
 }
 
@@ -140,6 +234,17 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
 # Maps filename patterns to capability profile keys.
 # Order matters: more specific patterns first.
 _CAPABILITY_DISPATCH: list[tuple[str, str]] = [
+    # SDXL (and same-architecture finetunes: Illustrious, Pony, NoobAI)
+    ("sdxl", "sdxl_base"),
+    ("illustrious", "sdxl_base"),
+    ("pony", "sdxl_base"),
+    ("noobai", "sdxl_base"),
+    # Z-Image
+    ("zimage_turbo", "zimage_turbo"),
+    ("z_image_turbo", "zimage_turbo"),
+    ("zimage", "zimage_base"),
+    ("z_image", "zimage_base"),
+    ("z-image", "zimage_base"),
     # FLUX.1 Fill
     ("fill", "flux1_fill"),
     # FLUX.1 Depth

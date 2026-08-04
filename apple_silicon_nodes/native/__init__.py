@@ -1,7 +1,8 @@
 """
 Native MLX Transformer for FLUX.1
 ==================================
-A minimal but complete FLUX.1 transformer implementation in pure MLX.
+A FLUX.1 transformer implementation in pure MLX, matching the reference
+architecture in ComfyUI's `comfy/ldm/flux/{model,layers,math}.py`.
 
 This module provides:
   - FluxConfig: model configuration (from config submodule)
@@ -9,14 +10,16 @@ This module provides:
   - load_transformer: loads safetensors checkpoints into MLX arrays
 
 Architecture (FLUX.1 dev):
-  - 19 double transformer blocks (img + txt cross-attention)
-  - 38 single transformer blocks (joint img+txt attention + MLP)
-  - Hidden dim: 3072, MLP dim: 12288
+  - 19 double transformer blocks (img + txt joint self-attention)
+  - 38 single transformer blocks (joint img+txt attention + MLP, fused linear1/linear2)
+  - Hidden dim: 3072, MLP dim: 12288 (mlp_ratio=4)
   - 24 attention heads (head_dim = 128)
+  - 3-axis RoPE (frame, height, width), axes_dim=[16,56,56], theta=10000
+  - Per-head QK RMSNorm
+  - adaLN-style modulation driven by timestep+guidance+pooled conditioning
 
 Design decisions:
   - Use mx.Linear for all linear layers (built-in, efficient on Metal)
-  - Fused rope/attention where possible
   - Lazy evaluation with strategic mx.eval() for bridge points
   - float16 default, bfloat16 supported
 """
@@ -24,6 +27,53 @@ Design decisions:
 from __future__ import annotations
 
 __all__ = ["FluxConfig", "FluxTransformer", "load_transformer"]
+
+# ── Krea2 re-exports ───────────────────────────────────────────────────
+# Krea2 components are in native/krea2/; re-export for convenience.
+
+from .krea2 import (  # noqa: E402
+    Krea2Config,
+    SingleStreamDiT,
+    DoubleSharedModulation,
+    SimpleModulation,
+    RMSNorm as Krea2RMSNorm,
+    QKNorm as Krea2QKNorm,
+    SingleStreamBlock as Krea2SingleStreamBlock,
+    Attention as Krea2Attention,
+    SwiGLU,
+    EmbedND as Krea2EmbedND,
+    apply_rope_3d,
+    compute_rope_3d,
+    load_krea2_transformer,
+    normalize_krea2_keys,
+    map_krea2_to_native,
+    KREA2_LATENT_SCALE,
+    KREA2_LATENT_SHIFT,
+    process_krea2_latent_in,
+    process_krea2_latent_out,
+)
+
+__all__ += [
+    "Krea2Config",
+    "SingleStreamDiT",
+    "DoubleSharedModulation",
+    "SimpleModulation",
+    "Krea2RMSNorm",
+    "Krea2QKNorm",
+    "Krea2SingleStreamBlock",
+    "Krea2Attention",
+    "SwiGLU",
+    "Krea2EmbedND",
+    "apply_rope_3d",
+    "compute_rope_3d",
+    "load_krea2_transformer",
+    "normalize_krea2_keys",
+    "map_krea2_to_native",
+    "KREA2_LATENT_SCALE",
+    "KREA2_LATENT_SHIFT",
+    "process_krea2_latent_in",
+    "process_krea2_latent_out",
+]
 
 import math
 from pathlib import Path
@@ -34,6 +84,7 @@ import numpy as np
 
 # Re-export config from submodule
 from .config import FluxConfig  # noqa: E402
+from .weight_map import normalize_flux_keys, map_flux_to_native  # noqa: E402
 
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -42,174 +93,184 @@ HIDDEN_DIM = 3072
 MLP_DIM = 12288
 NUM_HEADS = 24
 HEAD_DIM = HIDDEN_DIM // NUM_HEADS  # 128
-MAX_POSITIONS = 4096
+AXES_DIM = (16, 56, 56)  # frame, height, width — sums to HEAD_DIM
+ROPE_THETA = 10000.0
+CONTEXT_IN_DIM = 4096  # T5-XXL
+VEC_IN_DIM = 768  # pooled CLIP-L
 
 
-# ── Helper layers ─────────────────────────────────────────────────────
+# ── RoPE (3-axis, paired-interleave convention) ─────────────────────────
 
-def rope(pos: mx.array, dim: int, theta: float = 10000.0) -> mx.array:
-    """Rotary positional embeddings.
+def rope_freqs(pos: mx.array, dim: int, theta: float) -> mx.array:
+    """Compute a [N, dim/2, 2, 2] rotation-matrix RoPE table for one axis.
+
+    Matches comfy.ldm.flux.math.rope: paired-interleave rotation (adjacent
+    dim pairs), NOT the rotate-half/LLaMA convention.
 
     Args:
-        pos: [N] position indices
-        dim: embedding dimension (must be even)
-        theta: scaling factor
+        pos: [N] position indices for this axis.
+        dim: axis dimension (must be even).
+        theta: frequency base for this axis.
+
     Returns:
-        [N, dim/2] cosine and sine values
+        [N, dim/2, 2, 2] rotation matrices — out[n, i] = [[cos, -sin], [sin, cos]].
     """
     assert dim % 2 == 0
     scale = mx.arange(0, dim, 2, dtype=mx.float32) / dim
-    freqs = (1.0 / (theta ** scale)).astype(mx.float32)
-    theta_i = pos.astype(mx.float32)[:, None] * freqs[None, :]  # [N, D/2]
-    cos = mx.cos(theta_i)
-    sin = mx.sin(theta_i)
-    return mx.concatenate([cos, sin], axis=-1)  # [N, D]
+    omega = 1.0 / (theta ** scale)  # [dim/2]
+    out = pos.astype(mx.float32)[:, None] * omega[None, :]  # [N, dim/2]
+    cos, sin = mx.cos(out), mx.sin(out)
+    # [N, dim/2, 2, 2]: [[cos, -sin], [sin, cos]]
+    return mx.stack([cos, -sin, sin, cos], axis=-1).reshape(*out.shape, 2, 2)
 
 
-def apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply rotary positional embeddings to QK pairs."""
-    split = x.shape[-1] // 2
-    x1 = x[..., :split]
-    x2 = x[..., split:]
-    return (x1 * cos[..., :split] - x2 * sin[..., :split]), \
-           (x1 * sin[..., :split] + x2 * cos[..., :split])
+def embed_nd(ids: mx.array, axes_dim: tuple[int, ...], theta: float) -> mx.array:
+    """3-axis RoPE embedding table.
 
+    Args:
+        ids: [N, num_axes] position indices, one column per axis.
+        axes_dim: per-axis dimension (sums to head_dim).
+        theta: frequency base.
 
-class EmbedND(nn.Module):
-    """Get image/text positional embeddings for FLUX.
-
-    Maps [B, T, dim] -> [B, T, dim] with sinusoidal positional encoding.
-    For FLUX: text gets T5 positions, image gets 2D spatial positions.
+    Returns:
+        [N, head_dim/2, 2, 2] rotation matrices, concatenated across axes.
     """
+    parts = [rope_freqs(ids[:, i], axes_dim[i], theta) for i in range(len(axes_dim))]
+    return mx.concatenate(parts, axis=-3)
 
-    def __init__(self, dim: int = HIDDEN_DIM, theta: float = 10000.0,
-                 freq_scale_c: float = 1.0, freq_scale_h: float = 1.0,
-                 freq_scale_w: float = 1.0):
+
+def apply_rope(x: mx.array, freqs: mx.array) -> mx.array:
+    """Apply paired-interleave RoPE rotation to Q or K.
+
+    Args:
+        x: [B, H, N, D] query or key tensor.
+        freqs: [N, D/2, 2, 2] rotation matrices from embed_nd.
+
+    Returns:
+        [B, H, N, D] rotated tensor.
+    """
+    B, H, N, D = x.shape
+    x_pairs = x.reshape(B, H, N, D // 2, 1, 2)  # [B,H,N,D/2,1,2]
+    f = freqs[None, None]  # [1,1,N,D/2,2,2]
+    out = (f[..., 0] * x_pairs[..., 0]) + (f[..., 1] * x_pairs[..., 1])  # [B,H,N,D/2,2]
+    return out.reshape(B, H, N, D)
+
+
+class QKNorm(nn.Module):
+    """Per-head RMSNorm applied to Q and K after the head split."""
+
+    def __init__(self, head_dim: int):
         super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.freq_scale_c = freq_scale_c
-        self.freq_scale_h = freq_scale_h
-        self.freq_scale_w = freq_scale_w
+        self.query_norm = nn.RMSNorm(head_dim)
+        self.key_norm = nn.RMSNorm(head_dim)
 
-    def __call__(self, x: mx.array, image_sizes: tuple[int, int] | None = None) -> mx.array:
-        """
-        Args:
-            x: [B, T, dim] input embeddings
-            image_sizes: (height, width) in pixels for spatial rope
+    def __call__(self, q: mx.array, k: mx.array) -> tuple[mx.array, mx.array]:
+        return self.query_norm(q), self.key_norm(k)
 
-        Returns:
-            [B, T, dim] with positional embeddings added
-        """
-        _, length, dim = x.shape
-        pos = mx.arange(length, dtype=mx.float32)  # [T]
-        rope_mult = rope(pos, self.dim, self.theta)  # [T, D]
-        return x + rope_mult[None]  # [B, T, D]
 
+# ── Modulation (adaLN-style, driven by conditioning vector) ────────────
 
 class Modulation(nn.Module):
-    """Modulation layers for diffusion transformer blocks.
+    """adaLN-style modulation: SiLU(vec) -> Linear -> chunk into ModulationOut(s).
 
-    Outputs 6 parameters (for double blocks) or 9 parameters (for single blocks):
-      double: shift_msa, gate_msa, shift_mlp, gate_mlp, shift_norm2, gate_norm2
-      single: shift_msa, gate_msa, shift_mlp, gate_mlp, gate_norm2, shift_norm2, ...
+    double=True:  returns (mod1, mod2), each (shift, scale, gate) — 6 total params.
+    double=False: returns (mod, None), (shift, scale, gate) — 3 total params.
     """
 
-    def __init__(self, dim: int, num_params: int = 6):
+    def __init__(self, dim: int, double: bool):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, affine=False)
-        self.linear = nn.Linear(dim, num_params * dim)
+        self.is_double = double
+        self.multiplier = 6 if double else 3
+        self.lin = nn.Linear(dim, self.multiplier * dim)
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
-        """Returns a tuple of (param_i * x) for each of num_params."""
-        normed = self.norm(x)
-        params = self.linear(nn.silu(normed))
-        # Split into num_params chunks
-        chunk_size = params.shape[-1] // 6
-        params = mx.split(params, 6, axis=-1)
-        return tuple(p for p in params)
+    def __call__(self, vec: mx.array) -> tuple[tuple[mx.array, mx.array, mx.array],
+                                                tuple[mx.array, mx.array, mx.array] | None]:
+        """Args: vec [B, dim] conditioning vector.
+
+        Returns: (mod1, mod2) where each is (shift, scale, gate) of shape [B, 1, dim],
+        or (mod1, None) when not double.
+        """
+        out = self.lin(nn.silu(vec))  # [B, multiplier*dim]
+        parts = mx.split(out, self.multiplier, axis=-1)
+        parts = [p[:, None, :] for p in parts]  # [B, 1, dim] for broadcast over [B, N, dim]
+        mod1 = (parts[0], parts[1], parts[2])
+        mod2 = (parts[3], parts[4], parts[5]) if self.is_double else None
+        return mod1, mod2
 
 
-class LinearAttention(nn.Module):
-    """Multi-head attention with QKV projection.
+def apply_mod(x: mx.array, scale: mx.array, shift: mx.array | None) -> mx.array:
+    """x * (1 + scale) [+ shift]. scale/shift are [B, 1, D], x is [B, N, D]."""
+    out = x * (1 + scale)
+    if shift is not None:
+        out = out + shift
+    return out
 
-    Supports optional Kontext KV cache injection for reference conditioning.
+
+# ── Joint attention (shared by DoubleStreamBlock and SingleStreamBlock) ─
+
+def joint_attention(
+    q: mx.array, k: mx.array, v: mx.array, freqs: mx.array,
+) -> mx.array:
+    """Scaled dot-product attention with RoPE.
+
+    Args:
+        q, k, v: [B, H, N, head_dim]
+        freqs: [N, head_dim/2, 2, 2] RoPE table
+
+    Returns:
+        [B, N, H*head_dim] attention output (heads merged back).
+    """
+    B, H, N, Dh = q.shape
+    q = apply_rope(q, freqs)
+    k = apply_rope(k, freqs)
+
+    scale = 1.0 / math.sqrt(Dh)
+    attn = (q * scale) @ k.transpose(0, 1, 3, 2)  # [B, H, N, N+]
+    attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(q.dtype)
+    out = attn @ v  # [B, H, N, Dh]
+    return out.transpose(0, 2, 1, 3).reshape(B, N, H * Dh)
+
+
+# ── Double Block (joint img+txt self-attention) ─────────────────────────
+
+class SelfAttentionProj(nn.Module):
+    """QKV + QKNorm + output projection, without running attention itself.
+
+    Matches comfy.ldm.flux.layers.SelfAttention: the block computes q/k/v via
+    this module's `qkv`/`norm`, runs joint attention externally, then calls
+    `proj` on the merged result.
     """
 
-    def __init__(self, dim: int = HIDDEN_DIM, num_heads: int = NUM_HEADS,
-                 qkv_bias: bool = True):
+    def __init__(self, dim: int, num_heads: int, qkv_bias: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.norm = QKNorm(self.head_dim)
         self.proj = nn.Linear(dim, dim)
 
-    def __call__(
-        self,
-        x: mx.array,
-        rope: mx.array,
-        kontext_kv: tuple[mx.array, mx.array] | None = None,
-    ) -> mx.array:
-        """
-        Args:
-            x: [B, N, D] input
-            rope: [N, D] rope embeddings
-            kontext_kv: optional (k_ref, v_ref) for reference conditioning
-
-        Returns:
-            [B, N, D] attention output
-        """
-        B, N, D = x.shape
-        qkv = self.qkv(x)  # [B, N, 3*D]
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).transpose(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # Apply RoPE
-        q = apply_rope(q, rope)
-        k = apply_rope(k, rope)
-
-        # Kontext KV cache injection
-        if kontext_kv is not None:
-            k_ref, v_ref = kontext_kv
-            k = mx.concatenate([k, k_ref], axis=2)
-            v = mx.concatenate([v, v_ref], axis=2)
-
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = (q * scale) @ k.transpose(0, 1, 3, 2)  # [B, H, N, N+]
-        attn = mx.softmax(attn, axis=-1)
-        out = attn @ v  # [B, H, N, head_dim]
-        out = out.transpose(0, 2, 1, 3).reshape(B, N, D)
-        return self.proj(out)
-
-
-# ── Double Block (img + txt cross-attention) ─────────────────────────
 
 class DoubleBlock(nn.Module):
     """FLUX.1 double transformer block.
 
-    Processes image and text tokens in parallel:
-      1. Image self-attention (with rope)
-      2. Text self-attention (with rope)
-      3. Image cross-attention to text
-      4. Text cross-attention to image (skip for FLUX dev)
-      5. Image MLP (gated)
-      6. Text MLP (gated)
+    Image and text tokens each get their own modulation + QKV, but attention
+    is JOINT: img and txt Q/K/V are concatenated (txt first) into one
+    attention call, then split back for the separate MLP branches.
     """
 
     def __init__(self, dim: int = HIDDEN_DIM, num_heads: int = NUM_HEADS,
-                 mlp_ratio: float = 4.0):
+                 mlp_ratio: float = 4.0, qkv_bias: bool = True):
         super().__init__()
         self.dim = dim
-        self.img_mod = Modulation(dim, num_params=6)
-        self.txt_mod = Modulation(dim, num_params=6)
+        self.img_mod = Modulation(dim, double=True)
+        self.img_norm1 = nn.LayerNorm(dim, affine=False, eps=1e-6)
+        self.img_attn = SelfAttentionProj(dim, num_heads, qkv_bias)
+        self.img_norm2 = nn.LayerNorm(dim, affine=False, eps=1e-6)
 
-        self.img_attn = LinearAttention(dim, num_heads)
-        self.txt_attn = LinearAttention(dim, num_heads)
-
-        # Text-to-image cross-attention (FLUX dev: text attends to image via txt_attn)
-        # In FLUX dev, txt_attn is self-attention on concatenated [img, txt]
-        # Simplified: we use the combined rope approach
+        self.txt_mod = Modulation(dim, double=True)
+        self.txt_norm1 = nn.LayerNorm(dim, affine=False, eps=1e-6)
+        self.txt_attn = SelfAttentionProj(dim, num_heads, qkv_bias)
+        self.txt_norm2 = nn.LayerNorm(dim, affine=False, eps=1e-6)
 
         hidden_mlp = int(dim * mlp_ratio)
         self.img_mlp_0 = nn.Linear(dim, hidden_mlp)
@@ -217,107 +278,170 @@ class DoubleBlock(nn.Module):
         self.txt_mlp_0 = nn.Linear(dim, hidden_mlp)
         self.txt_mlp_2 = nn.Linear(hidden_mlp, dim)
 
+    def _qkv_heads(self, attn: SelfAttentionProj, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        B, N, D = x.shape
+        qkv = attn.qkv(x).reshape(B, N, 3, attn.num_heads, attn.head_dim).transpose(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = attn.norm(q, k)
+        return q, k, v
+
     def __call__(
         self,
         img: mx.array,
         txt: mx.array,
-        rope: mx.array,
-        kontext_kv: tuple[mx.array, mx.array] | None = None,
+        vec: mx.array,
+        freqs: mx.array,
     ) -> tuple[mx.array, mx.array]:
         """
         Args:
             img: [B, N_img, D] image tokens
             txt: [B, N_txt, D] text tokens
-            rope: [N, D] rope embeddings (N = max(N_img, N_txt))
-            kontext_kv: optional (k_ref, v_ref) for reference conditioning
+            vec: [B, D] conditioning vector (timestep + guidance + pooled)
+            freqs: [N_txt+N_img, head_dim/2, 2, 2] RoPE table (txt positions first)
 
         Returns:
             (img_out, txt_out)
         """
-        # --- Image branch ---
-        img_mod1_shift, img_mod1_gate, img_mod2_shift, img_mod2_gate, img_mod3_shift, img_mod3_gate = \
-            self.img_mod(img)
+        (img_shift1, img_scale1, img_gate1), (img_shift2, img_scale2, img_gate2) = self.img_mod(vec)
+        (txt_shift1, txt_scale1, txt_gate1), (txt_shift2, txt_scale2, txt_gate2) = self.txt_mod(vec)
 
-        img_modded = img * (1 + img_mod1_shift) + img_mod1_gate
+        img_modulated = apply_mod(self.img_norm1(img), img_scale1, img_shift1)
+        img_q, img_k, img_v = self._qkv_heads(self.img_attn, img_modulated)
 
-        # Self-attention on image tokens (with optional Kontext)
-        img_attn_out = self.img_attn(img_modded, rope, kontext_kv=kontext_kv)
-        img = img + img_attn_out * img_mod2_gate
+        txt_modulated = apply_mod(self.txt_norm1(txt), txt_scale1, txt_shift1)
+        txt_q, txt_k, txt_v = self._qkv_heads(self.txt_attn, txt_modulated)
 
-        # --- Text branch ---
-        txt_mod1_shift, txt_mod1_gate, txt_mod2_shift, txt_mod2_gate, txt_mod3_shift, txt_mod3_gate = \
-            self.txt_mod(txt)
+        # Joint attention: txt tokens first, then img tokens (matches RoPE id order)
+        q = mx.concatenate([txt_q, img_q], axis=2)
+        k = mx.concatenate([txt_k, img_k], axis=2)
+        v = mx.concatenate([txt_v, img_v], axis=2)
 
-        txt_modded = txt * (1 + txt_mod1_shift) + txt_mod1_gate
+        attn = joint_attention(q, k, v, freqs)
+        txt_attn, img_attn = attn[:, :txt.shape[1]], attn[:, txt.shape[1]:]
 
-        # Self-attention on text tokens (with optional Kontext)
-        txt_attn_out = self.txt_attn(txt_modded, rope, kontext_kv=kontext_kv)
-        txt = txt + txt_attn_out * txt_mod2_gate
+        # Attention residual (gate1), no shift — matches apply_mod(x, gate, None)
+        img = img + self.img_attn.proj(img_attn) * img_gate1
+        txt = txt + self.txt_attn.proj(txt_attn) * txt_gate1
 
-        # --- MLP ---
-        img_mlp = self.img_mlp_2(nn.gelu(self.img_mlp_0(img_modded)))
-        img = img + img_mlp * img_mod3_gate
+        # MLP branch: fresh norm2 + modulation2 on the POST-attention residual
+        img_mlp_in = apply_mod(self.img_norm2(img), img_scale2, img_shift2)
+        img_mlp = self.img_mlp_2(nn.gelu_approx(self.img_mlp_0(img_mlp_in)))
+        img = img + img_mlp * img_gate2
 
-        txt_mlp = self.txt_mlp_2(nn.gelu(self.txt_mlp_0(txt_modded)))
-        txt = txt + txt_mlp * txt_mod3_gate
+        txt_mlp_in = apply_mod(self.txt_norm2(txt), txt_scale2, txt_shift2)
+        txt_mlp = self.txt_mlp_2(nn.gelu_approx(self.txt_mlp_0(txt_mlp_in)))
+        txt = txt + txt_mlp * txt_gate2
 
         return img, txt
 
 
-# ── Single Block (joint attention) ────────────────────────────────────
+# ── Single Block (fused joint attention + MLP) ──────────────────────────
 
 class SingleBlock(nn.Module):
     """FLUX.1 single transformer block.
 
-    Concatenates image and text tokens, then applies joint attention + MLP.
-    More efficient than double blocks for the second half of the network.
+    Operates on the concatenated [txt, img] sequence. QKV and the MLP's
+    first projection are fused into one `linear1`; the attention output and
+    MLP activation are fused back together through one `linear2`. Modulation
+    has only 3 params (shift, scale, gate) — no separate second modulation.
     """
 
     def __init__(self, dim: int = HIDDEN_DIM, num_heads: int = NUM_HEADS,
                  mlp_ratio: float = 4.0):
         super().__init__()
         self.dim = dim
-        self.mod = Modulation(dim, num_params=9)
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.hidden_mlp = int(dim * mlp_ratio)
 
-        self.attn = LinearAttention(dim, num_heads)
+        self.modulation = Modulation(dim, double=False)
+        self.pre_norm = nn.LayerNorm(dim, affine=False, eps=1e-6)
+        self.norm = QKNorm(self.head_dim)
 
-        hidden_mlp = int(dim * mlp_ratio)
-        self.mlp_0 = nn.Linear(dim, hidden_mlp * 3)  # Fused: 3 projections
-        self.mlp_2 = nn.Linear(hidden_mlp, dim)
+        # qkv (3*dim) + mlp_in (hidden_mlp) fused
+        self.linear1 = nn.Linear(dim, dim * 3 + self.hidden_mlp)
+        # attn_out (dim) + mlp_out (hidden_mlp) fused back to dim
+        self.linear2 = nn.Linear(dim + self.hidden_mlp, dim)
 
     def __call__(
         self,
         x: mx.array,
-        rope: mx.array,
-        kontext_kv: tuple[mx.array, mx.array] | None = None,
+        vec: mx.array,
+        freqs: mx.array,
     ) -> mx.array:
         """
         Args:
-            x: [B, N, D] concatenated [img, txt] tokens
-            rope: [N, D] rope embeddings
-            kontext_kv: optional (k_ref, v_ref) for reference conditioning
+            x: [B, N, D] concatenated [txt, img] tokens
+            vec: [B, D] conditioning vector
+            freqs: [N, head_dim/2, 2, 2] RoPE table
 
         Returns:
             [B, N, D] output
         """
-        mod_shift, mod_gate, shift2, gate2, shift3, gate3, shift4, gate4, shift5 = \
-            self.mod(x)
+        (shift, scale, gate), _ = self.modulation(vec)
 
-        x_modded = x * (1 + shift2) + gate2
+        B, N, D = x.shape
+        modulated = apply_mod(self.pre_norm(x), scale, shift)
+        fused = self.linear1(modulated)
+        qkv, mlp_in = mx.split(fused, [3 * self.dim], axis=-1)
 
-        # Joint attention (with optional Kontext)
-        attn_out = self.attn(x_modded, rope, kontext_kv=kontext_kv)
-        x = x + attn_out * gate3
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).transpose(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = self.norm(q, k)
 
-        # Fused MLP with swiglu
-        mlp_out = self.mlp_0(nn.silu(x_modded))
-        # Split into 3 parts and apply SwiGLU
-        mlp_out = mx.split(mlp_out, 3, axis=-1)
-        mlp_out = mlp_out[0] * nn.gelu(mlp_out[1])
-        mlp_out = self.mlp_2(mlp_out)
-        x = x + mlp_out * gate3
+        attn = joint_attention(q, k, v, freqs)
+        mlp_act = nn.gelu_approx(mlp_in)
+        out = self.linear2(mx.concatenate([attn, mlp_act], axis=-1))
+        x = x + out * gate
 
         return x
+
+
+# ── LastLayer ────────────────────────────────────────────────────────────
+
+class LastLayer(nn.Module):
+    """Final output layer: adaLN modulation -> LayerNorm -> Linear."""
+
+    def __init__(self, dim: int, out_dim: int):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(dim, affine=False, eps=1e-6)
+        self.linear = nn.Linear(dim, out_dim)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 2 * dim),
+        )
+
+    def __call__(self, x: mx.array, vec: mx.array) -> mx.array:
+        shift, scale = mx.split(self.adaLN_modulation(vec), 2, axis=-1)
+        x = apply_mod(self.norm_final(x), scale[:, None, :], shift[:, None, :])
+        return self.linear(x)
+
+
+# ── MLPEmbedder (time_in / vector_in / guidance_in) ─────────────────────
+
+class MLPEmbedder(nn.Module):
+    """in_dim -> hidden_dim -> SiLU -> hidden_dim, matching FLUX's time/vector/guidance embedders."""
+
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.in_layer = nn.Linear(in_dim, hidden_dim)
+        self.out_layer = nn.Linear(hidden_dim, hidden_dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.out_layer(nn.silu(self.in_layer(x)))
+
+
+def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0,
+                        time_factor: float = 1000.0) -> mx.array:
+    """Sinusoidal timestep embedding, matching comfy.ldm.flux.layers.timestep_embedding."""
+    t = time_factor * t
+    half = dim // 2
+    freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
+    args = t[:, None].astype(mx.float32) * freqs[None, :]
+    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+    if dim % 2:
+        emb = mx.concatenate([emb, mx.zeros((emb.shape[0], 1), dtype=emb.dtype)], axis=-1)
+    return emb
 
 
 # ── Main Transformer ──────────────────────────────────────────────────
@@ -337,12 +461,12 @@ class FluxTransformer(nn.Module):
 
         # Input projections
         self.img_in = nn.Linear(64, HIDDEN_DIM)
-        self.txt_in = nn.Linear(4096, HIDDEN_DIM)
+        self.txt_in = nn.Linear(CONTEXT_IN_DIM, HIDDEN_DIM)
 
-        # Time / guidance embedding
-        self.time_in = nn.Linear(256, HIDDEN_DIM * 4)
-        self.vector_in = nn.Linear(768, HIDDEN_DIM * 4)
-        self.guidance_in = nn.Linear(768, HIDDEN_DIM * 4) if config.guidance_embed else None
+        # Time / vector / guidance embedding (MLPEmbedder: in -> hidden -> SiLU -> hidden)
+        self.time_in = MLPEmbedder(256, HIDDEN_DIM)
+        self.vector_in = MLPEmbedder(VEC_IN_DIM, HIDDEN_DIM)
+        self.guidance_in = MLPEmbedder(256, HIDDEN_DIM) if config.guidance_embed else None
 
         # Transformer blocks
         self.double_blocks = [
@@ -353,73 +477,80 @@ class FluxTransformer(nn.Module):
         ]
 
         # Output
-        self.final_layer = nn.Linear(HIDDEN_DIM, 64)
+        self.final_layer = LastLayer(HIDDEN_DIM, 64)
 
-        # Positional embedding
-        self.rope = EmbedND(HIDDEN_DIM)
+    def get_rope(
+        self,
+        img_h: int,
+        img_w: int,
+        txt_len: int,
+        ref_grids: list[tuple[int, int]] | None = None,
+    ) -> mx.array:
+        """Compute the 3-axis RoPE table for a [txt, img, ref...] sequence.
 
-        # Kontext KV cache for reference conditioning
-        self.kontext_kv_cache: dict[str, tuple[mx.array, mx.array]] = {}
-        self.kontext_kv_enabled: bool = False
-        self.kontext_ref_tokens: int = 0
+        Matches comfy's `process_img`/`img_ids`: each image token gets its own
+        (row, col) grid coordinate on axes 1/2, not a flat sequential index
+        reused on both axes. Text tokens sit at position 0 on every axis
+        (comfy's `txt_ids` are zeros for standard FLUX.1, since `txt_ids_dims`
+        is empty).
 
-    def set_kontext(self, enabled: bool, reference_tokens: int = 0) -> None:
-        """Enable/disable Kontext KV cache."""
-        self.kontext_kv_enabled = enabled and reference_tokens > 0
-        self.kontext_ref_tokens = reference_tokens
-        if not enabled:
-            self.kontext_kv_cache.clear()
+        Kontext reference tokens (`ref_grids`) are appended after the target
+        image tokens, matching `comfy/ldm/flux/model.py::_forward`'s default
+        "offset" `ref_latents_method`: each reference gets its own row/col
+        grid (same coordinate space as the target) but is distinguished by an
+        increasing index on axis 0 (1, 2, 3, ...) — the target image and text
+        both sit at axis-0 index 0.
 
-    def get_kontext_kv(self, layer_idx: int) -> tuple[mx.array, mx.array] | None:
-        """Get cached K/V for a given layer, or None."""
-        if not self.kontext_kv_enabled:
-            return None
-        key = f"block_{layer_idx}"
-        return self.kontext_kv_cache.get(key)
+        Args:
+            img_h: image token grid height (in patches).
+            img_w: image token grid width (in patches).
+            txt_len: number of text tokens.
+            ref_grids: optional list of (h, w) grid sizes, one per Kontext
+                reference image, in the same order they'll be concatenated
+                to `img` by the caller.
 
-    def store_kontext_kv(self, layer_idx: int, k: mx.array, v: mx.array) -> None:
-        """Store reference K/V for a given layer."""
-        if not self.kontext_kv_enabled or self.kontext_ref_tokens <= 0:
-            return
-        key = f"block_{layer_idx}"
-        if k.shape[2] >= self.kontext_ref_tokens:
-            ref_k = mx.contiguous(k[:, :, -self.kontext_ref_tokens:, :])
-            ref_v = mx.contiguous(v[:, :, -self.kontext_ref_tokens:, :])
-            mx.eval(ref_k, ref_v)
-            self.kontext_kv_cache[key] = (ref_k, ref_v)
+        Returns:
+            [txt_len + img_h*img_w + sum(ref_h*ref_w), head_dim/2, 2, 2] table.
+        """
+        ref_grids = ref_grids or []
+        img_len = img_h * img_w
+        ref_lens = [rh * rw for rh, rw in ref_grids]
+        total = txt_len + img_len + sum(ref_lens)
+        ids = mx.zeros((total, 3), dtype=mx.float32)
+        if img_len > 0:
+            rows = mx.arange(img_h, dtype=mx.float32)[:, None]
+            cols = mx.arange(img_w, dtype=mx.float32)[None, :]
+            rows = mx.broadcast_to(rows, (img_h, img_w)).reshape(-1)
+            cols = mx.broadcast_to(cols, (img_h, img_w)).reshape(-1)
+            ids[txt_len:txt_len + img_len, 1] = rows
+            ids[txt_len:txt_len + img_len, 2] = cols
 
-    def get_rope(self, img_len: int, txt_len: int) -> mx.array:
-        """Compute rope embeddings for image and text lengths."""
-        # For FLUX dev: image tokens = H/8 * W/8, text tokens = T5 sequence
-        # rope is computed per-position
-        max_len = max(img_len, txt_len)
-        pos = mx.arange(max_len, dtype=mx.float32)
-        return rope(pos, HIDDEN_DIM)
+        offset = txt_len + img_len
+        for ref_idx, (rh, rw) in enumerate(ref_grids, start=1):
+            rlen = rh * rw
+            if rlen > 0:
+                rrows = mx.arange(rh, dtype=mx.float32)[:, None]
+                rcols = mx.arange(rw, dtype=mx.float32)[None, :]
+                rrows = mx.broadcast_to(rrows, (rh, rw)).reshape(-1)
+                rcols = mx.broadcast_to(rcols, (rh, rw)).reshape(-1)
+                ids[offset:offset + rlen, 0] = float(ref_idx)
+                ids[offset:offset + rlen, 1] = rrows
+                ids[offset:offset + rlen, 2] = rcols
+            offset += rlen
+        return embed_nd(ids, AXES_DIM, ROPE_THETA)
 
     def time_embed(self, t: mx.array, guidance: mx.array | None = None,
                    pooled: mx.array | None = None) -> mx.array:
-        """Compute time + guidance + pooled conditioning."""
-        # Standard timestep embedding
-        half_dim = 256 // 2
-        emb_math = mx.log(10000.0) / (half_dim - 1)
-        emb = mx.exp(mx.arange(half_dim, dtype=mx.float32) * -emb_math)
-        emb = t[:, None].astype(mx.float32) * emb[None, :]
-        emb = mx.concatenate([mx.cos(emb), mx.sin(emb)], axis=-1)
-        emb = self.time_in(emb.astype(self.dtype))
+        """Compute the [B, hidden_dim] conditioning vector: time + guidance + pooled."""
+        vec = self.time_in(timestep_embedding(t, 256).astype(self.dtype))
 
-        # Add pooled (CLIP-L) embedding
-        if pooled is not None:
-            pooled_emb = self.vector_in(pooled.astype(self.dtype))
-            emb = emb + pooled_emb
-
-        # Add guidance embedding (FLUX dev only)
         if guidance is not None and self.guidance_in is not None:
-            guidance_emb = self.guidance_in(
-                guidance.astype(self.dtype)
-            )
-            emb = emb + guidance_emb
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).astype(self.dtype))
 
-        return emb
+        if pooled is not None:
+            vec = vec + self.vector_in(pooled.astype(self.dtype))
+
+        return vec
 
     def __call__(
         self,
@@ -428,7 +559,9 @@ class FluxTransformer(nn.Module):
         t: mx.array,         # [B] timestep
         guidance: mx.array | None = None,  # [B] guidance scale
         pooled: mx.array | None = None,    # [B, 768] pooled CLIP
-        rope: mx.array | None = None,      # precomputed rope
+        rope: mx.array | None = None,      # precomputed 3-axis RoPE table
+        control: dict[str, list[mx.array | None]] | None = None,
+        ref_img: mx.array | None = None,   # packed Kontext reference tokens [B, N_ref, 64]
     ) -> mx.array:
         """Forward pass.
 
@@ -438,42 +571,66 @@ class FluxTransformer(nn.Module):
             t: timesteps [B]
             guidance: guidance scale [B] (FLUX dev)
             pooled: pooled CLIP output [B, 768]
-            rope: precomputed rope embeddings [N, D]
+            rope: precomputed RoPE table [N_txt+N_img+N_ref, head_dim/2, 2, 2]
+            control: optional ControlNet residuals, {"input": [...], "output": [...]},
+                     one entry per double/single block (None entries are skipped).
+                     Matches comfy.ldm.flux.model.Flux's `control` dict convention.
+            ref_img: optional packed Kontext reference tokens [B, N_ref, 64],
+                     same raw patch space as `img` (pre-`img_in`). Concatenated
+                     onto `img` before the input projection, matching comfy's
+                     `_forward` (`img = torch.cat([img, kontext], dim=1)`), and
+                     dropped again from the output before `final_layer`
+                     (`out = out[:, :img_tokens]`).
 
         Returns:
             [B, N_img, 64] noise prediction
         """
-        B = img.shape[0]
+        img_tokens = img.shape[1]
+        if ref_img is not None:
+            img = mx.concatenate([img, ref_img], axis=1)
 
         # Input projections
         img = self.img_in(img.astype(self.dtype))
         txt = self.txt_in(txt.astype(self.dtype))
 
-        # Time conditioning
-        cond = self.time_embed(t, guidance=guidance, pooled=pooled)
+        # Conditioning vector drives modulation in every block
+        vec = self.time_embed(t, guidance=guidance, pooled=pooled)
 
-        # --- Double blocks ---
         if rope is None:
-            rope = self.get_rope(img.shape[1], txt.shape[1])
+            raise ValueError(
+                "ASDX: FluxTransformer.__call__ requires a precomputed `rope` table. "
+                "get_rope(img_h, img_w, txt_len) needs the actual image token grid "
+                "shape, which a flat token count (img.shape[1]) cannot provide; "
+                "callers must precompute it via self.get_rope(...) with the real "
+                "height/width before calling predict()/__call__."
+            )
 
+        control_input = control.get("input") if control is not None else None
         for i, block in enumerate(self.double_blocks):
-            kv = self.get_kontext_kv(i)
-            img, txt = block(img, txt, rope, kontext_kv=kv)
+            img, txt = block(img, txt, vec, rope)
+            if control_input is not None and i < len(control_input):
+                add = control_input[i]
+                if add is not None:
+                    img = img.at[:, :add.shape[1]].add(add)
 
-        # Concatenate for single blocks
-        x = mx.concatenate([img, txt], axis=1)
+        # Concatenate for single blocks: txt first, matching RoPE id order
+        x = mx.concatenate([txt, img], axis=1)
 
-        # --- Single blocks ---
+        control_output = control.get("output") if control is not None else None
         for i, block in enumerate(self.single_blocks):
-            kv = self.get_kontext_kv(len(self.double_blocks) + i)
-            x = block(x, rope, kontext_kv=kv)
+            x = block(x, vec, rope)
+            if control_output is not None and i < len(control_output):
+                add = control_output[i]
+                if add is not None:
+                    start = txt.shape[1]
+                    x = x.at[:, start:start + add.shape[1]].add(add)
 
-        # Split back
-        img_out = x[:, :img.shape[1], :]
+        # Split back: image tokens are after the text tokens. Kontext reference
+        # tokens (if any) trail the target image tokens — drop them here,
+        # matching comfy's `out = out[:, :img_tokens]`.
+        img_out = x[:, txt.shape[1]:txt.shape[1] + img_tokens, :]
 
-        # Final layer
-        noise = self.final_layer(img_out)
-        return noise
+        return self.final_layer(img_out, vec)
 
     def predict(
         self,
@@ -483,6 +640,8 @@ class FluxTransformer(nn.Module):
         guidance: float = 3.5,
         pooled: mx.array | None = None,
         rope: mx.array | None = None,
+        control: dict[str, list[mx.array | None]] | None = None,
+        ref_img: mx.array | None = None,
     ) -> mx.array:
         """Convenience method for one denoising step.
 
@@ -493,32 +652,35 @@ class FluxTransformer(nn.Module):
             guidance: guidance scale
             pooled: [B, 768] pooled CLIP
             rope: optional precomputed rope
+            control: optional ControlNet residuals (see __call__)
+            ref_img: optional packed Kontext reference tokens (see __call__)
 
         Returns:
             [B, N, 64] predicted noise
         """
         t = mx.array([timestep], dtype=mx.float32)
         g = mx.array([guidance], dtype=mx.float32) if guidance is not None else None
-        return self(img, txt, t, guidance=g, pooled=pooled, rope=rope)
+        return self(img, txt, t, guidance=g, pooled=pooled, rope=rope, control=control,
+                    ref_img=ref_img)
 
 
 # ── Loader ────────────────────────────────────────────────────────────
 
-def _normalize_key(key: str) -> str:
-    """Normalize a PyTorch/ComfyUI key to our internal naming."""
-    # Strip common prefixes
-    for prefix in ("model.diffusion_model.", "diffusion_model."):
-        if key.startswith(prefix):
-            key = key[len(prefix):]
-    return key
-
-
 def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
-    """Load a safetensors file into MLX arrays."""
-    import safetensors
-    with open(path, "rb") as f:
-        data = safetensors.numpy.load(f.read())
-    return {k: mx.array(v) for k, v in data.items()}
+    """Load a safetensors file into MLX arrays.
+
+    Uses safetensors.torch to support BF16 (numpy backend doesn't).
+    BF16 tensors are cast to float32 before conversion to MLX.
+    """
+    import torch
+    import safetensors.torch
+    state = safetensors.torch.load_file(path, device="cpu")
+    result = {}
+    for k, v in state.items():
+        if v.dtype == torch.bfloat16:
+            v = v.float()
+        result[k] = mx.array(v.cpu().numpy())
+    return result
 
 
 def load_transformer(
@@ -532,124 +694,42 @@ def load_transformer(
         dtype: "float16" or "bfloat16"
 
     Returns:
-        Loaded FluxTransformer (weights not yet assigned to module)
+        Loaded FluxTransformer with weights assigned.
     """
+    from mlx.utils import tree_flatten, tree_unflatten
+
     path = Path(path)
     state = _load_safetensors(path)
 
-    # Normalize keys
-    normalized = {}
-    for k, v in state.items():
-        nk = _normalize_key(k)
-        if nk is not None:
-            normalized[nk] = v
+    # Normalize keys: strip prefixes, map to native naming (matches ComfyUI's
+    # process_unet_state_dict: only "*_norm.scale" -> "*_norm.weight" renaming;
+    # everything else keeps the checkpoint's own double_blocks/single_blocks layout).
+    normalized = normalize_flux_keys(state)
+    normalized = map_flux_to_native(normalized)
 
     config = FluxConfig(dtype=dtype)
     model = FluxTransformer(config)
 
-    # Assign weights - map our keys to checkpoint keys
-    # This is a simplified mapping; real checkpoints may vary
-    _assign_weights(model, normalized, config)
+    # Assign weights via tree_unflatten: navigating attribute-by-attribute and
+    # reassigning only works down to the parent module (mx.array leaves have
+    # no .weight/.value to update in place), so build the full parameter tree
+    # from flat checkpoint keys and hand it to model.update() in one shot.
+    # tree_flatten returns (dotted_string_key, array) pairs — matching
+    # directly against the checkpoint's own dotted string keys (both use the
+    # same "." separator and plain integer block indices).
+    model_flat = tree_flatten(model.parameters())
 
+    new_flat = []
+    matched = 0
+    for flat_key, value in model_flat:
+        if flat_key in normalized:
+            new_flat.append((flat_key, normalized[flat_key]))
+            matched += 1
+        else:
+            new_flat.append((flat_key, value))
+    new_nested = tree_unflatten(new_flat)
+    model.update(new_nested)
     mx.eval(model.parameters())
+
+    print(f"[ASDX] FLUX transformer: matched {matched}/{len(model_flat)} params from checkpoint")
     return model
-
-
-def _assign_weights(model: FluxTransformer, state: dict[str, mx.array],
-                    config: FluxConfig) -> None:
-    """Assign loaded weights to model parameters."""
-    # Input projections
-    if "img_in.weight" in state:
-        model.img_in.weight = state["img_in.weight"]
-    if "txt_in.weight" in state:
-        model.txt_in.weight = state["txt_in.weight"]
-
-    # Time/guidance embeddings
-    if "time_in.in_layer.weight" in state:
-        model.time_in.weight = state["time_in.in_layer.weight"]
-        model.time_in.bias = state["time_in.in_layer.bias"]
-    if "vector_in.in_layer.weight" in state:
-        model.vector_in.weight = state["vector_in.in_layer.weight"]
-        model.vector_in.bias = state["vector_in.in_layer.bias"]
-    if config.guidance_embed and "guidance_in.in_layer.weight" in state:
-        model.guidance_in.weight = state["guidance_in.in_layer.weight"]
-        model.guidance_in.bias = state["guidance_in.in_layer.bias"]
-
-    # Transformer blocks
-    for i, block in enumerate(model.double_blocks):
-        prefix = f"double_blocks.{i}."
-        _assign_double_block(block, state, prefix)
-
-    for i, block in enumerate(model.single_blocks):
-        prefix = f"single_blocks.{i}."
-        _assign_single_block(block, state, prefix)
-
-    # Final layer
-    if "final_layer.linear.weight" in state:
-        model.final_layer.weight = state["final_layer.linear.weight"]
-        if "final_layer.linear.bias" in state:
-            model.final_layer.bias = state["final_layer.linear.bias"]
-
-
-def _assign_double_block(block: DoubleBlock, state: dict[str, mx.array],
-                         prefix: str) -> None:
-    """Assign weights to a DoubleBlock."""
-    # Modulation layers
-    for name, submodule in [("img_mod", block.img_mod), ("txt_mod", block.txt_mod)]:
-        p = f"{prefix}{name}."
-        submodule.norm.weight = state[f"{p}norm.weight"]
-        submodule.norm.bias = state[f"{p}norm.bias"]
-        submodule.linear.weight = state[f"{p}linear.weight"]
-        submodule.linear.bias = state[f"{p}linear.bias"]
-
-    # Attention
-    for name, attn in [("img_attn", block.img_attn), ("txt_attn", block.txt_attn)]:
-        p = f"{prefix}{name}."
-        attn.qkv.weight = state[f"{p}qkv.weight"]
-        if f"{p}qkv.bias" in state:
-            attn.qkv.bias = state[f"{p}qkv.bias"]
-        attn.proj.weight = state[f"{p}proj.weight"]
-        if f"{p}proj.bias" in state:
-            attn.proj.bias = state[f"{p}proj.bias"]
-
-    # MLP
-    for name, mlp in [("img_mlp", block.img_mlp_0), ("txt_mlp", block.txt_mlp_0)]:
-        p = f"{prefix}{name}."
-        mlp.weight = state[f"{p}0.weight"]
-        if f"{p}0.bias" in state:
-            mlp.bias = state[f"{p}0.bias"]
-
-    for name, mlp in [("img_mlp", block.img_mlp_2), ("txt_mlp", block.txt_mlp_2)]:
-        p = f"{prefix}{name}."
-        mlp.weight = state[f"{p}2.weight"]
-        if f"{p}2.bias" in state:
-            mlp.bias = state[f"{p}2.bias"]
-
-
-def _assign_single_block(block: SingleBlock, state: dict[str, mx.array],
-                         prefix: str) -> None:
-    """Assign weights to a SingleBlock."""
-    # Modulation
-    p = f"{prefix}mod."
-    block.mod.norm.weight = state[f"{p}norm.weight"]
-    block.mod.norm.bias = state[f"{p}norm.bias"]
-    block.mod.linear.weight = state[f"{p}linear.weight"]
-    block.mod.linear.bias = state[f"{p}linear.bias"]
-
-    # Attention
-    p = f"{prefix}attn."
-    block.attn.qkv.weight = state[f"{p}qkv.weight"]
-    if f"{p}qkv.bias" in state:
-        block.attn.qkv.bias = state[f"{p}qkv.bias"]
-    block.attn.proj.weight = state[f"{p}proj.weight"]
-    if f"{p}proj.bias" in state:
-        block.attn.proj.bias = state[f"{p}proj.bias"]
-
-    # MLP
-    p = f"{prefix}mlp."
-    block.mlp_0.weight = state[f"{p}0.weight"]
-    if f"{p}0.bias" in state:
-        block.mlp_0.bias = state[f"{p}0.bias"]
-    block.mlp_2.weight = state[f"{p}2.weight"]
-    if f"{p}2.bias" in state:
-        block.mlp_2.bias = state[f"{p}2.bias"]

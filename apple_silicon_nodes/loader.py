@@ -47,10 +47,155 @@ def _build_cache_key(base_key: str, extra: dict[str, str] | None = None) -> str:
     return base_key
 _TYPE_HINTS = {
     "schnell": "schnell",
-    "klein": "schnell",
     "dev": "dev",
     "kontext": "dev",
 }
+
+_KREA2_HINTS = {
+    "krea2": "krea2",
+    "krea": "krea2",
+}
+
+_SDXL_HINTS = {
+    "sdxl": "sdxl",
+    "illustrious": "sdxl",
+    "pony": "sdxl",
+    "noobai": "sdxl",
+}
+
+_ZIMAGE_HINTS = {
+    "zimage": "zimage",
+    "z_image": "zimage",
+    "z-image": "zimage",
+}
+
+_FLUX2_HINTS = {
+    "klein": "flux2",
+    "flux.2": "flux2",
+    "flux2": "flux2",
+    "flux_2": "flux2",
+}
+
+
+def _detect_model_type(path: Path) -> str:
+    """Detect model type from filename, falling back to checkpoint key
+    inspection when the filename gives no hint.
+
+    Filename hints are checked first (cheap, matches established
+    convention). `_FLUX2_HINTS` is checked BEFORE the generic
+    `_TYPE_HINTS` (schnell/dev/kontext): Flux2-D's real filename on this
+    machine (`flux2_dev_fp8mixed.safetensors`) contains "dev" too, which
+    would otherwise misroute it to the FLUX.1-dev architecture (the exact
+    class of bug `_TYPE_HINTS["klein"]="schnell"` used to be, for Klein).
+    Many SDXL finetunes (Illustrious/Pony/NoobAI merges in particular)
+    don't include an obvious marker in their filename, so if nothing
+    matches, peek at the checkpoint's own tensor keys (header-only read via
+    safetensors, no weight data loaded) — SDXL's conv UNet has a
+    structurally distinctive `input_blocks.` key that FLUX/Krea2 never have,
+    Z-Image has an equally distinctive `noise_refiner.` key, and Flux2 has
+    `double_stream_modulation_img.` (comfy's own detection marker for this
+    exact branch — see `comfy/model_detection.py:237`).
+    """
+    name = path.name.lower()
+    for hint in _KREA2_HINTS:
+        if hint in name:
+            return "krea2"
+    for hint in _SDXL_HINTS:
+        if hint in name:
+            return "sdxl"
+    for hint in _ZIMAGE_HINTS:
+        if hint in name:
+            return "zimage_turbo" if "turbo" in name else "zimage"
+    for hint in _FLUX2_HINTS:
+        if hint in name:
+            return "flux2"
+    for hint in _TYPE_HINTS:
+        if hint in name:
+            return _TYPE_HINTS[hint]
+    return _detect_model_type_from_keys(path)
+
+
+def _detect_model_type_from_keys(path: Path) -> str:
+    """Fallback: distinguish SDXL/Z-Image/Flux2 from FLUX.1/Krea2 by checkpoint tensor keys."""
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            keys = list(f.keys())
+    except Exception as e:
+        print(f"[ASDX] Model type key-detection failed ({e}), defaulting to 'dev'")
+        return "dev"
+
+    if any("diffusion_model.input_blocks." in k or k.startswith("input_blocks.") for k in keys):
+        return "sdxl"
+    if any("noise_refiner." in k for k in keys):
+        return "zimage"
+    if any("double_stream_modulation_img." in k for k in keys):
+        return "flux2"
+    if any("txtfusion." in k for k in keys):
+        return "krea2"
+    return "dev"
+
+
+def _load_transformer_for_type(
+    path: Path, model_type: str, dtype: str
+):
+    """Load transformer weights based on detected model type.
+
+    Returns (transformer, config) tuple.
+    """
+    if model_type == "krea2":
+        from .native.krea2 import (
+            Krea2Config,
+            SingleStreamDiT,
+            load_krea2_transformer,
+        )
+        config = Krea2Config(dtype=dtype)
+        transformer = load_krea2_transformer(path, dtype=dtype)
+        return transformer, config
+    elif model_type == "sdxl":
+        from .native.sdxl import SDXLConfig, load_sdxl_unet
+        config = SDXLConfig(dtype=dtype)
+        transformer = load_sdxl_unet(path, dtype=dtype)
+        return transformer, config
+    elif model_type in ("zimage", "zimage_turbo"):
+        from .native.zimage import ZImageConfig, load_zimage_transformer
+        config = ZImageConfig(dtype=dtype)
+        transformer = load_zimage_transformer(path, dtype=dtype)
+        return transformer, config
+    elif model_type == "flux2":
+        from .native.flux2 import load_flux2_transformer
+        transformer = load_flux2_transformer(path, dtype=dtype)
+        # Unlike the other families, Flux2's config is DETECTED from the
+        # checkpoint (hidden_size/depth/guidance_embed differ between Klein
+        # and Flux2-D) — reuse the config load_flux2_transformer already
+        # derived, don't construct a fresh default one.
+        return transformer, transformer.config
+    else:
+        # FLUX.1 path
+        guidance_embed = model_type == "dev"
+        config = FluxConfig(dtype=dtype, guidance_embed=guidance_embed)
+        transformer = load_transformer(path, dtype=dtype)
+        return transformer, config
+
+
+_MODEL_TYPE_CAPABILITY = {
+    "sdxl": "sdxl_base",
+    "zimage": "zimage_base",
+    "zimage_turbo": "zimage_turbo",
+    "flux2": "flux2_klein",
+}
+
+
+def _capability_for_model_type(model_type: str, path: Path) -> CapabilityProfile:
+    """Resolve a capability profile, preferring the already-known `model_type`
+    (from `_detect_model_type`, which includes a content-based fallback for
+    ambiguous filenames) over re-guessing from the filename alone — avoids
+    the two detection systems disagreeing for checkpoints whose name gave
+    no hint (e.g. Illustrious/Pony/NoobAI SDXL finetunes)."""
+    profile_key = _MODEL_TYPE_CAPABILITY.get(model_type)
+    if profile_key is not None:
+        return CAPABILITY_PROFILES[profile_key]
+    return _resolve_capability_from_path(path)
 
 
 def _model_type_from_path(path: Path) -> str:
@@ -82,6 +227,7 @@ class ASDX_DiffusionLoader:
                 "lora": ("ASDX_LORA", {"default": None}),
                 "controlnet": ("ASDX_CONTROLNET", {"default": None}),
                 "base_model": ("ASDX_MODEL", {"default": None}),
+                "low_memory_mode": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -118,6 +264,7 @@ class ASDX_DiffusionLoader:
         lora: str | None = None,
         controlnet: str | None = None,
         base_model: str | None = None,
+        low_memory_mode: bool = False,
     ) -> tuple[dict]:
         t0 = time.perf_counter()
 
@@ -139,19 +286,15 @@ class ASDX_DiffusionLoader:
 
         # Find model file
         path = self._resolve_model_path(model_name)
-        model_type = _model_type_from_path(path)
+        model_type = _detect_model_type(path)
 
-        # Resolve capability profile from model name
-        capability = _resolve_capability_from_path(path)
+        # Resolve capability profile (see _capability_for_model_type).
+        capability = _capability_for_model_type(model_type, path)
 
-        # Load into MLX
-        config = FluxConfig(
-            dtype=precision,
-            guidance_embed=(model_type == "dev"),
+        # Load transformer based on model type (FLUX.1, Krea2, SDXL, or Z-Image)
+        transformer, config = _load_transformer_for_type(
+            path, model_type, precision
         )
-
-        # Load transformer weights from checkpoint
-        transformer = load_transformer(path, dtype=precision)
 
         # Create model descriptor with capability profile
         model_desc = {
@@ -164,6 +307,7 @@ class ASDX_DiffusionLoader:
             "precision": precision,
             "capability": capability,
             "load_time": 0.0,
+            "low_memory_mode": low_memory_mode,
         }
 
         load_time = time.perf_counter() - t0
@@ -220,7 +364,7 @@ class ASDX_CheckpointLoader:
             },
         }
 
-    RETURN_TYPES = ("asdx_model", "mlx_clip", "mlx_vae")
+    RETURN_TYPES = ("asdx_model", "mlx_clip", "VAE")
     RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load"
     CATEGORY = "ASDX/Loaders"
@@ -242,22 +386,22 @@ class ASDX_CheckpointLoader:
             pass
         return ["flux1-dev-fp16.safetensors"]
 
-    def load(self, ckpt_name: str, precision: str) -> tuple[dict, dict, dict]:
+    def load(self, ckpt_name: str, precision: str) -> tuple[dict, dict, Any]:
         t0 = time.perf_counter()
 
         # Resolve checkpoint path
         path = self._resolve_checkpoint_path(ckpt_name)
-        model_type = _model_type_from_path(path)
+        model_type = _detect_model_type(path)
 
-        # Load diffusion model
-        config = FluxConfig(
-            dtype=precision,
-            guidance_embed=(model_type == "dev"),
+        # Load diffusion model based on type
+        transformer, config = _load_transformer_for_type(
+            path, model_type, precision
         )
-        transformer = load_transformer(path, dtype=precision)
 
-        # Resolve capability profile from checkpoint path
-        capability = _resolve_capability_from_path(path)
+        # Resolve capability profile (see _capability_for_model_type — this
+        # loader is the one most likely to see merged SDXL/Illustrious/Pony
+        # checkpoints, whose filenames are often ambiguous).
+        capability = _capability_for_model_type(model_type, path)
 
         # Create model descriptor
         model_desc = {
@@ -271,22 +415,28 @@ class ASDX_CheckpointLoader:
             "capability": capability,
         }
 
-        # Create placeholder CLIP handle (text encoding handled by DualCLIPLoader)
-        clip_desc = {
-            "type": "flux1",
-            "cache_key": str(path),
-            "model_path": str(path),
-            "clip_l": None,
-            "t5xxl": None,
-        }
-
-        # Create placeholder VAE handle (VAE encode/decode handled separately)
-        vae_desc = {
-            "type": "flux_vae",
-            "cache_key": str(path),
-            "model_path": str(path),
-            "dtype": precision,
-        }
+        # Real comfy.sd.CLIP + comfy.sd.VAE, extracted from the same checkpoint
+        # file in one pass — NOT placeholders. The diffusion transformer is
+        # loaded separately above via our own MLX-native reader, so
+        # `output_model=False` skips the (expensive, redundant) PyTorch UNet
+        # build; only the CLIP/VAE-prefixed tensors are used. `clip` must be a
+        # real `comfy.sd.CLIP` (ASDX_CLIPTextEncode does `isinstance(mlx_clip,
+        # comfy.sd.CLIP)`), and `vae` must be a real "VAE"-typed comfy object
+        # (ASDX_VAEDecode's `vae` input socket only accepts the standard
+        # ComfyUI "VAE" type, and its decode path calls `vae.decode()`).
+        # Bonus over the standalone ASDX_DualCLIPLoader path: the text-encoder
+        # architecture (e.g. Klein's Qwen3-4B vs Qwen3-8B vs Flux2-D's
+        # Mistral3-24B) is detected from the checkpoint's own embedded CLIP
+        # weights (`model_config.clip_target(state_dict)`), not from a
+        # user-selected `clip_type` dropdown — sidesteps the Klein-4B
+        # misrouting footgun that dropdown has when clip_type is left at its
+        # default (see Phase F notes in the multi-model plan).
+        import comfy.sd
+        _, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(
+            str(path), output_model=False, output_clip=True,
+            output_vae=True, output_clipvision=False,
+        )
+        clip_desc = clip
 
         load_time = time.perf_counter() - t0
         mem = bridge.collect_mlx_memory()
@@ -294,7 +444,7 @@ class ASDX_CheckpointLoader:
               f"(type={model_type}, precision={precision}, "
               f"mem={mem['active_gb']:.1f}GB active, {mem['cache_gb']:.1f}GB cache)")
 
-        return (model_desc, clip_desc, vae_desc)
+        return (model_desc, clip_desc, vae)
 
     @staticmethod
     def _resolve_checkpoint_path(name: str) -> Path:
