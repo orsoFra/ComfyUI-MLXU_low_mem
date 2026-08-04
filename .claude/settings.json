@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // empty' | { read -r f; case \"$f\" in */apple_silicon_nodes/*.py) out=$(python3 -m py_compile \"$f\" 2>&1); if [ $? -ne 0 ]; then jq -n --arg r \"$out\" '{decision:\"block\", reason: (\"py_compile failed for edited file:\\n\" + $r)}'; fi ;; esac; }",
+            "timeout": 15,
+            "statusMessage": "py_compile check..."
+          }
+        ]
+      }
+    ]
+  }
+}
