@@ -130,15 +130,21 @@ class ASDX_MLXSampler:
         # Prepare noise. SDXL's UNet consumes the latent grid directly (no
         # 2x2 patchify like FLUX/Krea2), so it needs its own noise-prep path.
         # Flux2/Klein has 128 channels / patch_size=1 / 16x VAE downscale
-        # (vs FLUX's 16ch/patch=2/8x) — also its own path, NOT shared with
-        # Z-Image (which reuses FLUX's path outright since it inherits the
-        # exact same 16ch/patch=2/8x latent format).
+        # (vs FLUX's 16ch/patch=2/8x) — also its own path. Z-Image shares
+        # FLUX's channel count/scale/shift but NOT its patch-token axis
+        # order (comfy/ldm/lumina/model.py packs [pH,pW,C], FLUX packs
+        # [C,pH,pW] — verified against the real comfy source), so it needs
+        # its own noise-prep path too, despite the identical latent shape.
         if model_type == "sdxl":
             noise, height, width, output_shape = bridge.prepare_noise_from_latent_sdxl(
                 latent_image, int(seed), config.mlx_dtype
             )
         elif model_type == "flux2":
             noise, height, width, output_shape = bridge.prepare_noise_from_latent_flux2(
+                latent_image, int(seed), config.mlx_dtype
+            )
+        elif model_type in ("zimage", "zimage_turbo"):
+            noise, height, width, output_shape = bridge.prepare_noise_from_latent_zimage(
                 latent_image, int(seed), config.mlx_dtype
             )
         else:

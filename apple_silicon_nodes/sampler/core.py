@@ -561,12 +561,20 @@ class _SamplerCore:
         height: int,
         width: int,
         output_shape: tuple[int, int],
+        model_type: str = "flux",
     ) -> torch.Tensor | None:
-        """Convert current MLX latent to a decodable PyTorch latent for preview."""
+        """Convert current MLX latent to a decodable PyTorch latent for preview.
+
+        `_unpack_flux_latents`/`_unpack_zimage_latents` already apply
+        `process_flux_latent_out` (the FLUX/Z-Image scale+shift) internally
+        -- do not additionally call `comfy.latent_formats.Flux().process_out`
+        here, or the conversion is applied twice.
+        """
         try:
-            import comfy.latent_formats
-            samples = bridge._unpack_flux_latents(noise, height, width)
-            samples = comfy.latent_formats.Flux().process_out(samples)
+            if model_type in ("zimage", "zimage_turbo"):
+                samples = bridge._unpack_zimage_latents(noise, height, width)
+            else:
+                samples = bridge._unpack_flux_latents(noise, height, width)
             if torch.backends.mps.is_available():
                 return samples.to(device="mps")
             return samples
@@ -1185,12 +1193,16 @@ class _SamplerCore:
 
         Flow-matching, same Euler update as FLUX/Krea2 (`sampler/
         scheduling.py::time_snr_shift` — a FIXED shift, not FLUX-dev's
-        resolution-dependent `mu`). Reuses FLUX's exact latent packing
-        (`bridge.mlx_to_comfy_latent`/`prepare_noise_from_latent`,
-        `_denoise_to_latent` for preview) since Z-Image inherits the same
-        16-channel/patch=2 `latent_formats.Flux` VAE space (verified via
-        comfy's class chain: `ZImage(Lumina2)`, `Lumina2.latent_format =
-        latent_formats.Flux`) — no new bridge functions needed for that part.
+        resolution-dependent `mu`). Z-Image inherits FLUX's 16-channel/
+        patch=2 `latent_formats.Flux` VAE space (scale/shift constants,
+        verified via comfy's class chain: `ZImage(Lumina2)`,
+        `Lumina2.latent_format = latent_formats.Flux`) but NOT its
+        per-token patch-channel axis order: comfy/ldm/lumina/model.py
+        packs `[pH,pW,C]`, FLUX packs `[C,pH,pW]` (comfy/ldm/flux/
+        model.py:319) — reusing FLUX's pack/unpack functions here produced
+        a visibly grainy/pixelated image despite a NaN-free, otherwise
+        correct forward pass. Uses `bridge.prepare_noise_from_latent_zimage`/
+        `mlx_to_comfy_latent_zimage` (own `[pH,pW,C]` packing) instead.
 
         Single conditional forward pass per step: `NextDiT` has no built-in
         guidance-embedding mechanism (unlike FLUX-dev's `guidance_in`), and
@@ -1256,7 +1268,8 @@ class _SamplerCore:
 
             if self.preview and self.previewer is not None:
                 preview_latent = self._denoise_to_latent(
-                    self.noise, self.height, self.width, self.output_shape
+                    self.noise, self.height, self.width, self.output_shape,
+                    model_type="zimage",
                 )
                 if preview_latent is not None:
                     preview_bytes = self.previewer.decode_latent_to_preview_image(
@@ -1279,7 +1292,7 @@ class _SamplerCore:
             mx.clear_cache()
             print("[ASDX] Low memory: transformer cleared after denoising")
 
-        out_latent = bridge.mlx_to_comfy_latent(
+        out_latent = bridge.mlx_to_comfy_latent_zimage(
             self.noise, self.height, self.width, {"samples": self.noise}
         )
         out_latent["sdmlx_model_type"] = model_type

@@ -221,9 +221,11 @@ def _unpack_flux_latents(
     at this exact sampling boundary) -- must be converted back to raw VAE
     latent space here before the caller hands this to VAE decode, or the
     decoded image comes out visibly grainy/speckled (fp16 VAE decoders are
-    very sensitive to latent scale). Z-Image reuses this same function and
-    is also covered: it inherits `latent_formats.Flux` unchanged (verified
-    against the real comfy source), same 0.3611/0.1159 constants.
+    very sensitive to latent scale). NOT used for Z-Image, despite it
+    inheriting the same `latent_formats.Flux` 16ch/0.3611/0.1159 VAE space
+    -- Z-Image's own per-token patch-channel order is `[pH,pW,C]`, not
+    FLUX's `[C,pH,pW]` (see `_unpack_zimage_latents`'s docstring for the
+    comfy-source-verified difference); use `mlx_to_comfy_latent_zimage`.
     """
     from .native.config import process_flux_latent_out
 
@@ -233,6 +235,56 @@ def _unpack_flux_latents(
     # Reshape: [B, NH, NW, 16, 2, 2] -> [B, 16, NH, 2, NW, 2] -> [B, 16, NH*2, NW*2]
     unpacked = mx.reshape(latents, (1, latent_h // 2, latent_w // 2, 16, 2, 2))
     unpacked = mx.transpose(unpacked, (0, 3, 1, 4, 2, 5))
+    unpacked = mx.reshape(unpacked, (1, 16, latent_h // 2 * 2, latent_w // 2 * 2))
+    unpacked = process_flux_latent_out(unpacked.astype(mx.float32))
+    mx.eval(unpacked)
+
+    return torch.from_numpy(np.array(unpacked, dtype=np.float32))
+
+
+def mlx_to_comfy_latent_zimage(
+    latents: mx.array,
+    height: int,
+    width: int,
+    template: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert MLX Z-Image latent to a ComfyUI LATENT dict.
+
+    Z-Image latents are packed as [B, H_lat*W_lat, 64], token order
+    [pH, pW, C] (see `_unpack_zimage_latents`). Unpack back to
+    [B, 16, H/8, W/8].
+    """
+    samples = _unpack_zimage_latents(latents, height, width)
+    out = dict(template)
+    out["samples"] = samples
+    return out
+
+
+def _unpack_zimage_latents(
+    latents: mx.array,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Unpack packed Z-Image latent [B, NH*NW, 64] -> [B, 16, H/8, W/8].
+
+    Inverse of `prepare_noise_from_latent_zimage`'s packing, matching
+    comfy/ldm/lumina/model.py::NextDiT.unpatchify exactly:
+    `x[i][begin:end].view(H//pH, W//pW, pH, pW, C).permute(4,0,2,1,3)
+    .flatten(3,4).flatten(1,2)` -- i.e. the packed per-token dim is
+    `[pH, pW, C]` (verified against the real comfy source), NOT FLUX's
+    `[C, pH, pW]` (`_unpack_flux_latents`). Also applies
+    `process_flux_latent_out` (same 0.3611/0.1159 constants as FLUX,
+    since Z-Image shares `latent_formats.Flux` unchanged for scale/shift
+    -- only the token axis order differs, not the VAE latent space).
+    """
+    from .native.config import process_flux_latent_out
+
+    latent_h = height // 8
+    latent_w = width // 8
+
+    # Reshape: [B, NH, NW, 64] -> [B, NH, NW, pH, pW, 16] -> [B, 16, NH, pH, NW, pW] -> [B, 16, NH*2, NW*2]
+    unpacked = mx.reshape(latents, (1, latent_h // 2, latent_w // 2, 2, 2, 16))
+    unpacked = mx.transpose(unpacked, (0, 5, 1, 3, 2, 4))
     unpacked = mx.reshape(unpacked, (1, 16, latent_h // 2 * 2, latent_w // 2 * 2))
     unpacked = process_flux_latent_out(unpacked.astype(mx.float32))
     mx.eval(unpacked)
@@ -450,6 +502,62 @@ def prepare_noise_from_latent(
     batch, channels, latent_h, latent_w = noise_np.shape
     packed = noise_np.reshape(batch, channels, latent_h // 2, 2, latent_w // 2, 2)
     packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+    packed = packed.reshape(batch, (latent_h // 2) * (latent_w // 2), channels * 4)
+
+    noise_mlx = mx.array(packed).astype(precision)
+    mx.eval(noise_mlx)
+
+    output_shape = (int(samples.shape[-2]), int(samples.shape[-1]))
+    return noise_mlx, height, width, output_shape
+
+
+def prepare_noise_from_latent_zimage(
+    latent: dict[str, Any],
+    seed: int,
+    precision: mx.Dtype,
+) -> tuple[mx.array, int, int, tuple[int, int]]:
+    """Prepare initial noise from a Comfy latent for Z-Image, packed MLX.
+
+    Same 16ch/patch=2/8x VAE latent space as FLUX (`latent_formats.Flux`,
+    verified against the real comfy source), but a DIFFERENT per-token
+    patch-channel order: comfy/ldm/lumina/model.py's own patchify
+    (`embed_all`: `.permute(0,2,4,3,5,1).flatten(3)` on
+    `[B,C,H/pH,pH,W/pW,pW]`) packs each token as `[pH, pW, C]`, whereas
+    FLUX's `rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)")`
+    (comfy/ldm/flux/model.py:319) packs as `[C, pH, pW]` -- a different
+    axis order, despite the identical channel count/scale/shift. Reusing
+    `prepare_noise_from_latent` (FLUX's `[C,pH,pW]` order) here silently
+    scrambled every 2x2 patch's channel-vs-position mapping, producing a
+    visibly grainy/pixelated image even though the model ran NaN-free.
+    """
+    if "samples" not in latent:
+        raise RuntimeError("ASDX: latent must be a Comfy LATENT with 'samples'.")
+
+    samples = latent["samples"]
+    if tuple(samples.shape)[1] != FLUX_LATENT_CHANNELS:
+        raise RuntimeError(
+            f"ASDX: needs 16-channel Z-Image latent, got {tuple(samples.shape)}"
+        )
+
+    import comfy.sample
+    batch_inds = latent.get("batch_index") if "batch_index" in latent else None
+    noise = comfy.sample.prepare_noise(samples, int(seed), batch_inds)
+
+    noise_np = noise.detach().cpu().float().numpy().astype(np.float32, copy=False)
+
+    h, w = noise_np.shape[-2], noise_np.shape[-1]
+    if h % 2 != 0 or w % 2 != 0:
+        pad_h = h % 2
+        pad_w = w % 2
+        noise_np = np.pad(noise_np, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), mode="constant")
+
+    height = noise_np.shape[-2] * 8
+    width = noise_np.shape[-1] * 8
+
+    # Pack: [B, C, H, W] -> [B, H/2, W/2, pH*pW*C], token order [pH, pW, C]
+    batch, channels, latent_h, latent_w = noise_np.shape
+    packed = noise_np.reshape(batch, channels, latent_h // 2, 2, latent_w // 2, 2)
+    packed = np.transpose(packed, (0, 2, 4, 3, 5, 1))
     packed = packed.reshape(batch, (latent_h // 2) * (latent_w // 2), channels * 4)
 
     noise_mlx = mx.array(packed).astype(precision)

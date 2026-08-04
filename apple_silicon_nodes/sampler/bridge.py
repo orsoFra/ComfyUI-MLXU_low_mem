@@ -23,9 +23,11 @@ from ..bridge import (  # noqa: F401
     mlx_to_comfy_latent,
     mlx_to_comfy_latent_flux2,
     mlx_to_comfy_latent_sdxl,
+    mlx_to_comfy_latent_zimage,
     prepare_noise_from_latent,
     prepare_noise_from_latent_flux2,
     prepare_noise_from_latent_sdxl,
+    prepare_noise_from_latent_zimage,
     set_mlx_cache_limit_gb,
     tensor_to_mlx,
 )
