@@ -22,6 +22,57 @@ import torch
 _VAE_CACHE: dict[str, Any] = {}
 
 
+# ── VAE Loader ───────────────────────────────────────────────────────
+
+class ASDX_VAELoader:
+    """Load a standalone VAE checkpoint (e.g. ae.safetensors for FLUX.1,
+    the Flux2/Krea2/Z-Image VAE, or a plain SDXL VAE file).
+
+    Needed for any model loaded via ASDX_DiffusionLoader, which only
+    returns the diffusion transformer — no VAE is embedded in a
+    diffusion-only checkpoint. ASDX_CheckpointLoader already returns a
+    real VAE for full checkpoints and does not need this node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae_name": (cls._get_vae_names(),),
+            },
+        }
+
+    RETURN_TYPES = ("VAE",)
+    RETURN_NAMES = ("vae",)
+    FUNCTION = "load"
+    CATEGORY = "ASDX/Loaders"
+
+    @staticmethod
+    def _get_vae_names() -> list[str]:
+        try:
+            import folder_paths
+            return folder_paths.get_filename_list("vae")
+        except Exception:
+            return []
+
+    def load(self, vae_name: str) -> tuple[Any]:
+        if vae_name in _VAE_CACHE:
+            return (_VAE_CACHE[vae_name],)
+
+        import comfy.sd
+        import comfy.utils
+        import folder_paths
+
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        sd = comfy.utils.load_torch_file(vae_path)
+        vae = comfy.sd.VAE(sd=sd)
+        vae.throw_exception_if_invalid()
+
+        _VAE_CACHE[vae_name] = vae
+        print(f"[ASDX] VAE loaded: {vae_name}")
+        return (vae,)
+
+
 # ── VAE Decode ───────────────────────────────────────────────────────
 
 class ASDX_VAEDecode:
@@ -162,11 +213,13 @@ class ASDX_VAEEncode:
 
 
 NODE_CLASS_MAPPINGS = {
+    "ASDX_VAELoader": ASDX_VAELoader,
     "ASDX_VAEDecode": ASDX_VAEDecode,
     "ASDX_VAEEncode": ASDX_VAEEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "ASDX_VAELoader": "🍏 ASDX VAE Loader",
     "ASDX_VAEDecode": "🍏 ASDX VAE Decode (MLX)",
     "ASDX_VAEEncode": "🍏 ASDX VAE Encode (MLX)",
 }
