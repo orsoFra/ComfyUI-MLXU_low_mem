@@ -791,6 +791,18 @@ class EmbedND(nn.Module):
 
 # ── load_krea2_transformer ─────────────────────────────────────────────
 
+def _read_safetensors_dtypes(path) -> dict[str, str]:
+    """Read a safetensors file's per-tensor dtype strings straight from its
+    JSON header, without loading any tensor data."""
+    import json
+    import struct
+
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    return {k: v["dtype"] for k, v in header.items() if k != "__metadata__"}
+
+
 def load_krea2_transformer(
     path,
     dtype: str = "float16",
@@ -811,10 +823,29 @@ def load_krea2_transformer(
     # Load state dict
     state_dict = _load_safetensors(path)
 
+    # Which checkpoint tensors were stored as F32 (vs BF16), by their RAW
+    # on-disk key, read straight from the safetensors header (no data load).
+    # The real checkpoint stores the 15 boundary/non-repeated tensors --
+    # first, last.linear, tmlp, tproj, txtmlp, txtfusion.projector -- in F32
+    # and every repeated-per-block tensor in BF16. `_load_safetensors`
+    # upcasts BF16 to float32 too (numpy has no bf16), so by the time we get
+    # here EVERY value is an MLX float32 array regardless of its checkpoint
+    # dtype -- without this, the loop below would blanket-downcast the
+    # checkpoint's own deliberately-higher-precision boundary tensors to
+    # config.mlx_dtype along with everything else, discarding exactly the
+    # extra precision the checkpoint author chose for the layers that
+    # directly shape the image patch grid (first/last.linear) and the
+    # timestep/text conditioning signal (tmlp/tproj/txtmlp) that modulates
+    # every block. Run the SAME raw-key transform (normalize + map) over
+    # this dtype dict so its keys line up with state_dict's final keys.
+    raw_dtypes = _read_safetensors_dtypes(path)
+    raw_f32_only = {k: v for k, v in raw_dtypes.items() if v == "F32"}
+
     # Normalize and map keys
     from .weight_map import normalize_krea2_keys, map_krea2_to_native
     state_dict = normalize_krea2_keys(state_dict)
     state_dict = map_krea2_to_native(state_dict)
+    f32_keys = set(map_krea2_to_native(normalize_krea2_keys(raw_f32_only)).keys())
 
     # Create config and model
     from .config import Krea2Config
@@ -832,7 +863,11 @@ def load_krea2_transformer(
     matched = 0
     for flat_key, value in model_flat:
         if flat_key in state_dict:
-            new_flat.append((flat_key, state_dict[flat_key].astype(config.mlx_dtype)))
+            # Keep the checkpoint's own F32 boundary tensors at full
+            # precision instead of blanket-downcasting to config.mlx_dtype
+            # (see f32_keys comment above).
+            target_dtype = mx.float32 if flat_key in f32_keys else config.mlx_dtype
+            new_flat.append((flat_key, state_dict[flat_key].astype(target_dtype)))
             matched += 1
         else:
             # mx.random-initialized params (nn.Linear's default bias is a
