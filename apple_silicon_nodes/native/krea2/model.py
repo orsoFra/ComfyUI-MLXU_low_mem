@@ -358,23 +358,6 @@ _KREA2T_GLOBAL_MULTIPLIER = 15.0
 _KREA2T_TOKEN_REL_CAP = 0.75
 
 
-def _krea2t_run_txtfusion_parts(
-    txtfusion: "TextFusionTransformer", x: mx.array
-) -> mx.array:
-    """Mirrors `TextFusionTransformer.__call__` exactly (layerwise_blocks ->
-    projector -> refiner_blocks), factored out so the enhancer can run it
-    twice (once plain, once on amplified input) before blending."""
-    B, seq, txtlayers, txtdim = x.shape
-    y = x.reshape(B * seq, txtlayers, txtdim)
-    for block in txtfusion.layerwise_blocks:
-        y = block(y)
-    y = y.reshape(B, seq, txtlayers, txtdim).transpose(0, 1, 3, 2)
-    out = txtfusion.projector(y).squeeze(-1)
-    for block in txtfusion.refiner_blocks:
-        out = block(out)
-    return out
-
-
 def krea2t_enhance_conditioning(
     txtfusion: "TextFusionTransformer",
     x: mx.array,
@@ -392,6 +375,10 @@ def krea2t_enhance_conditioning(
         Fused text embeddings [B, seq, txtdim], same shape as
         `txtfusion(x)`.
     """
+    # Only strength<=1.0 has been verified NaN/overflow-safe against the
+    # real reference node (see the ComfyUI widget's tooltip) -- clamp here
+    # so every caller inherits the guarantee, not just the current widget.
+    strength = max(0.0, min(strength, 1.0))
     if (
         strength == 0.0
         or x.shape[2] != txtfusion.num_txt_layers
@@ -400,7 +387,7 @@ def krea2t_enhance_conditioning(
         return txtfusion(x)
 
     B, seq, taps, dim = x.shape
-    reference_out = _krea2t_run_txtfusion_parts(txtfusion, x)
+    reference_out = txtfusion(x)
 
     profile = mx.array(_KREA2T_CHUNK_PROFILE, dtype=mx.float32)
     gains = (1.0 + strength * (profile - 1.0)).astype(x.dtype)
@@ -410,7 +397,7 @@ def krea2t_enhance_conditioning(
         * gains.reshape(1, 1, _KREA2T_CHUNK_COUNT, 1)
         * global_multiplier
     ).reshape(B, seq, taps, dim)
-    candidate_out = _krea2t_run_txtfusion_parts(txtfusion, scaled_x)
+    candidate_out = txtfusion(scaled_x)
 
     post_delta = candidate_out.astype(mx.float32) - reference_out.astype(mx.float32)
     token_base_rms = mx.sqrt(mx.mean(reference_out.astype(mx.float32) ** 2, axis=-1, keepdims=True))

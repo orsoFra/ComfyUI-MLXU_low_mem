@@ -77,12 +77,14 @@ class ASDX_MLXSampler:
                 "ref_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01,
                                           "tooltip": "reference-fidelity dial: multiplies target->source attention. "
                                                      "1.0 = off, >1 pulls harder toward the source's appearance."}),
-                "krea2_enhancer_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                "krea2_enhancer_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                                           "tooltip": "Krea2-only: community txtfusion conditioning-strength "
                                                      "boost (ported from ComfyUI-Krea2T-Enhancer). 0 = off "
                                                      "(vanilla Krea2, weaker prompt adherence and lower final "
                                                      "latent amplitude); 1.0 matches the reference node's "
-                                                     "default. No effect on non-Krea2 models."}),
+                                                     "default (max -- only strength=1.0 has been verified "
+                                                     "NaN/overflow-safe against the real node). No effect on "
+                                                     "non-Krea2 models."}),
                 # Legacy
                 "lora_schedule": ("ASDX_LORA_SCHEDULE", {"default": None}),
             },

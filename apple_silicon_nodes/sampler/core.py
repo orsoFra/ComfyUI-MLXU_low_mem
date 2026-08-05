@@ -571,9 +571,9 @@ class _SamplerCore:
         `process_flux_latent_out` (the FLUX/Z-Image scale+shift) internally
         -- do not additionally call `comfy.latent_formats.Flux().process_out`
         here, or the conversion is applied twice. Krea2 uses its own
-        `_unpack_krea2_latents`, which applies NO scale/shift at all
-        (`latent_formats.Wan21` has `scale_factor=1.0`, unlike FLUX/Z-Image's
-        shared `latent_formats.Flux`).
+        `_unpack_krea2_latents`, which applies `process_wan21_latent_out`
+        (Wan21's real per-channel de-whitening -- mean/std, not a plain
+        scale_factor) internally for the same reason -- do not reapply it.
         """
         try:
             if model_type in ("zimage", "zimage_turbo"):
