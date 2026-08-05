@@ -420,8 +420,14 @@ def generate_sigmas(
         return [1.0 - i / steps for i in range(steps + 1)]
 
     if model_type in ("krea2", "krea2_turbo"):
-        # Flow matching: linear schedule from 1.0 to 0.0
-        return [1.0 - i / steps for i in range(steps + 1)]
+        # Flow matching with a FIXED shift (not resolution-dependent like
+        # FLUX-dev's mu) — comfy/supported_models.py::Krea2.sampling_settings
+        # = {"multiplier": 1.0, "shift": 1.15}, confirmed by reading the real
+        # source rather than assuming a plain linear (shift=1.0) schedule.
+        shift = 1.15
+        sigmas = [time_snr_shift(shift, 1.0 - i / steps) for i in range(steps)]
+        sigmas.append(0.0)
+        return sigmas
 
     if model_type in ("zimage", "zimage_turbo"):
         # Flow matching with a FIXED shift (not resolution-dependent like
