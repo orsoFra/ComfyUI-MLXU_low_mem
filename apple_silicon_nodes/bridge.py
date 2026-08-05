@@ -292,6 +292,55 @@ def _unpack_zimage_latents(
     return torch.from_numpy(np.array(unpacked, dtype=np.float32))
 
 
+def mlx_to_comfy_latent_krea2(
+    latents: mx.array,
+    height: int,
+    width: int,
+    template: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert MLX Krea2 latent to a ComfyUI LATENT dict.
+
+    Krea2 latents are packed as [B, H_lat*W_lat, 64], token order [C, pH, pW]
+    -- confirmed identical to FLUX by reading `comfy/ldm/krea2/model.py::
+    process_img` (`rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)")`,
+    the exact same call FLUX's own patchify uses). Unlike FLUX, no
+    scale/shift is applied here (see `_unpack_krea2_latents`).
+    """
+    samples = _unpack_krea2_latents(latents, height, width)
+    out = dict(template)
+    out["samples"] = samples
+    return out
+
+
+def _unpack_krea2_latents(
+    latents: mx.array,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Unpack packed Krea2 latent [B, NH*NW, 64] -> [B, 16, H/8, W/8].
+
+    Same `[C, pH, pW]` per-token axis order as FLUX (verified above), so the
+    reshape/transpose below is identical to `_unpack_flux_latents`. The
+    difference is scale/shift: `comfy.supported_models.Krea2.latent_format`
+    is `latent_formats.Wan21` (`scale_factor=1.0`, no shift override -- the
+    Wan21 class does not define `__init__`/`process_in`/`process_out`, so it
+    inherits `LatentFormat`'s identity-scale defaults), NOT FLUX's
+    `latent_formats.Flux` (0.3611 scale / 0.1159 shift). Applying
+    `process_flux_latent_out` here would silently rescale every value into
+    the wrong range before VAE decode.
+    """
+    latent_h = height // 8
+    latent_w = width // 8
+
+    unpacked = mx.reshape(latents, (1, latent_h // 2, latent_w // 2, 16, 2, 2))
+    unpacked = mx.transpose(unpacked, (0, 3, 1, 4, 2, 5))
+    unpacked = mx.reshape(unpacked, (1, 16, latent_h // 2 * 2, latent_w // 2 * 2))
+    unpacked = unpacked.astype(mx.float32)
+    mx.eval(unpacked)
+
+    return torch.from_numpy(np.array(unpacked, dtype=np.float32))
+
+
 def conditioning_zimage_to_mlx(
     conditioning: Any,
     precision: mx.Dtype,

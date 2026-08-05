@@ -22,6 +22,7 @@ from ..bridge import (  # noqa: F401
     mlx_to_comfy_image,
     mlx_to_comfy_latent,
     mlx_to_comfy_latent_flux2,
+    mlx_to_comfy_latent_krea2,
     mlx_to_comfy_latent_sdxl,
     mlx_to_comfy_latent_zimage,
     prepare_noise_from_latent,

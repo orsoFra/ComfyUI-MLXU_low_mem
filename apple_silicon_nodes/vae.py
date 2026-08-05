@@ -144,8 +144,23 @@ class ASDX_VAEDecode:
 
         `latent` here is already the unwrapped tensor (`decode()` extracts
         `samples["samples"]` before calling this) — do not index it again.
+
+        Some VAEs (e.g. Krea2's, which is architecturally a Wan 2.1 video
+        VAE — `comfy.supported_models.Krea2.latent_format = latent_formats.
+        Wan21`, confirmed against the real comfy source) declare
+        `vae.latent_dim == 3` and require a 5D `[B,C,T,H,W]` tensor; comfy's
+        own `VAE.decode()` only auto-squeezes 5D->4D for `latent_dim==2`
+        VAEs, never the reverse (`comfy/sd.py` `VAE.decode`). Our own latent
+        dicts are always plain 4D `[B,C,H,W]` (single image, no temporal
+        axis), so add a size-1 temporal axis here for these VAEs and remove
+        it again from the decoded image, mirroring stock `nodes.py::
+        VAEDecode.decode()`'s own `if len(images.shape) == 5: reshape(...)`.
         """
+        if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 4:
+            latent = latent.unsqueeze(2)
         image = vae.decode(latent)
+        if image.dim() == 5:
+            image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
         return (image,)
 
 

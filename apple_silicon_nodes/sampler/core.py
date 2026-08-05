@@ -568,11 +568,16 @@ class _SamplerCore:
         `_unpack_flux_latents`/`_unpack_zimage_latents` already apply
         `process_flux_latent_out` (the FLUX/Z-Image scale+shift) internally
         -- do not additionally call `comfy.latent_formats.Flux().process_out`
-        here, or the conversion is applied twice.
+        here, or the conversion is applied twice. Krea2 uses its own
+        `_unpack_krea2_latents`, which applies NO scale/shift at all
+        (`latent_formats.Wan21` has `scale_factor=1.0`, unlike FLUX/Z-Image's
+        shared `latent_formats.Flux`).
         """
         try:
             if model_type in ("zimage", "zimage_turbo"):
                 samples = bridge._unpack_zimage_latents(noise, height, width)
+            elif model_type in ("krea2", "krea2_turbo"):
+                samples = bridge._unpack_krea2_latents(noise, height, width)
             else:
                 samples = bridge._unpack_flux_latents(noise, height, width)
             if torch.backends.mps.is_available():
@@ -1034,7 +1039,8 @@ class _SamplerCore:
             # Preview
             if self.preview and self.previewer is not None:
                 preview_latent = self._denoise_to_latent(
-                    self.noise, self.height, self.width, self.output_shape
+                    self.noise, self.height, self.width, self.output_shape,
+                    model_type=model_type,
                 )
                 if preview_latent is not None:
                     preview_bytes = self.previewer.decode_latent_to_preview_image(
@@ -1063,8 +1069,11 @@ class _SamplerCore:
             mx.clear_cache()
             print("[ASDX] Low memory: transformer cleared after denoising")
 
-        # Convert result to ComfyUI latent
-        out_latent = bridge.mlx_to_comfy_latent(
+        # Convert result to ComfyUI latent. Krea2's own `latent_formats.Wan21`
+        # (scale_factor=1.0, no shift) is NOT FLUX's latent space (0.3611/
+        # 0.1159) despite sharing the same [C,pH,pW] patch order -- see
+        # `bridge._unpack_krea2_latents`.
+        out_latent = bridge.mlx_to_comfy_latent_krea2(
             self.noise, self.height, self.width, {"samples": self.noise}
         )
         out_latent["sdmlx_model_type"] = model_type
