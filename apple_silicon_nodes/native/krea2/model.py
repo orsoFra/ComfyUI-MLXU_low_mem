@@ -498,9 +498,20 @@ class SingleStreamDiT(nn.Module):
             (t_embed, tvec): t_embed is [B, hidden_dim], tvec is [B, 6*hidden_dim].
         """
         # Standard sinusoidal timestep embedding (time_factor=1000, matching
-        # comfy.ldm.flux.layers.timestep_embedding used by the Krea2 reference)
+        # comfy.ldm.flux.layers.timestep_embedding used by the Krea2 reference).
+        # NOTE: divide by half_dim, NOT half_dim-1 -- comfy's own formula is
+        # `exp(-log(max_period) * arange(half) / half)`. The previous
+        # `half_dim - 1` denominator here was an off-by-one that desynced the
+        # frequency spectrum from the reference (up to ~1.92 absolute error
+        # in the [-1,1]-bounded 256-dim embedding), corrupting the timestep
+        # signal feeding every block's modulation at every denoising step --
+        # the actual cause of the "piquetée"/speckled output, confirmed via
+        # a comfy-reference-diff audit after RoPE, GQA, modulation broadcast,
+        # bias handling, patch pack/unpack, text fusion, and the weight_map
+        # key mapping were all individually verified correct against the
+        # real checkpoint and comfy/ldm/krea2/model.py.
         half_dim = self.config.time_dim // 2
-        emb_math = mx.log(mx.array(10000.0, dtype=mx.float32)) / (half_dim - 1)
+        emb_math = mx.log(mx.array(10000.0, dtype=mx.float32)) / half_dim
         freqs = mx.exp(mx.arange(half_dim, dtype=mx.float32) * -emb_math)
         emb = (1000.0 * t)[:, None].astype(mx.float32) * freqs[None, :]
         emb = mx.concatenate([mx.cos(emb), mx.sin(emb)], axis=-1)  # [B, 256]
