@@ -68,13 +68,20 @@ def conditioning_krea2_to_mlx(
     """
     guidance = None
 
+    # Same fix as bridge.py::conditioning_to_mlx (the FLUX.1 KeyError: 0 bug):
+    # unwrap ASDX_CLIPTextEncode's wrapper dict on the presence of the
+    # "conditioning" key itself, not gated on "type" == "krea2" -- the
+    # SD-style path (t5xxl left blank) tags it "type": "clip" instead, and
+    # gating the unwrap on "krea2" left the wrapper dict un-unwrapped,
+    # indexed like a list below (KeyError: 0, dict has no int key 0).
     if isinstance(conditioning, dict):
-        if conditioning.get("type") == "krea2":
+        if "guidance" in conditioning:
             try:
                 guidance = float(conditioning["guidance"]) if conditioning.get("guidance") is not None else None
             except Exception:
                 guidance = None
-            conditioning = conditioning.get("conditioning", conditioning)
+        if "conditioning" in conditioning:
+            conditioning = conditioning["conditioning"]
 
         if "cond" in conditioning:
             cond = conditioning.get("cond")
