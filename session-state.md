@@ -40,6 +40,70 @@ metadata:
 
 ---
 
+## Session 4 — Krea2 "piqueté" investigation and fix
+
+**Date:** 2026-08-05
+
+### What was done
+
+#### Le bug : texture en croisillon ("piqueté") sur toutes les générations Krea2
+Investigation très longue et méthodique d'un défaut visuel systématique (motif fin en
+damier) sur les images Krea2 générées par ASDX, absent des générations produites par un
+workflow ComfyUI natif de référence utilisant le même checkpoint/prompt/seed.
+
+**Pistes explorées et corrigées en chemin (réelles, mais pas la cause principale) :**
+- Précision Metal du GPU sur les matmuls d'attention (routées vers le stream CPU de MLX)
+- Préservation de la précision F32 native du checkpoint pour les couches limites
+- Formule et grille de timesteps du schedule sigma (utilisait `time_snr_shift`, faux pour
+  Krea2 qui s'enregistre comme `ModelSamplingFlux` côté Comfy — corrigé vers
+  `flux_time_shift` + grille linéaire en espace timestep, vérifié bit-exact contre
+  `comfy.samplers.normal_scheduler`)
+- Port de l'enhancer communautaire `ComfyUI-Krea2T-Enhancer` (boost du conditioning texte)
+
+**Root cause réelle, trouvée via un audit multi-agents avec regard neuf** (comfy-reference-diff
++ weight-map-reviewer + 2 agents généralistes en parallèle) : `comfy.latent_formats.Wan21`
+(l'espace latent de Krea2) définit une vraie transformation affine par canal
+(`process_in`/`process_out`, 16 constantes moyenne/écart-type), qu'on croyait à tort être une
+identité (`scale_factor=1.0` n'annule qu'une partie de la formule). Cette transformation
+n'était jamais appliquée en sortie du sampler — d'où un latent final à ~moitié de l'amplitude
+réelle, ce qui déclenche l'artefact via le décodeur WanVAE (très sensible à l'amplitude
+d'entrée).
+
+**Vérification numérique** : après le fix, le ratio d'amplitude par canal (qui allait de
+1.10× à 3.16× hors cible) est tombé à 0.97-1.02× sur les 16 canaux, comparé à un latent de
+référence Comfy natif au même seed.
+
+#### Commits
+- `bcc1cf1` — "fix(krea2): apply Wan21's real per-channel latent de-whitening"
+- `520a8bd` — "chore(graphify): rebuild knowledge graph after Krea2 fixes"
+
+### Key decisions
+- L'enhancer Krea2T est gardé (paramètre `krea2_enhancer_strength`, défaut 1.0) car le
+  workflow de référence l'utilise réellement — mais ce n'est PAS le fix de l'amplitude,
+  juste une fonctionnalité légitime à part (effet mesuré ~2-4% sur la sortie finale).
+- Le rescale empirique temporaire (`krea2_output_rescale=1.95`) a été retiré, remplacé par
+  la vraie transformation par canal.
+- `native/krea2/config.py::KREA2_LATENT_SCALE/SHIFT` (mauvaises constantes FLUX, code mort)
+  supprimées.
+- Méthodologie validée : quand une investigation approfondie piétine malgré de multiples
+  vérifications individuelles cohérentes, un audit multi-agents en parallèle avec instruction
+  explicite de ne pas faire confiance aux conclusions précédentes permet de repérer une
+  hypothèse fondamentale erronée (ici : "Wan21 = identité") qui avait biaisé toute
+  l'investigation précédente.
+
+### Fichiers modifiés
+- `apple_silicon_nodes/native/config.py` — `WAN21_LATENTS_MEAN/STD`, `process_wan21_latent_in/out`
+- `apple_silicon_nodes/bridge.py` — application du de-whitening dans `_unpack_krea2_latents`
+- `apple_silicon_nodes/sampler/core.py` — whitening du latent source pour Identity Edit
+- `apple_silicon_nodes/native/krea2/model.py` — port de l'enhancer Krea2T
+- `apple_silicon_nodes/sampler/scheduling.py` — fix du schedule sigma Krea2
+- `apple_silicon_nodes/native/krea2/config.py`, `native/__init__.py`, `native/krea2/__init__.py` — nettoyage code mort
+
+### Fichiers générés
+- `graphify-out/` — graphe reconstruit (1109 nœuds, 1917 arêtes, 60 communautés)
+
+---
+
 ## Session 3 — Unified CLIP Text Encode
 
 **Date:** 2026-08-02 (continuation)
