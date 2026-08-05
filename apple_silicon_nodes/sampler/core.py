@@ -77,6 +77,7 @@ class _SamplerCore:
         # Krea2 Identity Edit
         source_latent: dict | None = None,
         ref_boost: float = 1.0,
+        krea2_enhancer_strength: float = 1.0,
         controlnet: dict | None = None,
     ):
         self.transformer = transformer
@@ -113,6 +114,7 @@ class _SamplerCore:
         # Krea2 Identity Edit
         self.source_latent = source_latent
         self.ref_boost = ref_boost
+        self.krea2_enhancer_strength = krea2_enhancer_strength
         self.controlnet = controlnet
 
     def run(self, steps: int, seed: int) -> dict:
@@ -833,6 +835,18 @@ class _SamplerCore:
                 else np.asarray(source_samples, dtype=np.float32)
             )
 
+            # Whiten into the model's internal Wan21 latent space -- matches
+            # comfy/model_base.py::Krea2.extra_conds's
+            # `latents.append(self.process_latent_in(lat))` for reference
+            # latents, and this project's own FLUX Kontext path
+            # (`_prepare_kontext_reference`), which applies
+            # `latent_formats.Flux().process_in(...)` for the same reason.
+            from ..native.config import process_wan21_latent_in
+            source_mlx = mx.array(source_np).astype(mx.float32)
+            source_mlx = process_wan21_latent_in(source_mlx)
+            mx.eval(source_mlx)
+            source_np = np.array(source_mlx, dtype=np.float32)
+
             # [B, C, H, W] -> pack to [B, NH*NW, 64]
             batch, channels, src_h, src_w = source_np.shape
             packed = source_np.reshape(
@@ -986,6 +1000,7 @@ class _SamplerCore:
                     src=src_tokens,
                     src_h=src_h,
                     src_w=src_w,
+                    enhancer_strength=self.krea2_enhancer_strength,
                 )
                 mx.eval(current_output)
 
@@ -1015,6 +1030,7 @@ class _SamplerCore:
                     src=src_tokens,
                     src_h=src_h,
                     src_w=src_w,
+                    enhancer_strength=self.krea2_enhancer_strength,
                 )
                 mx.eval(current_output)
                 noise_pred = current_output
@@ -1070,9 +1086,9 @@ class _SamplerCore:
             print("[ASDX] Low memory: transformer cleared after denoising")
 
         # Convert result to ComfyUI latent. Krea2's own `latent_formats.Wan21`
-        # (scale_factor=1.0, no shift) is NOT FLUX's latent space (0.3611/
-        # 0.1159) despite sharing the same [C,pH,pW] patch order -- see
-        # `bridge._unpack_krea2_latents`.
+        # applies a real per-channel affine de-whitening in `_unpack_krea2_
+        # latents` (see that function's docstring) -- NOT FLUX's scalar
+        # scale/shift, despite sharing the same [C,pH,pW] patch order.
         out_latent = bridge.mlx_to_comfy_latent_krea2(
             self.noise, self.height, self.width, {"samples": self.noise}
         )

@@ -91,35 +91,9 @@ class Krea2Config:
         self.validate()
 
 
-# ── Krea2 latent space constants ────────────────────────────────────────
-# FLUX-compatible VAE: same scale/shift as FLUX.1
-
-KREA2_LATENT_SCALE: float = 0.3611
-"""Scale factor for Krea2 latent space transformation (same as FLUX)."""
-
-KREA2_LATENT_SHIFT: float = 0.1159
-"""Shift factor for Krea2 latent space transformation (same as FLUX)."""
-
-
-def process_krea2_latent_in(latent: Any) -> Any:
-    """Process latent for model input: (latent - shift) * scale.
-
-    Args:
-        latent: Input latent tensor (any array-like).
-
-    Returns:
-        Processed latent tensor.
-    """
-    return (latent - KREA2_LATENT_SHIFT) * KREA2_LATENT_SCALE
-
-
-def process_krea2_latent_out(latent: Any) -> Any:
-    """Process latent for model output: latent / scale + shift.
-
-    Args:
-        latent: Output latent tensor (any array-like).
-
-    Returns:
-        Reconstructed latent tensor.
-    """
-    return (latent / KREA2_LATENT_SCALE) + KREA2_LATENT_SHIFT
+# Krea2's real latent space is `comfy.latent_formats.Wan21` (a per-channel
+# affine transform, 16 mean/std constants) -- NOT FLUX's scalar scale/shift.
+# See native/config.py::WAN21_LATENTS_MEAN/STD and process_wan21_latent_in/
+# out, applied in bridge.py::_unpack_krea2_latents and sampler/core.py's
+# Identity Edit source-latent prep. (A previous FLUX-scale/shift constant
+# pair lived here under these names -- wrong for Krea2 and unused; removed.)

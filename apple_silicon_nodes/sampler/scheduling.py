@@ -378,6 +378,28 @@ def time_snr_shift(shift: float, t: float) -> float:
     return shift * t / (1.0 + (shift - 1.0) * t)
 
 
+def _flux_fixed_shift_sigmas(shift: float, steps: int) -> list[float]:
+    """Sigma schedule for a `ModelSamplingFlux`-backed model with a fixed
+    (non-resolution-dependent) shift -- matches `comfy.samplers.
+    normal_scheduler` run on a real `ModelSamplingFlux` instance exactly.
+
+    `ModelSamplingFlux.timestep()` is the identity function, so the
+    timestep grid is `linspace(1.0, sigma_min, steps)` (uniform in
+    TIMESTEP space, not in sigma or in a plain `1 - i/steps` grid), where
+    `sigma_min` is the model's precomputed near-zero floor
+    (`flux_time_shift(shift, 1.0, 1/10000)`). Each grid point is then
+    mapped through `flux_time_shift`, and an explicit 0.0 is appended.
+    """
+    sigma_min = flux_time_shift(shift, 1.0, 1.0 / 10000.0)
+    if steps > 1:
+        timesteps = [1.0 + (sigma_min - 1.0) * i / (steps - 1) for i in range(steps)]
+    else:
+        timesteps = [1.0]
+    sigmas = [flux_time_shift(shift, 1.0, t) for t in timesteps]
+    sigmas.append(0.0)
+    return sigmas
+
+
 def flux_resolution_shift(width: int, height: int,
                            max_shift: float = 1.15, base_shift: float = 0.5) -> float:
     """Resolution-dependent shift (mu), matching ComfyUI's ModelSamplingFlux node.
@@ -420,13 +442,29 @@ def generate_sigmas(
         return [1.0 - i / steps for i in range(steps + 1)]
 
     if model_type in ("krea2", "krea2_turbo"):
-        # Flow matching with a FIXED shift (not resolution-dependent like
-        # FLUX-dev's mu) — comfy/supported_models.py::Krea2.sampling_settings
-        # = {"multiplier": 1.0, "shift": 1.15}, confirmed by reading the real
-        # source rather than assuming a plain linear (shift=1.0) schedule.
+        # Krea2 registers as `model_type=ModelType.FLUX` (comfy/model_base.py
+        # ::Krea2.__init__ default), which comfy's model_sampling() factory
+        # (comfy/model_base.py:127) maps to `ModelSamplingFlux` -- NOT
+        # `ModelSamplingDiscreteFlow`. ModelSamplingFlux.sigma() calls
+        # `flux_time_shift(shift, 1.0, t)` (the SAME formula FLUX.1-dev uses,
+        # just with a fixed shift=1.15 instead of a resolution-dependent mu),
+        # not `time_snr_shift` -- confirmed by reading comfy/model_sampling.py
+        # directly and executing both formulas: they diverge sharply away
+        # from the t=0/t=1 endpoints (e.g. t=0.5, shift=1.15: flux_time_shift
+        # =0.760 vs time_snr_shift=0.535). Using time_snr_shift here was a
+        # real, previously-uncaught bug.
+        #
+        # ModelSamplingFlux.timestep() is also the IDENTITY function, so
+        # comfy's `normal_scheduler` (comfy/samplers.py:671) builds its
+        # timestep grid via `linspace(1.0, sigma_min, steps)` -- NOT the
+        # uniform `1 - i/steps` grid used elsewhere in this file -- where
+        # `sigma_min = flux_time_shift(shift, 1.0, 1/10000)` (the model's
+        # precomputed near-zero floor, ~0.000316 for shift=1.15), then maps
+        # each grid point through sigma() and appends an explicit 0.0.
+        # Verified end-to-end against `comfy.samplers.normal_scheduler` run
+        # on a real `ModelSamplingFlux` instance: exact match to 1e-6.
         shift = 1.15
-        sigmas = [time_snr_shift(shift, 1.0 - i / steps) for i in range(steps)]
-        sigmas.append(0.0)
+        sigmas = _flux_fixed_shift_sigmas(shift, steps)
         return sigmas
 
     if model_type in ("zimage", "zimage_turbo"):

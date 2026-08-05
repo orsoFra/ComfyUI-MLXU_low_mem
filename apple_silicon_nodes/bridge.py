@@ -303,8 +303,8 @@ def mlx_to_comfy_latent_krea2(
     Krea2 latents are packed as [B, H_lat*W_lat, 64], token order [C, pH, pW]
     -- confirmed identical to FLUX by reading `comfy/ldm/krea2/model.py::
     process_img` (`rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)")`,
-    the exact same call FLUX's own patchify uses). Unlike FLUX, no
-    scale/shift is applied here (see `_unpack_krea2_latents`).
+    the exact same call FLUX's own patchify uses). See `_unpack_krea2_latents`
+    for the Wan21 per-channel de-whitening applied here.
     """
     samples = _unpack_krea2_latents(latents, height, width)
     out = dict(template)
@@ -322,13 +322,18 @@ def _unpack_krea2_latents(
     Same `[C, pH, pW]` per-token axis order as FLUX (verified above), so the
     reshape/transpose below is identical to `_unpack_flux_latents`. The
     difference is scale/shift: `comfy.supported_models.Krea2.latent_format`
-    is `latent_formats.Wan21` (`scale_factor=1.0`, no shift override -- the
-    Wan21 class does not define `__init__`/`process_in`/`process_out`, so it
-    inherits `LatentFormat`'s identity-scale defaults), NOT FLUX's
-    `latent_formats.Flux` (0.3611 scale / 0.1159 shift). Applying
-    `process_flux_latent_out` here would silently rescale every value into
-    the wrong range before VAE decode.
+    is `latent_formats.Wan21`, which DOES define a real per-channel affine
+    `process_out` (`latent * latents_std + latents_mean`, 16 channel-specific
+    constants) despite `scale_factor=1.0` -- confirmed by reading comfy/
+    latent_formats.py::Wan21 directly, after a prior assumption that it was
+    an identity no-op turned out to be wrong (that assumption produced a
+    ~2x-undersized final latent relative to real ComfyUI, verified against
+    a same-seed reference run). `comfy/samplers.py`'s `CFGGuider.
+    inner_sample()` applies this unconditionally, once, after the whole
+    Euler loop -- see `native/config.py::process_wan21_latent_out`.
     """
+    from .native.config import process_wan21_latent_out
+
     latent_h = height // 8
     latent_w = width // 8
 
@@ -336,6 +341,7 @@ def _unpack_krea2_latents(
     unpacked = mx.transpose(unpacked, (0, 3, 1, 4, 2, 5))
     unpacked = mx.reshape(unpacked, (1, 16, latent_h // 2 * 2, latent_w // 2 * 2))
     unpacked = unpacked.astype(mx.float32)
+    unpacked = process_wan21_latent_out(unpacked)
     mx.eval(unpacked)
 
     return torch.from_numpy(np.array(unpacked, dtype=np.float32))

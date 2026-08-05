@@ -327,6 +327,103 @@ class TextFusionTransformer(nn.Module):
         return x
 
 
+# ── Krea2T conditioning enhancer (community prompt-adherence boost) ─────
+#
+# Ported from the third-party ComfyUI-Krea2T-Enhancer custom node, which
+# every real (working) Krea2 reference workflow tested against this session
+# runs alongside the base model -- confirmed by its author to apply to both
+# Krea2 Turbo and Krea2 Raw, not just Turbo. It is a genuine, faithfully-
+# ported feature (verified numerically against the real node's own debug
+# output: out_rel/clamp/global multiplier all matched closely) kept here to
+# match reference-pipeline behavior -- NOT a fix for the "piqueté"/low-
+# amplitude bug an earlier version of this comment blamed it for. That bug's
+# real cause was a missing Wan21 per-channel de-whitening transform at the
+# sampler's latent-space boundary (see bridge.py::_unpack_krea2_latents),
+# unrelated to conditioning strength; this enhancer's own measured effect on
+# final output amplitude is small (~2-4%).
+#
+# Algorithm: run txtfusion's (layerwise_blocks -> projector -> refiner_
+# blocks) pipeline twice on the SAME stacked Qwen3-VL taps -- once
+# unmodified ("reference"), once with specific tap-halves ("chunks")
+# artificially amplified ("candidate") -- then blend reference + a
+# per-token-RMS-clamped delta between the two, so the enhancement can only
+# shift each token's fused embedding by a bounded fraction (0.75) of its
+# own magnitude, never fully replacing the unmodified signal.
+
+_KREA2T_CHUNK_COUNT = 24
+_KREA2T_CHUNK_DIM = 1280
+_KREA2T_PROFILE_12 = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.5, 5.0, 1.1, 4.0, 1.0)
+_KREA2T_CHUNK_PROFILE = _KREA2T_PROFILE_12 + _KREA2T_PROFILE_12
+_KREA2T_GLOBAL_MULTIPLIER = 15.0
+_KREA2T_TOKEN_REL_CAP = 0.75
+
+
+def _krea2t_run_txtfusion_parts(
+    txtfusion: "TextFusionTransformer", x: mx.array
+) -> mx.array:
+    """Mirrors `TextFusionTransformer.__call__` exactly (layerwise_blocks ->
+    projector -> refiner_blocks), factored out so the enhancer can run it
+    twice (once plain, once on amplified input) before blending."""
+    B, seq, txtlayers, txtdim = x.shape
+    y = x.reshape(B * seq, txtlayers, txtdim)
+    for block in txtfusion.layerwise_blocks:
+        y = block(y)
+    y = y.reshape(B, seq, txtlayers, txtdim).transpose(0, 1, 3, 2)
+    out = txtfusion.projector(y).squeeze(-1)
+    for block in txtfusion.refiner_blocks:
+        out = block(out)
+    return out
+
+
+def krea2t_enhance_conditioning(
+    txtfusion: "TextFusionTransformer",
+    x: mx.array,
+    strength: float = 1.0,
+) -> mx.array:
+    """Apply the Krea2T prompt-adherence enhancer, then run txtfusion.
+
+    Args:
+        x: Stacked Qwen3-VL taps [B, seq, txtlayers, txtdim] -- the same
+           input `TextFusionTransformer.__call__` takes.
+        strength: 0.0 disables (falls back to plain `txtfusion(x)`); 1.0
+                  matches the reference node's default.
+
+    Returns:
+        Fused text embeddings [B, seq, txtdim], same shape as
+        `txtfusion(x)`.
+    """
+    if (
+        strength == 0.0
+        or x.shape[2] != txtfusion.num_txt_layers
+        or x.shape[3] != txtfusion.text_dim
+    ):
+        return txtfusion(x)
+
+    B, seq, taps, dim = x.shape
+    reference_out = _krea2t_run_txtfusion_parts(txtfusion, x)
+
+    profile = mx.array(_KREA2T_CHUNK_PROFILE, dtype=mx.float32)
+    gains = (1.0 + strength * (profile - 1.0)).astype(x.dtype)
+    global_multiplier = 1.0 + strength * (_KREA2T_GLOBAL_MULTIPLIER - 1.0)
+    scaled_x = (
+        x.reshape(B, seq, _KREA2T_CHUNK_COUNT, _KREA2T_CHUNK_DIM)
+        * gains.reshape(1, 1, _KREA2T_CHUNK_COUNT, 1)
+        * global_multiplier
+    ).reshape(B, seq, taps, dim)
+    candidate_out = _krea2t_run_txtfusion_parts(txtfusion, scaled_x)
+
+    post_delta = candidate_out.astype(mx.float32) - reference_out.astype(mx.float32)
+    token_base_rms = mx.sqrt(mx.mean(reference_out.astype(mx.float32) ** 2, axis=-1, keepdims=True))
+    token_base_rms = mx.maximum(token_base_rms, 1e-8)
+    token_delta_rms = mx.sqrt(mx.mean(post_delta ** 2, axis=-1, keepdims=True))
+    token_delta_rms = mx.maximum(token_delta_rms, 1e-8)
+    token_rel = token_delta_rms / token_base_rms
+    token_scale = mx.minimum(_KREA2T_TOKEN_REL_CAP / token_rel, 1.0)
+
+    out = reference_out.astype(mx.float32) + post_delta * token_scale
+    return out.astype(candidate_out.dtype)
+
+
 # ── SingleStreamBlock ───────────────────────────────────────────────────
 
 class SingleStreamBlock(nn.Module):
@@ -626,6 +723,7 @@ class SingleStreamDiT(nn.Module):
         src: mx.array | None = None,      # [B, N_src, latent_channels*patch²] source latent
         src_h: int | None = None,
         src_w: int | None = None,
+        enhancer_strength: float = 0.0,
     ) -> mx.array:
         """Forward pass through Krea2 transformer.
 
@@ -658,9 +756,12 @@ class SingleStreamDiT(nn.Module):
                 f"img token count ({img.shape[1]})"
             )
 
-        # Text processing: unpack → txtfusion → txtmlp
+        # Text processing: unpack → txtfusion (optionally Krea2T-enhanced) → txtmlp
         context = self.unpack_context(txt)
-        context = self.txtfusion(context)
+        if enhancer_strength != 0.0:
+            context = krea2t_enhance_conditioning(self.txtfusion, context, enhancer_strength)
+        else:
+            context = self.txtfusion(context)
         context = self.txtmlp(context)
         txt_len = context.shape[1]
 
