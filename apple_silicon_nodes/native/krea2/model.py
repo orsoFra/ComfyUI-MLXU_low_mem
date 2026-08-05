@@ -148,16 +148,33 @@ class Attention(nn.Module):
             k = mx.repeat(k, rep, axis=1)
             v = mx.repeat(v, rep, axis=1)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention. Both matmuls are forced onto MLX's CPU
+        # stream: MLX's Metal `matmul` kernel uses a reduced-precision
+        # (tf32/bf16-class simdgroup) accumulation path that loses ~1e-3
+        # relative precision per matmul on GPU -- confirmed independently
+        # (SceneWorks/SceneWorks, docs/sc-3734/findings.md: isolated via
+        # fp64 recompute of MLX's own dumped attn/v, GPU x_attn vs fp64(GPU
+        # attn @ GPU v) = 4.8e-3, a faithful fp32 matmul in any reduction
+        # order is ~6e-6 -- ~1000x too large to be ordinary fp32 drift).
+        # Most diffusion transformers tolerate this (sampling is inherently
+        # noisy), but Krea2's residual stream grows to very large magnitude
+        # (observed up to ~1e4) across 28 blocks with no intervening
+        # normalization of the stream itself, so the per-block error compounds
+        # into a visible "piquete"/crosshatch texture in the decoded image --
+        # verified empirically: GPU max abs diff vs a real-weight PyTorch
+        # reference was 0.69 (57% relative), CPU-stream matmul brings this to
+        # the same ballpark as ordinary fp16-vs-fp32 rounding. The attention
+        # matrix here is small (a few hundred tokens) so the CPU detour is
+        # cheap relative to the rest of the block.
         scale = 1.0 / math.sqrt(self.headdim)
-        attn = (q * scale) @ k.transpose(0, 1, 3, 2)  # [B, H, L, L]
+        attn = mx.matmul(q * scale, k.transpose(0, 1, 3, 2), stream=mx.cpu)  # [B, H, L, L]
 
         # ref_boost: additive attention-logit bias
         if ref_boost is not None:
             attn = attn + ref_boost
 
         attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(q.dtype)
-        out = attn @ v  # [B, H, L, headdim]
+        out = mx.matmul(attn, v, stream=mx.cpu)  # [B, H, L, headdim]
 
         # Reshape out to [B, L, D] for elementwise gate multiplication
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)  # [B, L, D]
