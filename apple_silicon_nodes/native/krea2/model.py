@@ -807,7 +807,16 @@ def load_krea2_transformer(
             new_flat.append((flat_key, state_dict[flat_key].astype(config.mlx_dtype)))
             matched += 1
         else:
-            new_flat.append((flat_key, value))
+            # mx.random-initialized params (nn.Linear's default bias is a
+            # non-zero uniform draw, not zero -- confirmed on this MLX
+            # version) must not leak into inference as leftover training
+            # noise when a checkpoint simply doesn't ship that tensor (e.g.
+            # a bias-free-trained Turbo variant, which has NO bias.* keys
+            # at all for any block -- verified against a real checkpoint
+            # that matched exactly 430/686, the missing 256 all being
+            # attn/mlp .bias tensors). Zero is the correct "this checkpoint
+            # has no such tensor" default for inference, not a random draw.
+            new_flat.append((flat_key, mx.zeros_like(value)))
     new_nested = tree_unflatten(new_flat)
     transformer.update(new_nested)
     mx.eval(transformer.parameters())
