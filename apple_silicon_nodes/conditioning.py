@@ -74,6 +74,14 @@ class ASDX_DualCLIPLoader:
         cache_key = f"{clip_name1}:{clip_name2}:{type}"
 
         if cache_key not in _CLIP_CACHE:
+            # Only one CLIP pair is meaningfully "current" at a time -- evict
+            # prior entries before loading a new one instead of accumulating
+            # every distinct clip_name/type combo used in the session (same
+            # fix already applied to loader.py's _MODEL_CACHE).
+            if _CLIP_CACHE:
+                _CLIP_CACHE.clear()
+                bridge.clear_mlx_cache()
+
             # Load the CLIP
             clip_path1 = self._find_file("text_encoders", clip_name1)
             clip_path2 = self._find_file("text_encoders", clip_name2)
@@ -286,6 +294,13 @@ class ASDX_CLIPLoader:
         cache_key = f"{clip_name}:{type}"
 
         if cache_key not in _CLIP_CACHE:
+            # See ASDX_DualCLIPLoader.load for why prior entries are evicted
+            # here (shared _CLIP_CACHE, same one-active-entry policy as
+            # loader.py's _MODEL_CACHE).
+            if _CLIP_CACHE:
+                _CLIP_CACHE.clear()
+                bridge.clear_mlx_cache()
+
             clip_path = self._find_file("text_encoders", clip_name)
             clip_type_enum = _clip_type_from_string(type)
 

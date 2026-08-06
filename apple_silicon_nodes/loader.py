@@ -32,6 +32,22 @@ _MODEL_CACHE: dict[str, dict[str, Any]] = {}
 _MODEL_EXTRA_KEYS: dict[str, str] = {}
 
 
+def clear_model_cache() -> None:
+    """Evict every cached diffusion model, freeing its memory.
+
+    `_MODEL_CACHE` holds at most one entry at a time by design (`load()`
+    below clears it before loading a different checkpoint/precision), so
+    there's nothing to key this by — callers that want the currently
+    resident model's memory back (e.g. the sampler's `low_memory_mode`)
+    just call this once the sampling run that needed it is done. The next
+    `ASDX_DiffusionLoader.load()` call will reload from disk instead of
+    hitting the cache.
+    """
+    if _MODEL_CACHE:
+        _MODEL_CACHE.clear()
+        bridge.clear_mlx_cache()
+
+
 def _build_cache_key(base_key: str, extra: dict[str, str] | None = None) -> str:
     """Build a composite cache key matching mflux-AnyModel pattern.
 

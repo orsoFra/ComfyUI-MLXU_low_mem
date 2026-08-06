@@ -85,6 +85,14 @@ class ASDX_LivePreview:
 
     def register(self, callback_type: str) -> tuple[dict]:
         """Register a preview callback."""
+        # Each run creates a brand-new closure, so the registry's own
+        # dedup check (`if callback not in cls._callbacks`) never catches
+        # it -- without this, every generation using this node permanently
+        # appends another callback that keeps firing (and doing real work,
+        # for "progress") on every future run's sampling steps. Only one
+        # active callback for this node is the intended behavior.
+        LivePreviewRegistry.clear()
+
         handle: dict[str, Any] = {"type": callback_type, "steps": 0}
 
         if callback_type == "log":

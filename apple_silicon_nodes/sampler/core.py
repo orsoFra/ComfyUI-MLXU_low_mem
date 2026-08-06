@@ -7,7 +7,6 @@ The ComfyUI node (sampler.py) wraps this to provide the node interface.
 from __future__ import annotations
 
 import enum
-import gc
 import math
 import time
 from typing import Any
@@ -284,7 +283,9 @@ class _SamplerCore:
             # Update LoRA schedule
             if self.lora_schedule is not None:
                 self.lora_schedule["step"] = t
-                self._update_lora_schedule(self.transformer, self.lora_schedule, t, steps)
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
 
             # ControlNet: recompute residuals each step (they depend on the
             # current noisy latent, unlike the frozen ControlNet weights).
@@ -391,15 +392,18 @@ class _SamplerCore:
 
         total_time = time.perf_counter() - t_sampling_start
 
-        # ── Low memory mode: clear transformer after denoising ──────
-        # Adapted from DiffusionKit's low_memory_mode pattern
+        # ── Low memory mode: evict the cached base model ─────────────
+        # self.transformer is the SAME object as loader.py's _MODEL_CACHE
+        # entry -- dropping only this local reference never freed anything
+        # (and _SamplerCore is local to sample() anyway, released on return
+        # regardless). Evict the cache entry itself so the memory is
+        # actually returned; the next generation will reload the checkpoint
+        # from disk instead of hitting the cache.
         if self.low_memory_mode:
-            # Clear transformer reference to allow GC
-            del self.transformer
+            from ..loader import clear_model_cache
+            clear_model_cache()
             self.transformer = None
-            gc.collect()
-            mx.clear_cache()
-            print("[ASDX] Low memory: transformer cleared after denoising")
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
 
         # Convert result to ComfyUI latent
         out_latent = bridge.mlx_to_comfy_latent(self.noise, self.height, self.width,
@@ -500,18 +504,27 @@ class _SamplerCore:
             print(f"[ASDX] Kontext reference prep failed: {e}")
 
     @staticmethod
-    def _update_lora_schedule(transformer: Any, schedule: dict, step: int, total_steps: int) -> None:
+    def _update_lora_schedule(
+        transformer: Any, config: Any, schedule: dict, step: int, total_steps: int
+    ) -> Any:
         """Recompute this step's LoRA strength from the schedule and re-apply it.
+
+        Returns the (possibly new) transformer — callers must reassign
+        `self.transformer` to the result.
 
         `schedule["lora"]` is the same LoRAAdapter set up by ASDX_LoraSchedule.
         Its deltas were already baked into the transformer once at
         `strength_start` when the node ran; here we UNDO that previous step's
         contribution and apply the new strength, so repeated calls don't
         compound (delta * scale_prev, then delta * scale_new, not additive).
+        `transformer` here is already a private, non-cached object (the node
+        graph's ASDX_LoraSchedule returns a fresh transformer, never the one
+        shared via loader.py's _MODEL_CACHE — see lora.py's
+        _apply_lora_to_transformer), so per-step reapplication is safe.
         """
         lora = schedule.get("lora")
         if lora is None:
-            return
+            return transformer
 
         strength_curve = schedule.get("strength_curve", "linear")
         start = schedule.get("strength_start", 1.0)
@@ -542,20 +555,22 @@ class _SamplerCore:
         else:
             strength = start
 
-        from ..lora import ASDX_LoraLoader
+        from ..lora import ASDX_LoraLoader, base_lora_scale
 
-        new_scale = lora.alpha / max(lora.rank, 1) * strength
+        new_scale = base_lora_scale(lora.alpha, lora.rank) * strength
         delta_scale = new_scale - lora.scale
         if delta_scale != 0:
             # Apply only the incremental change since the last step's scale,
             # so the cumulative effect matches `deltas * new_scale` without
             # first subtracting out the old contribution separately.
             lora.scale = delta_scale
-            ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora)
+            transformer = ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora, config)
             lora.scale = new_scale
 
         if step % 5 == 0:
             print(f"[ASDX] LoRA schedule: step {step}/{total_steps}, strength={strength:.3f}")
+
+        return transformer
 
     @staticmethod
     def _denoise_to_latent(
@@ -981,6 +996,14 @@ class _SamplerCore:
                 txt_len, src_h, src_w, img_h, img_w, self.ref_boost
             )
 
+        # Text conditioning (txtfusion + optional Krea2T enhancer) doesn't
+        # depend on the noisy image latent or timestep, so it's identical on
+        # every step -- precompute once instead of letting each predict()
+        # call recompute it (was costing up to ~12s/step, see
+        # SingleStreamDiT.encode_text's docstring).
+        context = self.transformer.encode_text(txt_fused, self.krea2_enhancer_strength)
+        mx.eval(context)
+
         for t in range(steps):
             step_start = time.perf_counter()
 
@@ -991,7 +1014,7 @@ class _SamplerCore:
             if teacache_state is not None:
                 current_output = self.transformer.predict(
                     img=self.noise,
-                    txt=txt_fused,
+                    context=context,
                     timestep=sigma_t,
                     img_h=img_h,
                     img_w=img_w,
@@ -1000,7 +1023,6 @@ class _SamplerCore:
                     src=src_tokens,
                     src_h=src_h,
                     src_w=src_w,
-                    enhancer_strength=self.krea2_enhancer_strength,
                 )
                 mx.eval(current_output)
 
@@ -1021,7 +1043,7 @@ class _SamplerCore:
             else:
                 current_output = self.transformer.predict(
                     img=self.noise,
-                    txt=txt_fused,
+                    context=context,
                     timestep=sigma_t,
                     img_h=img_h,
                     img_w=img_w,
@@ -1030,7 +1052,6 @@ class _SamplerCore:
                     src=src_tokens,
                     src_h=src_h,
                     src_w=src_w,
-                    enhancer_strength=self.krea2_enhancer_strength,
                 )
                 mx.eval(current_output)
                 noise_pred = current_output
@@ -1079,11 +1100,16 @@ class _SamplerCore:
 
         # ── Low memory mode ─────────────────────────────────────────
         if self.low_memory_mode:
-            del self.transformer
+            # self.transformer is the SAME object as loader.py's
+            # _MODEL_CACHE entry -- dropping only this local reference never
+            # freed anything (and _SamplerCore is local to sample() anyway,
+            # released on return regardless). Evict the cache entry itself
+            # so the memory is actually returned; the next generation will
+            # reload the checkpoint from disk instead of hitting the cache.
+            from ..loader import clear_model_cache
+            clear_model_cache()
             self.transformer = None
-            gc.collect()
-            mx.clear_cache()
-            print("[ASDX] Low memory: transformer cleared after denoising")
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
 
         # Convert result to ComfyUI latent. Krea2's own `latent_formats.Wan21`
         # applies a real per-channel affine de-whitening in `_unpack_krea2_
@@ -1191,11 +1217,16 @@ class _SamplerCore:
         total_time = time.perf_counter() - t_sampling_start
 
         if self.low_memory_mode:
-            del self.transformer
+            # self.transformer is the SAME object as loader.py's
+            # _MODEL_CACHE entry -- dropping only this local reference never
+            # freed anything (and _SamplerCore is local to sample() anyway,
+            # released on return regardless). Evict the cache entry itself
+            # so the memory is actually returned; the next generation will
+            # reload the checkpoint from disk instead of hitting the cache.
+            from ..loader import clear_model_cache
+            clear_model_cache()
             self.transformer = None
-            gc.collect()
-            mx.clear_cache()
-            print("[ASDX] Low memory: transformer cleared after denoising")
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
 
         out_latent = bridge.mlx_to_comfy_latent_sdxl(x, {"samples": x})
         out_latent["sdmlx_model_type"] = "sdxl"
@@ -1311,11 +1342,16 @@ class _SamplerCore:
         total_time = time.perf_counter() - t_sampling_start
 
         if self.low_memory_mode:
-            del self.transformer
+            # self.transformer is the SAME object as loader.py's
+            # _MODEL_CACHE entry -- dropping only this local reference never
+            # freed anything (and _SamplerCore is local to sample() anyway,
+            # released on return regardless). Evict the cache entry itself
+            # so the memory is actually returned; the next generation will
+            # reload the checkpoint from disk instead of hitting the cache.
+            from ..loader import clear_model_cache
+            clear_model_cache()
             self.transformer = None
-            gc.collect()
-            mx.clear_cache()
-            print("[ASDX] Low memory: transformer cleared after denoising")
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
 
         out_latent = bridge.mlx_to_comfy_latent_zimage(
             self.noise, self.height, self.width, {"samples": self.noise}
@@ -1456,11 +1492,16 @@ class _SamplerCore:
         total_time = time.perf_counter() - t_sampling_start
 
         if self.low_memory_mode:
-            del self.transformer
+            # self.transformer is the SAME object as loader.py's
+            # _MODEL_CACHE entry -- dropping only this local reference never
+            # freed anything (and _SamplerCore is local to sample() anyway,
+            # released on return regardless). Evict the cache entry itself
+            # so the memory is actually returned; the next generation will
+            # reload the checkpoint from disk instead of hitting the cache.
+            from ..loader import clear_model_cache
+            clear_model_cache()
             self.transformer = None
-            gc.collect()
-            mx.clear_cache()
-            print("[ASDX] Low memory: transformer cleared after denoising")
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
 
         out_latent = bridge.mlx_to_comfy_latent_flux2(
             self.noise, self.height, self.width, {"samples": self.noise}

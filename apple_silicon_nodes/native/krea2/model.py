@@ -105,11 +105,19 @@ class Attention(nn.Module):
       wo: Linear(dim, dim)                  # output projection
     """
 
-    def __init__(self, dim: int, heads: int, kvheads: int | None = None):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        kvheads: int | None = None,
+        cpu_attention: bool = True,
+    ):
         super().__init__()
         self.heads = heads
         self.kvheads = kvheads if kvheads is not None else heads
         self.headdim = dim // self.heads  # 6144 / 48 = 128
+        # See __call__ for why this is configurable per caller.
+        self.cpu_attention = cpu_attention
 
         self.wq = nn.Linear(dim, self.headdim * self.heads)
         self.wk = nn.Linear(dim, self.headdim * self.kvheads)
@@ -141,40 +149,53 @@ class Attention(nn.Module):
             q = apply_rope(q, freqs)
             k = apply_rope(k, freqs)
 
-        # GQA: repeat K/V heads to match Q heads
-        # After transpose (B, H, L, D), heads are on axis=1
-        if self.kvheads != self.heads:
-            rep = self.heads // self.kvheads
-            k = mx.repeat(k, rep, axis=1)
-            v = mx.repeat(v, rep, axis=1)
-
-        # Scaled dot-product attention. Both matmuls are forced onto MLX's CPU
-        # stream: MLX's Metal `matmul` kernel uses a reduced-precision
-        # (tf32/bf16-class simdgroup) accumulation path that loses ~1e-3
-        # relative precision per matmul on GPU -- confirmed independently
-        # (SceneWorks/SceneWorks, docs/sc-3734/findings.md: isolated via
-        # fp64 recompute of MLX's own dumped attn/v, GPU x_attn vs fp64(GPU
-        # attn @ GPU v) = 4.8e-3, a faithful fp32 matmul in any reduction
-        # order is ~6e-6 -- ~1000x too large to be ordinary fp32 drift).
-        # Most diffusion transformers tolerate this (sampling is inherently
-        # noisy), but Krea2's residual stream grows to very large magnitude
-        # (observed up to ~1e4) across 28 blocks with no intervening
-        # normalization of the stream itself, so the per-block error compounds
-        # into a visible "piquete"/crosshatch texture in the decoded image --
-        # verified empirically: GPU max abs diff vs a real-weight PyTorch
-        # reference was 0.69 (57% relative), CPU-stream matmul brings this to
-        # the same ballpark as ordinary fp16-vs-fp32 rounding. The attention
-        # matrix here is small (a few hundred tokens) so the CPU detour is
-        # cheap relative to the rest of the block.
         scale = 1.0 / math.sqrt(self.headdim)
-        attn = mx.matmul(q * scale, k.transpose(0, 1, 3, 2), stream=mx.cpu)  # [B, H, L, L]
 
-        # ref_boost: additive attention-logit bias
-        if ref_boost is not None:
-            attn = attn + ref_boost
-
-        attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(q.dtype)
-        out = mx.matmul(attn, v, stream=mx.cpu)  # [B, H, L, headdim]
+        if self.cpu_attention:
+            # Manual scaled dot-product attention, forced onto MLX's CPU
+            # stream: MLX's Metal `matmul` kernel uses a reduced-precision
+            # (tf32/bf16-class simdgroup) accumulation path that loses
+            # ~1e-3 relative precision per matmul on GPU -- confirmed
+            # independently (SceneWorks/SceneWorks, docs/sc-3734/findings.md:
+            # isolated via fp64 recompute of MLX's own dumped attn/v, GPU
+            # x_attn vs fp64(GPU attn @ GPU v) = 4.8e-3, a faithful fp32
+            # matmul in any reduction order is ~6e-6 -- ~1000x too large to
+            # be ordinary fp32 drift). Most diffusion transformers tolerate
+            # this (sampling is inherently noisy), but Krea2's residual
+            # stream grows to very large magnitude (observed up to ~1e4)
+            # across 28 blocks with no intervening normalization of the
+            # stream itself, so the per-block error compounds into a
+            # visible "piquete"/crosshatch texture in the decoded image.
+            #
+            # Only TextFusionBlock (a few hundred text tokens -- the CPU
+            # detour is cheap) opts into this path via `cpu_attention=True`.
+            # SingleStreamBlock (the full image sequence, thousands of
+            # tokens) uses the fused GPU kernel below instead -- forcing it
+            # onto CPU too made every step ~15x slower (measured: ~88s/step
+            # vs ~6s/step on the reference PyTorch/MPS pipeline) for a
+            # precision benefit that was NOT what fixed the "piquete" bug
+            # (the real cause was a missing Wan21 latent de-whitening step,
+            # see native/config.py::process_wan21_latent_out).
+            if self.kvheads != self.heads:
+                rep = self.heads // self.kvheads
+                k = mx.repeat(k, rep, axis=1)
+                v = mx.repeat(v, rep, axis=1)
+            attn = mx.matmul(q * scale, k.transpose(0, 1, 3, 2), stream=mx.cpu)  # [B, H, L, L]
+            if ref_boost is not None:
+                attn = attn + ref_boost
+            attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(q.dtype)
+            out = mx.matmul(attn, v, stream=mx.cpu)  # [B, H, L, headdim]
+        else:
+            # Fused Metal kernel: handles GQA natively (k/v kept at their
+            # own head count, no mx.repeat needed) and always accumulates
+            # softmax in float32 internally regardless of input dtype --
+            # every sibling MLX diffusion project checked (comfyui-mlx/
+            # DiffusionKit, mflux, SDMLX) uses this instead of a manual
+            # matmul->softmax->matmul, on the default GPU stream, with no
+            # CPU-stream precision workaround needed.
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=scale, mask=ref_boost
+            )  # [B, H, L, headdim]
 
         # Reshape out to [B, L, D] for elementwise gate multiplication
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)  # [B, L, D]
@@ -438,7 +459,11 @@ class SingleStreamBlock(nn.Module):
         self.mod = DoubleSharedModulation(features)
         self.prenorm = RMSNorm(features)
         self.postnorm = RMSNorm(features)
-        self.attn = Attention(features, heads, kvheads)
+        # cpu_attention=False: this block processes the full [text|source|
+        # target-image] sequence (thousands of tokens), unlike
+        # TextFusionBlock's short text-only sequence -- see Attention.__call__
+        # for why the CPU-stream precision fix doesn't scale to this size.
+        self.attn = Attention(features, heads, kvheads, cpu_attention=False)
         self.mlp = SwiGLU(features, multiplier)
 
     def __call__(
@@ -698,19 +723,39 @@ class SingleStreamDiT(nn.Module):
             )
         return context.reshape(B, seq, self.txtlayers, self.txtdim)
 
+    def encode_text(self, txt: mx.array, enhancer_strength: float = 0.0) -> mx.array:
+        """Text-conditioning pipeline: unpack → txtfusion (optionally
+        Krea2T-enhanced) → txtmlp.
+
+        Depends only on the prompt embedding and `enhancer_strength`, NOT on
+        the noisy image latent or timestep — identical on every denoising
+        step. Callers should compute this ONCE before the sampling loop and
+        pass the result to `__call__`/`predict` via `context=`, instead of
+        letting `__call__` recompute it (identically) every step: measured
+        cost was up to ~12s/step out of a Krea2 step's total budget when
+        recomputed inline (session log, 8-step run at seq_len=4444).
+        """
+        context = self.unpack_context(txt)
+        if enhancer_strength != 0.0:
+            context = krea2t_enhance_conditioning(self.txtfusion, context, enhancer_strength)
+        else:
+            context = self.txtfusion(context)
+        return self.txtmlp(context)
+
     def __call__(
         self,
         img: mx.array,       # [B, N_img, latent_channels*patch²] packed image patches
-        txt: mx.array,       # [B, seq, txtlayers*txtdim] fused text embeddings
-        t: mx.array,         # [B] timestep
-        img_h: int,
-        img_w: int,
+        txt: mx.array | None = None,  # [B, seq, txtlayers*txtdim] fused text embeddings
+        t: mx.array = None,  # [B] timestep
+        img_h: int = 0,
+        img_w: int = 0,
         freqs: mx.array | None = None,
         ref_boost: mx.array | None = None,
         src: mx.array | None = None,      # [B, N_src, latent_channels*patch²] source latent
         src_h: int | None = None,
         src_w: int | None = None,
         enhancer_strength: float = 0.0,
+        context: mx.array | None = None,
     ) -> mx.array:
         """Forward pass through Krea2 transformer.
 
@@ -721,7 +766,8 @@ class SingleStreamDiT(nn.Module):
 
         Args:
             img: Packed image latent [B, N_img, 64] (N_img = img_h * img_w).
-            txt: Fused text embeddings [B, seq, txtlayers*txtdim].
+            txt: Fused text embeddings [B, seq, txtlayers*txtdim]. Ignored if
+                 `context` is given (see `encode_text`).
             t: Timestep [B].
             img_h: Target image token grid height (in patches).
             img_w: Target image token grid width (in patches).
@@ -731,6 +777,10 @@ class SingleStreamDiT(nn.Module):
             src: Source latent for Identity Edit [B, N_src, 64] (N_src = src_h * src_w).
             src_h: Source token grid height (in patches). Required if src is given.
             src_w: Source token grid width (in patches). Required if src is given.
+            context: Pre-fused text embeddings from `encode_text(txt, ...)`.
+                     Pass this (computed once before the denoising loop) to
+                     skip the per-call text-processing pipeline entirely.
+                     Either `txt` or `context` must be given.
 
         Returns:
             Output tensor [B, N_img, latent_channels*patch²].
@@ -743,13 +793,14 @@ class SingleStreamDiT(nn.Module):
                 f"img token count ({img.shape[1]})"
             )
 
-        # Text processing: unpack → txtfusion (optionally Krea2T-enhanced) → txtmlp
-        context = self.unpack_context(txt)
-        if enhancer_strength != 0.0:
-            context = krea2t_enhance_conditioning(self.txtfusion, context, enhancer_strength)
-        else:
-            context = self.txtfusion(context)
-        context = self.txtmlp(context)
+        # Text processing: reuse a precomputed `context` if the caller hoisted
+        # it out of the denoising loop (see `encode_text`'s docstring);
+        # otherwise fall back to computing it here (e.g. single one-off calls
+        # outside a sampling loop, or callers that haven't been updated yet).
+        if context is None:
+            if txt is None:
+                raise ValueError("Krea2 __call__ requires either `txt` or `context`.")
+            context = self.encode_text(txt, enhancer_strength)
         txt_len = context.shape[1]
 
         # Source latent prepending for Identity Edit
@@ -792,10 +843,10 @@ class SingleStreamDiT(nn.Module):
     def predict(
         self,
         img: mx.array,
-        txt: mx.array,
-        timestep: float | mx.array,
-        img_h: int,
-        img_w: int,
+        txt: mx.array | None = None,
+        timestep: float | mx.array = 0.0,
+        img_h: int = 0,
+        img_w: int = 0,
         src: mx.array | None = None,
         src_h: int | None = None,
         src_w: int | None = None,
@@ -805,14 +856,16 @@ class SingleStreamDiT(nn.Module):
 
         Args:
             img: Packed image latent [B, N_img, 64].
-            txt: Fused text embeddings [B, seq, txtlayers*txtdim].
+            txt: Fused text embeddings [B, seq, txtlayers*txtdim]. Omit if
+                 passing a precomputed `context=` kwarg instead (see
+                 `encode_text`/`__call__`).
             timestep: Timestep value (float or [B] array).
             img_h: Target image token grid height (in patches).
             img_w: Target image token grid width (in patches).
             src: Source latent for Identity Edit [B, N_src, 64].
             src_h: Source token grid height (in patches). Required if src is given.
             src_w: Source token grid width (in patches). Required if src is given.
-            **kwargs: Additional kwargs passed to __call__ (rope, ref_boost, etc.)
+            **kwargs: Additional kwargs passed to __call__ (context, rope, ref_boost, etc.)
 
         Returns:
             Output tensor [B, N_img, 64].

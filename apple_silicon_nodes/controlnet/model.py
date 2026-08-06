@@ -182,6 +182,15 @@ def load_controlnet_union(path: str | Path, dtype: str = "float16") -> ControlNe
     if cache_key in _CONTROLNET_CACHE:
         return _CONTROLNET_CACHE[cache_key]
 
+    # Only one ControlNet is meaningfully "current" at a time -- evict prior
+    # entries before loading a new one instead of accumulating every
+    # distinct ControlNet checkpoint used in the session (same fix already
+    # applied to loader.py's _MODEL_CACHE).
+    if _CONTROLNET_CACHE:
+        from .. import bridge
+        _CONTROLNET_CACHE.clear()
+        bridge.clear_mlx_cache()
+
     from .. import native
     state = native._load_safetensors(path)
 

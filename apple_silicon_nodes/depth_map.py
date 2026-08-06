@@ -109,6 +109,17 @@ class ASDX_DepthMap:
         # Load model (cached)
         cache_key = f"depth_pro:{resolution}"
         if cache_key not in _DEPTH_CACHE:
+            # Only one depth model is meaningfully "current" at a time -- the
+            # `resolution` widget alone (256-2048, step 64) can produce up to
+            # 28 distinct keys, each holding a full DepthPro model on MPS.
+            # Evict prior entries before loading a new one instead of
+            # accumulating one per resolution ever used in the session (same
+            # fix already applied to loader.py's _MODEL_CACHE).
+            if _DEPTH_CACHE:
+                from . import bridge
+                _DEPTH_CACHE.clear()
+                bridge.clear_mlx_cache()
+
             processor = AutoImageProcessor.from_pretrained(
                 "facebook/depth-pro-foundation",
                 trust_remote_code=True,
