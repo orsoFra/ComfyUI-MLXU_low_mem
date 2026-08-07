@@ -15,8 +15,10 @@ Advanced features:
   - TeaCache acceleration (output-level step skipping)
   - SeaCache acceleration (residual-based step skipping)
   - Kontext KV cache (reference image conditioning)
-  - ControlNet Union (8 control types)
-  - IP-Adapter (cross-attention injection)
+
+Note: ControlNet Union and IP-Adapter (incl. CLIP Vision Encode) nodes are
+temporarily moved out of the active package to `disabled_nodes/` at the repo
+root pending a revisit -- not deleted, just not registered/importable here.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ _DISPLAY = {
     "ASDX_MLXSampler": "🍏 ASDX MLX Native Sampler",
     "ASDX_VAEDecode": "🍏 ASDX VAE Decode (MLX)",
     "ASDX_VAEEncode": "🍏 ASDX VAE Encode (MLX)",
-    "ASDX_EmptyFLUXLatent": "🍏 ASDX Empty FLUX Latent",
+    "ASDX_EmptyLatent": "🍏 ASDX Empty Latent",
     "ASDX_MemoryProfiler": "🍏 ASDX Memory Profiler",
     # Conditioning
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
@@ -44,13 +46,6 @@ _DISPLAY = {
     "ASDX_LoraLoader": "🍏 ASDX LoRA Loader",
     "ASDX_MultiLoraLoader": "🍏 ASDX Multi LoRA Loader",
     "ASDX_LoraSchedule": "🍏 ASDX LoRA Schedule",
-    # ControlNet
-    "ASDX_ControlNetUnionLoader": "🍏 ASDX ControlNet Union Loader",
-    "ASDX_ApplyControlNet": "🍏 ASDX Apply ControlNet",
-    # IP-Adapter
-    "ASDX_IPAdapterLoader": "🍏 ASDX IP-Adapter Loader",
-    "ASDX_IPAdapterCLIPVisionEncode": "🍏 ASDX CLIP Vision Encode",
-    "ASDX_ApplyIPAdapter": "🍏 ASDX Apply IP-Adapter",
     # Image Chain
     "ASDX_ImageToLatent": "🍏 ASDX Image → Latent",
     "ASDX_MaskFromImage": "🍏 ASDX Mask From Image",
@@ -78,10 +73,6 @@ try:
     from .memory import NODE_DISPLAY_NAME_MAPPINGS as _mem_names
     from .lora import NODE_CLASS_MAPPINGS as _lora_maps
     from .lora import NODE_DISPLAY_NAME_MAPPINGS as _lora_names
-    from .controlnet import NODE_CLASS_MAPPINGS as _cn_maps
-    from .controlnet import NODE_DISPLAY_NAME_MAPPINGS as _cn_names
-    from .ip_adapter import NODE_CLASS_MAPPINGS as _ip_maps
-    from .ip_adapter import NODE_DISPLAY_NAME_MAPPINGS as _ip_names
 
     # Optional: image chain, depth map, live preview
     try:
@@ -113,8 +104,6 @@ try:
         **_latent_maps,
         **_mem_maps,
         **_lora_maps,
-        **_cn_maps,
-        **_ip_maps,
         **_chain_maps,
         **_depth_maps,
         **_preview_maps,
@@ -127,8 +116,6 @@ try:
         **_latent_names,
         **_mem_names,
         **_lora_names,
-        **_cn_names,
-        **_ip_names,
         **_chain_names,
         **_depth_names,
         **_preview_names,

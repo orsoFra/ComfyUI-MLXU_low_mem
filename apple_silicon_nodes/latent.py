@@ -1,7 +1,8 @@
 """
-Empty FLUX Latent
-=================
-Creates empty 16-channel FLUX latents optimized for Apple Silicon.
+Empty Latent
+============
+Creates empty latents (FLUX/Krea2/Z-Image, Flux2/Klein, or SDXL)
+optimized for Apple Silicon.
 """
 
 from __future__ import annotations
@@ -31,8 +32,8 @@ _RESOLUTION_PRESETS = {
 }
 
 
-class ASDX_EmptyFLUXLatent:
-    """Create an empty 16-channel FLUX latent tensor.
+class ASDX_EmptyLatent:
+    """Create an empty latent tensor for FLUX/Krea2/Z-Image, Flux2/Klein, or SDXL.
 
     The latent is placed on the appropriate device (MPS when available)
     for zero-copy with the MLX sampler.
@@ -40,10 +41,12 @@ class ASDX_EmptyFLUXLatent:
 
     # (channels, spatial downscale) per model family -- FLUX.1/Krea2/Z-Image
     # share the same 16ch/8x VAE latent; Flux2/Klein uses a distinct
-    # 128ch/16x VAE (see bridge.py::FLUX2_LATENT_CHANNELS/FLUX2_VAE_DOWNSCALE).
+    # 128ch/16x VAE (see bridge.py::FLUX2_LATENT_CHANNELS/FLUX2_VAE_DOWNSCALE);
+    # SDXL uses the standard 4ch/8x VAE (see bridge.py::SDXL_LATENT_CHANNELS).
     _LATENT_FORMATS = {
         "flux": (16, 8),
         "flux2": (128, 16),
+        "sdxl": (4, 8),
     }
 
     @classmethod
@@ -91,7 +94,7 @@ class ASDX_EmptyFLUXLatent:
             dtype=comfy.model_management.intermediate_dtype(),
         )
 
-        print(f"[ASDX] Empty FLUX Latent ({latent_format}): {width}x{height}, batch={batch_size}, "
+        print(f"[ASDX] Empty Latent ({latent_format}): {width}x{height}, batch={batch_size}, "
               f"latent_shape=[{batch_size}, {channels}, {height//downscale}, {width//downscale}]")
 
         return ({"samples": latent, "downscale_ratio_spacial": downscale},)
@@ -109,9 +112,9 @@ class ASDX_EmptyFLUXLatent:
 
 
 NODE_CLASS_MAPPINGS = {
-    "ASDX_EmptyFLUXLatent": ASDX_EmptyFLUXLatent,
+    "ASDX_EmptyLatent": ASDX_EmptyLatent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_EmptyFLUXLatent": "🍏 ASDX Empty FLUX Latent",
+    "ASDX_EmptyLatent": "🍏 ASDX Empty Latent",
 }
