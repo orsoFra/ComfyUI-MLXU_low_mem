@@ -33,6 +33,21 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
 5. **MPS / MLX Limitations & Fallbacks**:
    * If an operation is unsupported on MPS, execute it via MLX or temporarily fallback to CPU with clean context management.
 
+6. **Quantized ComfyUI Checkpoint Handling**:
+   * Never cast a quantized tensor to float by dtype alone. Classify the checkpoint's
+     quantization convention from its safetensors header MARKER KEYS first
+     (`native/weight_format.py::classify_quant_format`) -- e.g. `.scale_weight`/
+     `.input_scale` (FP8_SCALED) vs. `.comfy_quant` (FP4_PACKED/INT8_TENSORWISE). A
+     format that cannot be classified with confidence must raise, never fall through to
+     a plausible-looking guess.
+   * `native/__init__.py::_load_safetensors()` is the single entry point where every
+     model family's checkpoint is loaded and dequantized; add new quantization formats
+     there, not per-family.
+   * Before shipping a new dequantization path, port the exact math from a real
+     reference implementation (e.g. ComfyUI's own `comfy_kitchen`) and verify
+     numerically against it on a real checkpoint -- do not trust a formula derived by
+     inspection alone.
+
 ---
 
 ## ComfyUI Architecture Standards

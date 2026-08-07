@@ -217,6 +217,7 @@ class _SamplerCore:
 
         # Precompute rope embeddings on the real 2D image token grid (FLUX packs
         # latents as 2x2 patches, so the grid is (height//8//2) x (width//8//2))
+        cap_module.require_divisible_dims(self.width, self.height, 16, "flux1")
         img_h = (self.height // 8) // 2
         img_w = (self.width // 8) // 2
         if img_h * img_w != self.noise.shape[1]:
@@ -440,10 +441,8 @@ class _SamplerCore:
         total_steps: int,
     ) -> tuple[bool, str]:
         """Check if TeaCache allows skipping. Returns (skip, reason)."""
-        reused, reason = state.try_reuse(current_output, step, total_steps)
-        if reused:
-            return True, reason
-        return False, "real"
+        _, reused, reason = state.try_reuse(current_output, step, total_steps)
+        return reused, reason
 
     def _prepare_kontext_reference(
         self,
@@ -946,6 +945,7 @@ class _SamplerCore:
 
         # Target image token grid (in patches): latent is height//8 x width//8,
         # each Krea2 token packs a 2x2 patch, so the grid is (latent//2) x (latent//2).
+        cap_module.require_divisible_dims(self.width, self.height, 16, "krea2")
         img_h = (self.height // 8) // 2
         img_w = (self.width // 8) // 2
         if img_h * img_w != self.noise.shape[1]:
@@ -1271,6 +1271,7 @@ class _SamplerCore:
 
         context = bridge.conditioning_zimage_to_mlx(self.positive, precision)
 
+        cap_module.require_divisible_dims(self.width, self.height, 16, "zimage")
         img_h = (self.height // 8) // 2
         img_w = (self.width // 8) // 2
         if img_h * img_w != self.noise.shape[1]:
@@ -1426,6 +1427,9 @@ class _SamplerCore:
         # Flux2's VAE downscales 16x spatially with patch_size=1 (no further
         # 2x2 token packing) — the image token grid IS the latent grid,
         # unlike FLUX.1/Z-Image's extra //2 for their 2x2 patchify.
+        cap_module.require_divisible_dims(
+            self.width, self.height, bridge.FLUX2_VAE_DOWNSCALE, "flux2"
+        )
         img_h = self.height // bridge.FLUX2_VAE_DOWNSCALE
         img_w = self.width // bridge.FLUX2_VAE_DOWNSCALE
         if img_h * img_w != self.noise.shape[1]:

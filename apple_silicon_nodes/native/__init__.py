@@ -658,6 +658,115 @@ class FluxTransformer(nn.Module):
 
 # ── Loader ────────────────────────────────────────────────────────────
 
+_HADAMARD_CACHE: dict[int, "torch.Tensor"] = {}
+
+
+def _build_hadamard(size: int) -> "torch.Tensor":
+    """Normalized regular (power-of-4) Hadamard matrix, ported 1:1 from
+    comfy_kitchen.tensor.int8_utils._build_hadamard -- required to undo
+    ComfyUI's offline 'ConvRot' weight rotation bit-for-bit rather than
+    approximating it."""
+    import math
+    import torch
+
+    if size in _HADAMARD_CACHE:
+        return _HADAMARD_CACHE[size]
+    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+        raise ValueError(f"ASDX: ConvRot Hadamard size must be a power of 4, got {size}")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=torch.float32,
+    )
+    h = h4
+    current_size = 4
+    while current_size < size:
+        h = torch.kron(h, h4)
+        current_size *= 4
+    h_normalized = h / (size ** 0.5)
+    _HADAMARD_CACHE[size] = h_normalized
+    return h_normalized
+
+
+def _rotate_weight_groups(weight: "torch.Tensor", h: "torch.Tensor", group_size: int) -> "torch.Tensor":
+    """W_rot = W @ H_block^T, applied per group along the input-feature axis
+    (comfy_kitchen.tensor.int8_utils._rotate_weight). H is symmetric and
+    involutory (H @ H == I), so calling this a second time with the same H
+    undoes the original quantization-time rotation."""
+    import torch
+
+    out_f, in_f = weight.shape
+    if in_f % group_size != 0:
+        raise ValueError(
+            f"ASDX: ConvRot group_size {group_size} does not divide "
+            f"in_features {in_f}"
+        )
+    n_groups = in_f // group_size
+    weight_grouped = weight.reshape(out_f, n_groups, group_size)
+    rotated = torch.matmul(weight_grouped, h.T)
+    return rotated.reshape(out_f, in_f)
+
+
+def _dequantize_comfy_quant_int8(
+    state: dict[str, "torch.Tensor"], filename: str
+) -> dict[str, "torch.Tensor"]:
+    """Replace every ComfyUI int8 '.weight'/'.weight_scale'/'.comfy_quant'
+    triplet with a dense float32 '.weight', undoing per-row INT8
+    quantization and (when present) the offline Hadamard 'ConvRot' rotation
+    -- ported from comfy_kitchen.backends.eager.quantization.
+    dequantize_int8_convrot_weight / dequantize_int8_simple. This project
+    runs no int8 GEMM kernels, so materializing the plain dense weight once
+    at load time lets every existing architecture file stay untouched.
+
+    Verified against a real checkpoint (darkBeast30BF16INT8_darkBeast330.
+    safetensors: 224 uniform format="int8_tensorwise"/convrot=true/
+    group_size=256 markers). Any marker deviating from that verified shape
+    raises rather than guessing, per this project's fail-closed doctrine.
+    """
+    import json
+    import torch
+
+    marker_keys = [k for k in state if k.endswith(".comfy_quant")]
+    if not marker_keys:
+        return state
+
+    new_state = dict(state)
+    for marker_key in marker_keys:
+        prefix = marker_key[: -len(".comfy_quant")]
+        weight_key = f"{prefix}.weight"
+        scale_key = f"{prefix}.weight_scale"
+        if weight_key not in state or scale_key not in state:
+            raise ValueError(
+                f"ASDX: '{filename}': '.comfy_quant' marker at '{marker_key}' "
+                f"has no matching '.weight'/'.weight_scale' pair -- refusing "
+                f"to guess the quantization layout."
+            )
+        blob = json.loads(state[marker_key].numpy().tobytes())
+        if blob.get("format") != "int8_tensorwise":
+            raise NotImplementedError(
+                f"ASDX: '{filename}': '{marker_key}' declares comfy_quant "
+                f"format {blob.get('format')!r} -- only 'int8_tensorwise' is "
+                f"implemented."
+            )
+        q = state[weight_key]
+        scale = state[scale_key]
+        if blob.get("convrot"):
+            group_size = blob.get("convrot_groupsize")
+            if not isinstance(group_size, int) or group_size <= 0:
+                raise ValueError(
+                    f"ASDX: '{filename}': '{marker_key}' has convrot=true "
+                    f"with an invalid convrot_groupsize ({group_size!r})."
+                )
+            h = _build_hadamard(group_size)
+            dense = q.to(torch.float32) * scale.to(torch.float32)
+            dense = _rotate_weight_groups(dense, h, group_size)
+        else:
+            dense = q.to(torch.float32) * scale.to(torch.float32)
+        new_state[weight_key] = dense
+        del new_state[marker_key]
+        del new_state[scale_key]
+    return new_state
+
+
 def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     """Load a safetensors file into MLX arrays.
 
@@ -666,13 +775,51 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     UNETLoader/ModelSave weight_dtype="fp8_e4m3fn" -- a straight per-tensor
     cast with no companion scale, unlike ComfyUI's separate "scaled fp8"
     format which stores a scale_weight/input_scale per layer and needs
-    dequantizing by multiplication, NOT handled here) are upcast to
-    float32 before conversion to MLX; the caller casts back down to the
-    requested precision afterward.
+    dequantizing by multiplication) are upcast to float32 before conversion
+    to MLX; the caller casts back down to the requested precision afterward.
+    INT8_TENSORWISE checkpoints (ComfyUI's per-row int8, optionally with an
+    offline Hadamard 'ConvRot' rotation) are dequantized to dense float32
+    weights before that same upcast path, via
+    `_dequantize_comfy_quant_int8`.
+
+    Single entry point for all 5 model families (flux1 directly, krea2/
+    sdxl/zimage/flux2 via `from .. import _load_safetensors`), so the
+    integrity check and quant-format gate below cover every family from
+    one place instead of being duplicated per family.
     """
+    from .safetensors_header import read_safetensors_header, verify_safetensors_integrity
+    from .weight_format import QuantFormat, Unrecognized, classify_quant_format
+
+    header = read_safetensors_header(path)
+    verify_safetensors_integrity(path, header)
+
+    quant_format = classify_quant_format(header)
+    if isinstance(quant_format, Unrecognized):
+        raise ValueError(
+            f"ASDX: '{Path(path).name}' uses an unrecognized weight format "
+            f"({quant_format.reason}). Refusing to load rather than guess -- "
+            f"this project has hit silent-corruption bugs from optimistic "
+            f"fallbacks before."
+        )
+    if quant_format == QuantFormat.FP8_SCALED:
+        raise NotImplementedError(
+            f"ASDX: '{Path(path).name}' uses ComfyUI's scaled-fp8 convention "
+            f"(per-layer .scale_weight/.input_scale) -- dequantization for this "
+            f"format is not implemented yet. Naively upcasting it like plain "
+            f"fp8 would silently produce wrong weights, so loading is refused."
+        )
+    if quant_format == QuantFormat.FP4_PACKED:
+        raise NotImplementedError(
+            f"ASDX: '{Path(path).name}' uses the '{quant_format.value}' "
+            f"ComfyUI quantization convention -- unpacking/dequantization for "
+            f"this format is not implemented yet."
+        )
+
     import torch
     import safetensors.torch
     state = safetensors.torch.load_file(path, device="cpu")
+    if quant_format == QuantFormat.INT8_TENSORWISE:
+        state = _dequantize_comfy_quant_int8(state, Path(path).name)
     result = {}
     for k, v in state.items():
         if v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):

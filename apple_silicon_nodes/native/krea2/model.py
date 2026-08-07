@@ -935,13 +935,10 @@ class EmbedND(nn.Module):
 def _read_safetensors_dtypes(path) -> dict[str, str]:
     """Read a safetensors file's per-tensor dtype strings straight from its
     JSON header, without loading any tensor data."""
-    import json
-    import struct
+    from ..safetensors_header import read_safetensors_header
 
-    with open(path, "rb") as f:
-        header_len = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(header_len))
-    return {k: v["dtype"] for k, v in header.items() if k != "__metadata__"}
+    header = read_safetensors_header(path)
+    return {k: v.dtype for k, v in header.tensors.items()}
 
 
 def load_krea2_transformer(

@@ -12,21 +12,89 @@ Features:
 
 from __future__ import annotations
 
+import os
 import time
+from collections.abc import MutableMapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import mlx.core as mx
 import torch
 
 from . import bridge
 from .capability import CAPABILITY_PROFILES, CapabilityProfile, _resolve_capability_from_path
+from .memory_calibration import LoadShape, check_fits_or_warn
 from .native import FluxConfig, FluxTransformer, load_transformer
+from .native.safetensors_header import read_safetensors_header
+from .native.weight_format import Unrecognized, classify_quant_format
 
 
 # ── Globals ───────────────────────────────────────────────────────────
 
-_MODEL_CACHE: dict[str, dict[str, Any]] = {}
+@dataclass
+class _CacheEntry:
+    value: dict[str, Any]
+    last_used: float  # time.monotonic()
+
+
+class _InactivityCache(MutableMapping):
+    """Dict-like cache that evicts entries idle for longer than
+    `idle_timeout_s`, checked at access time (no background thread --
+    ComfyUI gives nodes no natural hook to run one, and this project has no
+    other async infra to hang it off). Implements the standard mapping
+    protocol so every existing `_MODEL_CACHE[...]`/`in`/`len`/`clear()`
+    call site keeps working unchanged; only the class definition and
+    construction below change.
+    """
+
+    def __init__(self, idle_timeout_s: float):
+        self._store: dict[str, _CacheEntry] = {}
+        self.idle_timeout_s = idle_timeout_s
+
+    def _evict_idle(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, e in self._store.items() if now - e.last_used > self.idle_timeout_s]
+        for k in stale:
+            idle_for = now - self._store[k].last_used
+            print(f"[ASDX] Evicting idle cache entry '{k}' (idle {idle_for:.0f}s)")
+            del self._store[k]
+        if stale:
+            bridge.clear_mlx_cache()
+
+    def __contains__(self, key: object) -> bool:
+        self._evict_idle()
+        return key in self._store
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        self._evict_idle()
+        entry = self._store[key]
+        entry.last_used = time.monotonic()
+        return entry.value
+
+    def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+        self._store[key] = _CacheEntry(value=value, last_used=time.monotonic())
+
+    def __delitem__(self, key: str) -> None:
+        del self._store[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._store)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __bool__(self) -> bool:
+        self._evict_idle()
+        return bool(self._store)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+_MODEL_CACHE = _InactivityCache(
+    idle_timeout_s=float(os.environ.get("ASDX_MODEL_CACHE_IDLE_TIMEOUT_S", "900"))
+)
 
 # Composite cache key components (set by LoRA/ControlNet nodes)
 _MODEL_EXTRA_KEYS: dict[str, str] = {}
@@ -152,6 +220,31 @@ def _detect_model_type_from_keys(path: Path) -> str:
     return "dev"
 
 
+def _gate_memory_before_load(path: Path, model_type: str, precision: str, low_memory_mode: bool) -> None:
+    """Predict the checkpoint's peak memory footprint and refuse to load if it
+    clearly cannot fit -- see `memory_calibration.py` for the two-tier
+    (measured vs. heuristic) prediction and the two-level refuse/warn
+    threshold. Header-only read (no tensor data), independent of the
+    `_load_safetensors` gate that runs later in `_load_transformer_for_type`.
+    """
+    try:
+        header = read_safetensors_header(path)
+        quant_format = classify_quant_format(header)
+        quant_format_str = "unknown" if isinstance(quant_format, Unrecognized) else quant_format.value
+    except Exception as e:
+        print(f"[ASDX] memory_calibration: header read failed ({e}), skipping memory gate")
+        return
+
+    shape = LoadShape(
+        family=model_type,
+        quant_format=quant_format_str,
+        precision=precision,
+        low_memory_mode=low_memory_mode,
+        file_size_bytes=path.stat().st_size,
+    )
+    check_fits_or_warn(shape)
+
+
 def _load_transformer_for_type(
     path: Path, model_type: str, dtype: str
 ):
@@ -199,6 +292,16 @@ _MODEL_TYPE_CAPABILITY = {
     "zimage": "zimage_base",
     "zimage_turbo": "zimage_turbo",
     "flux2": "flux2_klein",
+    # Pre-existing gap (not new this session): "krea2" had no entry here, so
+    # every Krea2 load fell through to `_resolve_capability_from_path`, whose
+    # `_CAPABILITY_DISPATCH` (capability.py) also has no "krea"/"krea2"
+    # pattern -- every Krea2 checkpoint silently resolved to flux1_dev's
+    # profile. `_detect_model_type` never distinguishes krea2_turbo from
+    # krea2 today (unlike zimage_turbo), so krea2_base is the only reachable
+    # Krea2 profile; krea2_turbo (capability.py) stays unreachable until that
+    # detection is added -- noted, not fixed here, to keep this a minimal
+    # unblock rather than a redesign of Krea2 turbo/raw detection.
+    "krea2": "krea2_base",
 }
 
 
@@ -260,14 +363,15 @@ class ASDX_DiffusionLoader:
         """Get list of available diffusion models."""
         try:
             import folder_paths
-            models = []
+            models: dict[str, None] = {}
             for folder in ("diffusion_models", "unet"):
                 try:
-                    models.extend(folder_paths.get_filename_list(folder))
+                    for name in folder_paths.get_filename_list(folder):
+                        models[name] = None
                 except Exception:
                     pass
             if models:
-                return models
+                return list(models)
         except Exception:
             pass
         return ["flux1-dev-fp16.safetensors"]
@@ -319,6 +423,8 @@ class ASDX_DiffusionLoader:
 
         # Resolve capability profile (see _capability_for_model_type).
         capability = _capability_for_model_type(model_type, path)
+
+        _gate_memory_before_load(path, model_type, precision, low_memory_mode)
 
         # Load transformer based on model type (FLUX.1, Krea2, SDXL, or Z-Image)
         transformer, config = _load_transformer_for_type(
@@ -410,12 +516,7 @@ class ASDX_CheckpointLoader:
         """Get list of available checkpoint files."""
         try:
             import folder_paths
-            checkpoints = []
-            for folder in ("checkpoints", "diffusion_models"):
-                try:
-                    checkpoints.extend(folder_paths.get_filename_list(folder))
-                except Exception:
-                    pass
+            checkpoints = folder_paths.get_filename_list("checkpoints")
             if checkpoints:
                 return checkpoints
         except Exception:
@@ -428,6 +529,11 @@ class ASDX_CheckpointLoader:
         # Resolve checkpoint path
         path = self._resolve_checkpoint_path(ckpt_name)
         model_type = _detect_model_type(path)
+
+        # ASDX_CheckpointLoader has no low_memory_mode input, so gate with the
+        # strict default (False) -- see ASDX_DiffusionLoader.load() for the
+        # variant that honors a user-supplied low_memory_mode.
+        _gate_memory_before_load(path, model_type, precision, low_memory_mode=False)
 
         # Load diffusion model based on type
         transformer, config = _load_transformer_for_type(
@@ -491,19 +597,14 @@ class ASDX_CheckpointLoader:
         """Resolve checkpoint name to a file path."""
         try:
             import folder_paths
-            for folder in ("checkpoints", "diffusion_models"):
-                try:
-                    full = folder_paths.get_full_path(folder, name)
-                    if full:
-                        return Path(full)
-                except Exception:
-                    pass
+            full = folder_paths.get_full_path("checkpoints", name)
+            if full:
+                return Path(full)
         except Exception:
             pass
         # Fallback: check common locations
         for candidate in (
             Path.home() / "ComfyUI" / "models" / "checkpoints" / name,
-            Path.home() / "ComfyUI" / "models" / "diffusion_models" / name,
             Path(name),
         ):
             if candidate.exists():

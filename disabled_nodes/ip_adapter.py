@@ -182,14 +182,9 @@ class ASDX_IPAdapterLoader:
         """Get list of available IP-Adapter files."""
         try:
             import folder_paths
-            adapters = []
-            for folder in ("ipadapter", "unet"):
-                try:
-                    adapters.extend(folder_paths.get_filename_list(folder))
-                except Exception:
-                    pass
+            adapters = folder_paths.get_filename_list("ipadapter")
             if adapters:
-                return adapters
+                return list(adapters)
         except Exception:
             pass
         return ["ip-adapter-plus.safetensors"]
@@ -236,13 +231,9 @@ class ASDX_IPAdapterLoader:
     def _resolve_path(name: str) -> Path:
         try:
             import folder_paths
-            for folder in ("ipadapter", "unet"):
-                try:
-                    full = folder_paths.get_full_path(folder, name)
-                    if full:
-                        return Path(full)
-                except Exception:
-                    pass
+            full = folder_paths.get_full_path("ipadapter", name)
+            if full:
+                return Path(full)
         except Exception:
             pass
         for candidate in (

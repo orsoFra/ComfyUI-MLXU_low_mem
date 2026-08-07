@@ -329,3 +329,23 @@ def filter_params_for_model(
         )
 
     return valid, dropped
+
+
+def require_divisible_dims(width: int, height: int, divisor: int, family: str) -> None:
+    """Raise if width/height is not an exact multiple of `divisor`, instead
+    of letting a later `//` floor-division silently truncate to a smaller
+    grid than the caller asked for. `sampler/core.py` derives its patch grid
+    with `(self.height // 8) // 2` (FLUX.1/Krea2/SDXL) or `self.height //
+    bridge.FLUX2_VAE_DOWNSCALE` (Flux2) -- a non-multiple height/width would
+    otherwise generate at a silently different resolution than requested,
+    the same class of "silent substitution" bug this project's checkpoint-
+    loading gates (loader.py/native/__init__.py) exist to prevent, just for
+    dimensions instead of weights.
+    """
+    if width % divisor != 0 or height % divisor != 0:
+        raise ValueError(
+            f"ASDX: {family} requires width/height divisible by {divisor} "
+            f"(got {width}x{height}). Silent floor-division truncation would "
+            f"produce a different resolution than requested -- adjust the "
+            f"dimensions instead."
+        )

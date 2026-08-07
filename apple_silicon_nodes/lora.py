@@ -22,6 +22,110 @@ import mlx.core as mx
 import torch
 
 from . import bridge
+from .native.safetensors_header import read_safetensors_header
+
+
+# ── LoRA↔model family compatibility ─────────────────────────────────
+
+@dataclass(frozen=True)
+class LoRAFamilySignature:
+    family: str  # a CapabilityProfile.family value, or "unknown"
+    evidence: tuple[str, ...]
+
+
+# Base architecture a CapabilityProfile.family value is built on, for
+# compatibility comparison -- flux1_fill/flux1_depth are FLUX.1 variants that
+# share the exact double_blocks/single_blocks key namespace a plain "flux1"
+# LoRA targets, so they must not be flagged as a mismatch.
+_LORA_COMPATIBLE_BASE: dict[str, str] = {
+    "flux1": "flux1",
+    "flux1_fill": "flux1",
+    "flux1_depth": "flux1",
+    "flux2": "flux2",
+    "krea2": "krea2",
+    "sdxl": "sdxl",
+    "zimage": "zimage",
+}
+
+# Conservative, substring-based signatures over RAW (unstripped) safetensors
+# header keys -- a real LoRA file's keys still carry whatever prefix
+# (diffusion_model./model./transformer.) `_load_lora_file` strips later, but
+# substring matching doesn't care about a leading prefix.
+#
+# Verified against real LoRA files on this machine for flux1 (BFL-native),
+# flux2, krea2, sdxl (kohya-ss, the dominant convention for
+# Illustrious/Pony/NoobAI in this project's library) and zimage. NOT every
+# real-world naming convention is covered: a diffusers/PEFT-style FLUX LoRA
+# (`transformer.single_transformer_blocks.{i}.attn.to_k.lora_A.weight`, seen
+# on this machine under loras/Flux.1 D/) returns "unknown" here rather than a
+# false match -- and separately, `_load_lora_file`/`_apply_lora_to_transformer`
+# don't parse that naming convention either (they navigate the live module
+# tree by `double_blocks`/`single_blocks`, which that file's keys never
+# contain), so such a file already silently applies 0 deltas today,
+# independent of this compatibility check. That gap is pre-existing and out
+# of scope here; noted so it isn't mistaken for something this step fixes.
+#
+# `.double_blocks.` alone (not `.single_blocks.`) is the flux1 signal: Flux.2
+# reuses FLUX.1's `single_blocks.{i}.linear1/linear2` naming for its
+# single-stream blocks (confirmed against a real Flux.2 LoRA, which has
+# `single_blocks.*` but no `double_blocks.*` at all) -- `.single_blocks.`
+# alone cannot tell the two apart, so only Flux.2's own
+# `double_stream_modulation_img./_txt.` marker is used for flux2, and flux1
+# requires the double-block evidence that only FLUX.1 (which has BOTH double
+# and single blocks) carries.
+def detect_lora_family(path: Path) -> LoRAFamilySignature:
+    """Header-only (no tensor data) detection of which base family a LoRA
+    file targets, from distinctive key fragments. Zero or multiple matching
+    signatures both return family="unknown" -- never a forced guess; callers
+    should only refuse on a confident, single, DISAGREEING match, not on
+    "unknown" (see `_check_lora_compatibility`).
+    """
+    header = read_safetensors_header(path)
+    keys = header.tensors.keys()
+
+    matches: dict[str, str] = {}  # family -> the key fragment that matched
+    if any(".double_blocks." in k for k in keys):
+        matches["flux1"] = "double_blocks."
+    if any(".input_blocks." in k for k in keys) or any("_input_blocks_" in k for k in keys):
+        matches["sdxl"] = "input_blocks."
+    if any(".noise_refiner." in k for k in keys) or any(
+        ".layers." in k and ".attention.to_" in k for k in keys
+    ):
+        matches["zimage"] = "noise_refiner./layers.*.attention.to_*"
+    if any(".double_stream_modulation_img." in k or ".double_stream_modulation_txt." in k for k in keys):
+        matches["flux2"] = "double_stream_modulation_img./_txt."
+    # Krea2's SingleStreamDiT names attention projections attn.wq/wk/wv/wo
+    # directly under blocks.{i} -- distinct from FLUX's fused img_attn.qkv/
+    # txt_attn.qkv, so this never collides with the flux1 signature above.
+    if any(".attn.wq." in k or ".attn.wk." in k or ".attn.wv." in k for k in keys):
+        matches["krea2"] = "attn.wq/wk/wv"
+
+    if len(matches) != 1:
+        return LoRAFamilySignature(family="unknown", evidence=tuple(sorted(matches)))
+    family, evidence = next(iter(matches.items()))
+    return LoRAFamilySignature(family=family, evidence=(evidence,))
+
+
+def _check_lora_compatibility(lora_path: Path, model: dict) -> None:
+    """Refuse to apply a LoRA whose detected family disagrees with the
+    loaded model's family -- silently applying deltas keyed by coincidental
+    name overlap (or applying 0 deltas with only a quiet log line) is the
+    failure mode this guards against. An "unknown" detection never blocks:
+    it means "no confident signature found", not "confirmed mismatch".
+    """
+    signature = detect_lora_family(lora_path)
+    if signature.family == "unknown":
+        return
+    model_family = model["capability"].family
+    model_base = _LORA_COMPATIBLE_BASE.get(model_family, model_family)
+    lora_base = _LORA_COMPATIBLE_BASE.get(signature.family, signature.family)
+    if lora_base != model_base:
+        raise ValueError(
+            f"ASDX: '{lora_path.name}' looks like a {signature.family} LoRA "
+            f"(evidence: {', '.join(signature.evidence)}), but the loaded "
+            f"model is {model_family}. Applying it would silently apply "
+            f"deltas to unrelated layers. Refusing."
+        )
 
 
 # ── LoRA Target Definition ────────────────────────────────────────────
@@ -105,6 +209,30 @@ def base_lora_scale(alpha: float | None, rank: int) -> float:
     return alpha / max(rank, 1) if alpha is not None else 1.0
 
 
+def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any:
+    """Patch a CLIP text encoder with a LoRA file.
+
+    `mlx_clip` (see conditioning.py) is a real `comfy.sd.CLIP` -- a PyTorch/
+    ModelPatcher object, not our own MLX reimplementation -- so unlike
+    `_apply_lora_to_transformer` there is no reason to hand-roll key
+    matching here. `comfy.sd.load_lora_for_models(model, clip, ...)` already
+    does this correctly (alpha/rank normalization included); passing
+    `model=None` skips the model-side patch we already handle ourselves in
+    MLX. Needed for SDXL, where (unlike FLUX/Flux2/Krea2/Z-Image, whose
+    LoRAs are trained on the transformer only) real CLIP-side LoRA deltas
+    are common (kohya `lora_te1_`/`lora_te2_` keys) and silently dropping
+    them under-applies the LoRA's intended effect.
+    """
+    if clip is None or strength_clip == 0:
+        return clip
+    import comfy.sd
+    import comfy.utils
+
+    raw = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
+    _, new_clip = comfy.sd.load_lora_for_models(None, clip, raw, 0.0, strength_clip)
+    return new_clip if new_clip is not None else clip
+
+
 # ── LoRA Loader Node ─────────────────────────────────────────────────
 
 class ASDX_LoraLoader:
@@ -122,10 +250,14 @@ class ASDX_LoraLoader:
                 "lora_name": (cls._get_loras(),),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
             },
+            "optional": {
+                "clip": ("mlx_clip", {"default": None}),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+            },
         }
 
-    RETURN_TYPES = ("asdx_model",)
-    RETURN_NAMES = ("model",)
+    RETURN_TYPES = ("asdx_model", "mlx_clip")
+    RETURN_NAMES = ("model", "clip")
     FUNCTION = "load_lora"
     CATEGORY = "ASDX/LoRA"
 
@@ -151,12 +283,15 @@ class ASDX_LoraLoader:
         model: dict,
         lora_name: str,
         strength_model: float,
-    ) -> tuple[dict]:
-        """Load and apply a LoRA adapter to the model."""
+        clip: Any = None,
+        strength_clip: float = 1.0,
+    ) -> tuple[dict, Any]:
+        """Load and apply a LoRA adapter to the model (and, if connected, the CLIP)."""
         t0 = time.perf_counter()
 
         transformer = model["transformer"]
         lora_path = self._resolve_lora_path(lora_name)
+        _check_lora_compatibility(lora_path, model)
 
         # Load LoRA weights (alpha comes from the file itself, see
         # _load_lora_file -- matches real ComfyUI's LoraLoader, which has no
@@ -179,11 +314,17 @@ class ASDX_LoraLoader:
         # happens to clear it (loader.py does the same after every load).
         bridge.clear_mlx_cache()
 
+        # CLIP-side LoRA -- only meaningful when a clip is actually connected
+        # (SDXL); see _apply_lora_to_clip. Left as None when no clip input is
+        # wired, matching this node's pre-existing FLUX/Krea2/etc. workflows
+        # that never connect one.
+        new_clip = _apply_lora_to_clip(clip, lora_path, strength_clip)
+
         elapsed = time.perf_counter() - t0
         print(f"[ASDX] LoRA '{lora_name}' applied: rank={lora.rank}, "
               f"scale={lora.scale:.4f}, {elapsed:.2f}s")
 
-        return (new_model,)
+        return (new_model, new_clip)
 
     @staticmethod
     def _load_lora_file(path: Path) -> LoRAAdapter:
@@ -407,83 +548,99 @@ class ASDX_LoraLoader:
 # ── Multi LoRA Loader ────────────────────────────────────────────────
 
 class ASDX_MultiLoraLoader:
-    """Load multiple LoRA adapters with individual strengths.
+    """Load up to 5 LoRA adapters at once, each with its own on/off toggle
+    and independent model/clip strengths.
+
+    Functional parity with LoraManager's LoraLoaderLM and rgthree's Power
+    Lora Loader (per-entry active toggle, separate strength_model/
+    strength_clip) -- implemented with plain ComfyUI widgets rather than
+    their dynamic add/remove JS/Vue frontends, since this project has no
+    web/ frontend infrastructure at all (`_WEB_DIRECTORY = "web"` is
+    declared in __init__.py but the directory doesn't exist).
 
     Applies all LoRAs in a single pass for better performance.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
+        loras = ASDX_LoraLoader._get_loras()
+        required = {"model": ("asdx_model",)}
+        for i in range(1, 6):
+            required[f"lora{i}_enabled"] = ("BOOLEAN", {"default": False})
+            required[f"lora{i}_name"] = (loras,)
+            required[f"lora{i}_strength_model"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01})
+            required[f"lora{i}_strength_clip"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01})
         return {
-            "required": {
-                "model": ("asdx_model",),
-                "lora1_name": (ASDX_LoraLoader._get_loras(),),
-                "lora1_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-                "lora2_name": (ASDX_LoraLoader._get_loras(),),
-                "lora2_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-                "lora3_name": (ASDX_LoraLoader._get_loras(),),
-                "lora3_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-                "lora4_name": (ASDX_LoraLoader._get_loras(),),
-                "lora4_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-                "lora5_name": (ASDX_LoraLoader._get_loras(),),
-                "lora5_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-            },
+            "required": required,
+            "optional": {"clip": ("mlx_clip", {"default": None})},
         }
 
-    RETURN_TYPES = ("asdx_model",)
-    RETURN_NAMES = ("model",)
+    RETURN_TYPES = ("asdx_model", "mlx_clip")
+    RETURN_NAMES = ("model", "clip")
     FUNCTION = "load_loras"
     CATEGORY = "ASDX/LoRA"
 
     def load_loras(
         self,
         model: dict,
-        lora1_name: str, lora1_strength: float,
-        lora2_name: str, lora2_strength: float,
-        lora3_name: str, lora3_strength: float,
-        lora4_name: str, lora4_strength: float,
-        lora5_name: str, lora5_strength: float,
-    ) -> tuple[dict]:
-        """Apply up to 5 LoRA adapters at once."""
-        loras = [
-            (lora1_name, lora1_strength),
-            (lora2_name, lora2_strength),
-            (lora3_name, lora3_strength),
-            (lora4_name, lora4_strength),
-            (lora5_name, lora5_strength),
+        lora1_enabled: bool, lora1_name: str, lora1_strength_model: float, lora1_strength_clip: float,
+        lora2_enabled: bool, lora2_name: str, lora2_strength_model: float, lora2_strength_clip: float,
+        lora3_enabled: bool, lora3_name: str, lora3_strength_model: float, lora3_strength_clip: float,
+        lora4_enabled: bool, lora4_name: str, lora4_strength_model: float, lora4_strength_clip: float,
+        lora5_enabled: bool, lora5_name: str, lora5_strength_model: float, lora5_strength_clip: float,
+        clip: Any = None,
+    ) -> tuple[dict, Any]:
+        """Apply up to 5 active LoRA adapters at once (and, if connected, the CLIP)."""
+        entries = [
+            (lora1_enabled, lora1_name, lora1_strength_model, lora1_strength_clip),
+            (lora2_enabled, lora2_name, lora2_strength_model, lora2_strength_clip),
+            (lora3_enabled, lora3_name, lora3_strength_model, lora3_strength_clip),
+            (lora4_enabled, lora4_name, lora4_strength_model, lora4_strength_clip),
+            (lora5_enabled, lora5_name, lora5_strength_model, lora5_strength_clip),
         ]
 
         transformer = model["transformer"]
         config = model["config"]
         applied_any = False
 
-        for lora_name, strength in loras:
-            if not lora_name or lora_name == "None" or strength == 0:
+        for enabled, lora_name, strength_model, strength_clip in entries:
+            if not enabled or not lora_name or lora_name == "None":
+                continue
+            if strength_model == 0 and strength_clip == 0:
                 continue
 
             lora_path = ASDX_LoraLoader._resolve_lora_path(lora_name)
-            lora = ASDX_LoraLoader._load_lora_file(lora_path)
-            # Same alpha/rank normalization as ASDX_LoraLoader.load_lora, so a
-            # rank-N LoRA doesn't apply at N times its intended strength.
-            lora.scale = base_lora_scale(lora.alpha, lora.rank) * strength
+            _check_lora_compatibility(lora_path, model)
 
-            # Reuse the (non-destructive, tree-flatten-based) apply logic —
-            # do not duplicate it here. Each call returns a NEW transformer;
-            # chaining `transformer =` here stacks LoRAs onto that new
-            # object, never onto the cached base model.
-            transformer = ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora, config)
-            # Each iteration orphans the previous intermediate transformer
-            # (up to 5 full-size copies chained here) -- trim MLX's idle
-            # buffer cache between iterations instead of letting them stack.
-            bridge.clear_mlx_cache()
+            if strength_model != 0:
+                lora = ASDX_LoraLoader._load_lora_file(lora_path)
+                # Same alpha/rank normalization as ASDX_LoraLoader.load_lora,
+                # so a rank-N LoRA doesn't apply at N times its intended
+                # strength.
+                lora.scale = base_lora_scale(lora.alpha, lora.rank) * strength_model
+
+                # Reuse the (non-destructive, tree-flatten-based) apply
+                # logic — do not duplicate it here. Each call returns a NEW
+                # transformer; chaining `transformer =` here stacks LoRAs
+                # onto that new object, never onto the cached base model.
+                transformer = ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora, config)
+                # Each iteration orphans the previous intermediate
+                # transformer (up to 5 full-size copies chained here) --
+                # trim MLX's idle buffer cache between iterations instead of
+                # letting them stack.
+                bridge.clear_mlx_cache()
+
+            clip = _apply_lora_to_clip(clip, lora_path, strength_clip)
+
             applied_any = True
-            print(f"[ASDX] MultiLoRA: '{lora_name}' (strength={strength:.2f})")
+            print(f"[ASDX] MultiLoRA: '{lora_name}' "
+                  f"(model={strength_model:.2f}, clip={strength_clip:.2f})")
 
         if not applied_any:
             print("[ASDX] MultiLoRA: no LoRAs to apply")
-            return (model,)
+            return (model, clip)
 
-        return ({**model, "transformer": transformer},)
+        return ({**model, "transformer": transformer}, clip)
 
 
 # ── LoRA Schedule (per-step strength modulation) ─────────────────────
@@ -505,10 +662,14 @@ class ASDX_LoraSchedule:
                 "strength_middle": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "strength_curve": (["linear", "cosine", "ease_in_out"],),
             },
+            "optional": {
+                "clip": ("mlx_clip", {"default": None}),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            },
         }
 
-    RETURN_TYPES = ("asdx_model",)
-    RETURN_NAMES = ("model",)
+    RETURN_TYPES = ("asdx_model", "mlx_clip")
+    RETURN_NAMES = ("model", "clip")
     FUNCTION = "schedule_lora"
     CATEGORY = "ASDX/Advanced"
 
@@ -520,12 +681,15 @@ class ASDX_LoraSchedule:
         strength_end: float,
         strength_middle: float,
         strength_curve: str,
-    ) -> tuple[dict]:
+        clip: Any = None,
+        strength_clip: float = 1.0,
+    ) -> tuple[dict, Any]:
         """Attach LoRA schedule metadata to the model dict.
 
         The sampler reads this metadata and adjusts LoRA strength per step.
         """
         lora_path = ASDX_LoraLoader._resolve_lora_path(lora_name)
+        _check_lora_compatibility(lora_path, model)
         lora = ASDX_LoraLoader._load_lora_file(lora_path)
 
         # Apply with start strength (same alpha/rank normalization as
@@ -541,6 +705,12 @@ class ASDX_LoraSchedule:
         bridge.clear_mlx_cache()
         new_model = {**model, "transformer": new_transformer}
 
+        # CLIP-side LoRA is applied once at strength_clip (not scheduled):
+        # text conditioning is computed once before the sampling loop, not
+        # per step, so a step-varying CLIP strength has no sampler hook to
+        # attach to -- see _apply_lora_to_clip.
+        new_clip = _apply_lora_to_clip(clip, lora_path, strength_clip)
+
         # Store schedule info on the model — the sampler reads this and
         # adjusts LoRA strength per step (see sampler/core.py).
         new_model["lora_schedule"] = {
@@ -555,7 +725,7 @@ class ASDX_LoraSchedule:
         print(f"[ASDX] LoRA schedule: '{lora_name}' "
               f"start={strength_start:.2f} middle={strength_middle:.2f} end={strength_end:.2f}")
 
-        return (new_model,)
+        return (new_model, new_clip)
 
     @staticmethod
     def _compute_schedule_strength(
