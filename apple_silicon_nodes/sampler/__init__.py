@@ -188,6 +188,7 @@ class ASDX_MLXSampler:
             capability=capability,
             # Mode routing
             mode=mode,
+            latent_image=latent_image,
             # Low memory mode
             low_memory_mode=low_memory_mode,
             image=image,

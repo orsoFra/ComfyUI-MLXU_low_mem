@@ -16,6 +16,7 @@ graphify-out/
 # Local session notes/memory index -- not meant to be public
 MEMORY.md
 session-state.md
+ROADMAP.md
 
 # WIP nodes pending revisit, not registered -- kept locally, not published
 disabled_nodes/

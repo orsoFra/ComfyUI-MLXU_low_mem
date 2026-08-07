@@ -13,7 +13,6 @@ import time
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 import torch
 
 
@@ -192,22 +191,11 @@ class ASDX_VAEEncode:
         if pixels.ndim != 4:
             raise RuntimeError(f"ASDX VAE Encode: expected [B,H,W,C] image, got {pixels.shape}")
 
-        # Convert to MLX
-        # Transpose to [B, C, H, W] and normalize to [-1, 1]
-        image_np = pixels.detach().cpu().numpy().astype(np.float32)
-        image_np = image_np.transpose(0, 3, 1, 2)  # BHWC -> BCHW
-        image_np = (image_np * 2.0) - 1.0  # [0,1] -> [-1,1]
-
-        image_mlx = mx.array(image_np)
-        mx.eval(image_mlx)
-
-        # Encode with MLX VAE
-        latent = self._encode_with_mlx_vae(image_mlx)
-        mx.eval(latent)
-
-        # Convert back to PyTorch
-        latent_np = np.array(latent.astype(mx.float32), dtype=np.float32)
-        latent_torch = torch.from_numpy(latent_np)
+        # Always use the real ComfyUI/PyTorch VAE, mirroring ASDX_VAEDecode.decode()
+        # above: `_encode_with_mlx_vae()` below has no real weight loading -- it's an
+        # untrained placeholder that silently returns the raw pixels (mislabeled as a
+        # "latent") whenever the MLX encoder is unavailable, which it always is today.
+        latent_torch = self._fallback_encode(pixels, vae)
 
         elapsed = time.perf_counter() - t0
         print(f"[ASDX] VAE Encode: {latent_torch.shape}, {elapsed:.2f}s")
@@ -225,6 +213,23 @@ class ASDX_VAEEncode:
             pass
         print("[ASDX] VAE Encode: no MLX VAE available, using fallback")
         return image
+
+    @staticmethod
+    def _fallback_encode(pixels: torch.Tensor, vae: Any) -> torch.Tensor:
+        """Standard PyTorch VAE encode fallback.
+
+        Mirrors `ASDX_VAEDecode._fallback_decode`: comfy's own `VAE.encode()`
+        already handles the `[B,H,W,C]` -> internal layout conversion and pixel
+        normalization, and for `latent_dim == 3` VAEs (e.g. Krea2's Wan21-style
+        VAE) inserts a size-1 temporal axis before encoding, returning a 5D
+        `[B,C,T,H,W]` latent. Our own latent dicts are always plain 4D
+        `[B,C,H,W]` (single image, no temporal axis) -- squeeze that axis back
+        out here, the exact inverse of what `_fallback_decode` does before decode.
+        """
+        latent = vae.encode(pixels)
+        if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 5:
+            latent = latent.squeeze(2)
+        return latent
 
 
 NODE_CLASS_MAPPINGS = {

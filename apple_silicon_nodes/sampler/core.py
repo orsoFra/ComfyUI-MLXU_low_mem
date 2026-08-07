@@ -63,6 +63,7 @@ class _SamplerCore:
         capability: Any | None = None,
         # Mode routing (Phase 2)
         mode: str = "auto",
+        latent_image: dict | None = None,
         image: torch.Tensor | None = None,
         image_strength: float = 0.8,
         mask: torch.Tensor | None = None,
@@ -101,6 +102,7 @@ class _SamplerCore:
         self.capability = capability
         # Mode routing
         self.mode = mode
+        self.latent_image = latent_image
         self.image = image
         self.image_strength = image_strength
         self.mask = mask
@@ -668,26 +670,56 @@ class _SamplerCore:
         return packed_mlx
 
     def _prepare_img2img_noise(self) -> mx.array:
-        """Encode input image, add noise at specified strength level.
+        """Blend the real encoded `latent_image` with noise at the requested strength.
+
+        Previously this re-derived latent content from raw `image` pixels via
+        `_encode_image_to_latent()`, which routes through `MLXVAE()` -- an
+        untrained placeholder with no real weights (same class of bug fixed in
+        `vae.py`'s `ASDX_VAEEncode`) that silently produced garbage, and also
+        skipped the model-space scale/shift (`process_in`) that the noise/
+        Kontext-reference/ControlNet paths all apply. `latent_image` is a
+        required node input and is always a real VAE-encoded latent (e.g. via
+        the now-fixed `ASDX_VAEEncode`), and `_detect_mode()` only calls this
+        method when img2img was actually requested (image connected or
+        mode="img2img" set) -- so using it here, the same way
+        `_prepare_kontext_reference` already does, is correct and free of the
+        placeholder-VAE dependency. `image`/`_encode_image_to_latent` remain
+        for `_prepare_inpainting_noise`, which still has the same placeholder
+        issue (not fixed here -- see ROADMAP.md).
 
         Returns MLX packed noise for the denoising loop.
         """
-        if self.image is None:
+        if self.latent_image is None:
             return self.noise
 
-        # Encode input image to latent
-        input_latent = self._encode_image_to_latent(self.image)
+        import comfy.latent_formats
 
-        # Add noise at strength level
-        import comfy.sample
+        samples = self.latent_image.get("samples", self.latent_image)
+        latent_np = (
+            samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
+            if hasattr(samples, "detach")
+            else np.asarray(samples, dtype=np.float32)
+        )
+
+        # Model-space scale/shift, matching how the noise/Kontext-reference/
+        # ControlNet paths all enter the transformer.
+        model_space = comfy.latent_formats.Flux().process_in(torch.from_numpy(latent_np))
+        latent_np = model_space.numpy().astype(np.float32, copy=False)
+
+        # Pack: [B, C, H, W] -> [B, H/2, W/2, C*4] -> flatten spatial
+        batch, channels, latent_h, latent_w = latent_np.shape
+        packed = latent_np.reshape(
+            batch, channels, latent_h // 2, 2, latent_w // 2, 2
+        )
+        packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+        packed = packed.reshape(
+            batch, (latent_h // 2) * (latent_w // 2), channels * 4
+        )
 
         # Use ComfyUI's noise addition with sqrt(strength) for proper blending
         noise_strength = math.sqrt(self.image_strength)
-
-        # Convert input latent to packed format matching self.noise
-        # Then add noise
         noise_np = np.array(self.noise, dtype=np.float32)
-        blended = input_latent * (1.0 - noise_strength) + noise_np * noise_strength
+        blended = packed * (1.0 - noise_strength) + noise_np * noise_strength
 
         precision = self.config.mlx_dtype
         return mx.array(blended).astype(precision)
@@ -885,9 +917,11 @@ class _SamplerCore:
                 f"[1, {src_h//2*src_w//2}, {channels*4}] grid={src_h//2}x{src_w//2}"
             )
         except Exception as e:
-            print(f"[ASDX] Identity Edit prep failed: {e}")
-            self._identity_edit_source = None
-            self._identity_edit_src_grid = None
+            # Don't swallow this: a `source_latent` was explicitly wired in, so
+            # silently disabling Identity Edit and continuing would run the full
+            # (multi-minute) sampling pass while quietly ignoring the source
+            # image -- a misleading "success" instead of a fast, clear failure.
+            raise RuntimeError(f"ASDX: Identity Edit prep failed: {e}") from e
 
     def _krea2_ref_attn_bias(
         self, txt_len: int, src_h: int, src_w: int, tgt_h: int, tgt_w: int, boost: float
