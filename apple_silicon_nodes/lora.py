@@ -222,6 +222,14 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
     LoRAs are trained on the transformer only) real CLIP-side LoRA deltas
     are common (kohya `lora_te1_`/`lora_te2_` keys) and silently dropping
     them under-applies the LoRA's intended effect.
+
+    `raw` is filtered to drop `lora_unet_*` keys before the comfy call:
+    with `model=None`, comfy's internal key_map only covers CLIP, so every
+    `lora_unet_*` key in the file (already applied separately by
+    `_apply_lora_to_transformer`) would otherwise log a spurious
+    "lora key not loaded" warning -- for a real kohya SDXL LoRA (e.g.
+    Illustrious) that is thousands of warning lines burying any genuine
+    CLIP-side mismatch.
     """
     if clip is None or strength_clip == 0:
         return clip
@@ -229,6 +237,7 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
     import comfy.utils
 
     raw = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
+    raw = {k: v for k, v in raw.items() if not k.startswith("lora_unet_")}
     _, new_clip = comfy.sd.load_lora_for_models(None, clip, raw, 0.0, strength_clip)
     return new_clip if new_clip is not None else clip
 
