@@ -11,3 +11,11 @@ apple_silicon_nodes/.memory_evidence_staging.jsonl
 # Local agent-tool artifacts (not part of the project)
 .serena/
 .claude/.headroom_wrap_marker.json
+graphify-out/
+
+# Local session notes/memory index -- not meant to be public
+MEMORY.md
+session-state.md
+
+# WIP nodes pending revisit, not registered -- kept locally, not published
+disabled_nodes/

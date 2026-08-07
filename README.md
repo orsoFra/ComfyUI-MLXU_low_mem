@@ -9,6 +9,20 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
 3. **Precision awareness** — float16/bfloat16 native on Apple Silicon
 4. **Clean separation** — bridge, native core, and nodes are independently maintainable
 
+## Supported checkpoints
+
+| Family | Latent | Notes |
+|--------|--------|-------|
+| FLUX.1 (dev / kontext) | 16ch | Kontext KV cache for reference-image conditioning |
+| Krea2 | 16ch | Identity Edit (source-token attention), txtfusion enhancer |
+| Z-Image (+ turbo) | 16ch | Distinct patch-token axis order from FLUX |
+| Flux2 / Klein | 128ch | 16x VAE downscale |
+| SDXL (incl. Illustrious/Pony/NoobAI-style) | 4ch | Direct UNet latent grid, no 2x2 patchify |
+
+Model family is auto-detected from the checkpoint filename/keys. Quantized checkpoints
+(FP8_SCALED, INT8 ConvRot/tensorwise) are dequantized on load — the format is classified
+from the safetensors header marker keys, never guessed from dtype alone.
+
 ## Architecture
 
 ```
@@ -18,7 +32,7 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
                 │                           │
      ┌──────────▼──────────┐    ┌──────────▼──────────┐
      │   Conditioning      │    │    Latent Input      │
-     │   (CLIP/T5)         │    │    (16-channel)      │
+     │   (CLIP/T5)         │    │  (4/16/128-channel)  │
      └──────────┬──────────┘    └──────────┬──────────┘
                 │                          │
      ┌──────────▼──────────┐    ┌──────────▼──────────┐
@@ -31,12 +45,11 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
               │   ASDX_MLXSampler       │
               │   (Pure MLX inference)  │
               │                         │
-              │  • FluxTransformer      │
+              │  • FLUX/Krea2/SDXL/     │
+              │    Z-Image/Flux2 core   │
               │  • SeaCache / TeaCache  │
               │  • Kontext KV cache     │
               │  • LoRA injection       │
-              │  • ControlNet conditioning│
-              │  • IP-Adapter injection │
               └────────────┬────────────┘
                            │
               ┌────────────▼────────────┐
@@ -59,64 +72,59 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
 ### Loaders
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX Diffusion Loader` | Load FLUX.1 checkpoint into MLX transformer |
+| `🍏 ASDX Diffusion Loader` | Load a bare diffusion checkpoint (UNet/transformer only) into MLX |
+| `🍏 ASDX Checkpoint Loader` | Load a full checkpoint (transformer + CLIP + VAE) into MLX |
 | `🍏 ASDX Dual CLIP Loader` | Load CLIP-L + T5-XXL text encoders |
+| `🍏 ASDX CLIP Loader` | Load a single CLIP text encoder |
+| `🍏 ASDX VAE Loader` | Load a VAE checkpoint |
 
 ### Conditioning
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX CLIP Text Encode FLUX` | Encode prompts to T5 + CLIP embeddings |
+| `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL) |
 | `🍏 ASDX Conditioning Merger` | Merge conditioning inputs |
 
 ### Sampling
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX MLX Native Sampler` | Euler sampler in pure MLX with SeaCache |
+| `🍏 ASDX MLX Native Sampler` | Euler sampler in pure MLX with SeaCache/TeaCache |
 
-### Latent
+### Latent / VAE
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX Empty FLUX Latent` | Create 16-channel FLUX latent |
+| `🍏 ASDX Empty Latent` | Create an empty latent (`flux`/`flux2`/`sdxl` format) |
 | `🍏 ASDX VAE Decode (MLX)` | Decode latents via MLX VAE |
 | `🍏 ASDX VAE Encode (MLX)` | Encode images via MLX VAE |
 
 ### LoRA
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX LoRA Loader` | Load single LoRA (A/B or ComfyUI diff format) with strength scaling |
+| `🍏 ASDX LoRA Loader` | Load single LoRA (A/B, kohya, or ComfyUI diff format) with strength scaling |
 | `🍏 ASDX Multi LoRA Loader` | Stack up to 5 LoRAs simultaneously |
 | `🍏 ASDX LoRA Schedule` | Per-step LoRA strength modulation (linear/cosine/ease-in-out) |
-
-### ControlNet
-| Node | Description |
-|------|-------------|
-| `🍏 ASDX ControlNet Union Loader` | Load ControlNet supporting 8 control types |
-| `🍏 ASDX Apply ControlNet` | Apply control conditioning to the diffusion process |
-
-### IP-Adapter
-| Node | Description |
-|------|-------------|
-| `🍏 ASDX IP-Adapter Loader` | Load IP-Adapter projection weights |
-| `🍏 ASDX CLIP Vision Encode` | Encode reference image to CLIP-Vision tokens |
-| `🍏 ASDX Apply IP-Adapter` | Inject reference image features via cross-attention |
 
 ### Utilities
 | Node | Description |
 |------|-------------|
 | `🍏 ASDX Memory Profiler` | Real-time MLX/MPS memory stats |
-| `🍏 ASDX Cache Manager` | Clear caches between phases |
+| `🍏 ASDX Cache Manager` | Clear model/CLIP/VAE caches between runs |
+| `🍏 ASDX Depth Map` | Estimate a depth map from an image |
+| `🍏 ASDX Live Preview` | Stream intermediate latents during sampling |
+
+> ControlNet Union and IP-Adapter nodes exist in `disabled_nodes/` but are not currently
+> registered — kept for a future revisit, not deleted.
 
 ## Installation
 
-1. Place the `apple_silicon_nodes` folder into your ComfyUI custom_nodes directory:
+1. Clone this repo into your ComfyUI custom_nodes directory:
    ```bash
    cd ComfyUI/custom_nodes
-   ln -s /path/to/ComfyUI-MLXU/apple_silicon_nodes .
+   git clone https://github.com/unipacfr/ComfyUI-MLXU.git
    ```
 
 2. Install dependencies:
    ```bash
-   pip install mlx numpy safetensors
+   pip install -r ComfyUI-MLXU/requirements.txt
    ```
 
 3. Restart ComfyUI
@@ -146,29 +154,29 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
 - **Precomputed text projection**: `txt_in(emb)` computed once, reused across steps
 
 ### Advanced Conditioning
-- **LoRA Runtime Loading**: Standard A/B matrices and ComfyUI diff format with per-LoRA alpha scaling
+- **LoRA Runtime Loading**: Standard A/B matrices, kohya-style, and ComfyUI diff format with per-LoRA alpha scaling
 - **Multi-LoRA Stacking**: Up to 5 LoRAs applied simultaneously with strength scheduling
-- **ControlNet Union**: 8 control types (pose, depth, soft_edge, line_canny, normal, segment, tile, repaint)
-- **IP-Adapter**: Cross-attention injection using CLIP-Vision reference encoding
 - **Kontext KV Cache**: Reference image tokens cached and injected into transformer attention layers
+- **Quantized checkpoints**: FP8_SCALED and INT8 ConvRot/tensorwise dequantized on load
 
 ## Comparison with SDMLX
 
 | Feature | SDMLX | ASDX |
 |---------|-------|------|
 | FLUX native transformer | ✅ (C++ core) | ✅ (pure MLX) |
+| SDXL support | ❌ | ✅ |
 | LoRA runtime loading | ✅ | ✅ |
 | Multi-LoRA stacking | ✅ | ✅ |
 | TeaCache acceleration | ✅ | ✅ |
 | SeaCache acceleration | ✅ | ✅ |
-| ControlNet Union | ✅ | ✅ |
-| IP-Adapter | ✅ | ✅ |
+| ControlNet Union | ✅ | 🚧 disabled (WIP, `disabled_nodes/`) |
+| IP-Adapter | ✅ | 🚧 disabled (WIP, `disabled_nodes/`) |
 | Kontext reference | ✅ | ✅ |
 | Code size | ~15K lines | ~3K lines |
 | Learning curve | Steep | Gentle |
 | Modularity | Tightly coupled | Cleanly separated |
 
-ASDX is the **minimal viable set** — the core diffusion pipeline with advanced features (LoRA, ControlNet, IP-Adapter, TeaCache) implemented in clean, readable MLX code. Use it as a starting point, learning reference, or production pipeline for Apple Silicon.
+ASDX is the **minimal viable set** — the core diffusion pipeline with advanced features (LoRA, quantized checkpoints, TeaCache/SeaCache) implemented in clean, readable MLX code. Use it as a starting point, learning reference, or production pipeline for Apple Silicon.
 
 ## License
 
