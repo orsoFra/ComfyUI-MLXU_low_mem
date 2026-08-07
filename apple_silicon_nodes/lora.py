@@ -504,6 +504,17 @@ class ASDX_LoraLoader:
         # tree_flatten uses for checkpoint keys (see native/*/model.py's
         # load_*_transformer), so deltas match model_flat keys directly.
         model_flat = tree_flatten(transformer.parameters())
+
+        # Only SDXL's native module tree diverges from its real checkpoint
+        # keys (MLX Sequential's `.layers.` insertion, see weight_map.py) --
+        # FLUX/Krea2's native tree matches its checkpoint 1:1, so no un-
+        # mapping is needed there (or if a future architecture needs one,
+        # add it to that architecture's own weight_map.py, not here).
+        checkpoint_stem_fn = None
+        if type(transformer).__module__.startswith("apple_silicon_nodes.native.sdxl"):
+            from apple_silicon_nodes.native.sdxl.weight_map import native_key_to_checkpoint_stem
+            checkpoint_stem_fn = native_key_to_checkpoint_stem
+
         new_flat = []
         applied = 0
         for flat_key, value in model_flat:
@@ -520,7 +531,17 @@ class ASDX_LoraLoader:
                 # key, not reverse-engineered from the flat one, which is
                 # ambiguous whenever a module name itself contains an underscore,
                 # e.g. "proj_in"/"ff_net_0_proj").
+                #
+                # `flat_key` is OUR native module's tree_flatten key, not the
+                # real checkpoint key -- SDXL's weight_map.py inserts `.layers.`
+                # (and restructures ff.net/label_emb) to address MLX's
+                # nn.Sequential, so any target weight inside one of those
+                # wrappers must be un-mapped back to its real checkpoint stem
+                # before the kohya string is built, or it silently never
+                # matches (this was the cause of the 442/986 partial match).
                 stem, _, suffix = flat_key.rpartition(".")
+                if checkpoint_stem_fn is not None:
+                    stem = checkpoint_stem_fn(stem)
                 delta = lora.deltas.get(f"lora_unet_{stem.replace('.', '_')}.{suffix}")
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)

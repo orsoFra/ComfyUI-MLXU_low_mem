@@ -58,6 +58,33 @@ _SEQUENTIAL_INSERTS = (
 )
 
 
+def native_key_to_checkpoint_stem(key: str) -> str:
+    """Inverse of `map_sdxl_to_native` for a single flattened parameter key.
+
+    Recovers the real (PyTorch/kohya) checkpoint key from our native
+    module's `tree_flatten` key, undoing every `.layers.` insertion and the
+    `label_emb`/`ff.net` restructuring. Needed by `lora.py` to build the
+    kohya-flat LoRA key candidate from a live parameter key -- building it
+    from the native key directly (without this inverse) silently fails to
+    match any real LoRA weight that lives inside one of these Sequential
+    wrappers (ff, resblock in/emb/out_layers, attention to_out, time_embed,
+    label_emb, top-level out).
+    """
+    if key.startswith("time_embed.layers."):
+        return "time_embed." + key[len("time_embed.layers."):]
+    if key.startswith("label_emb.layers."):
+        return "label_emb.0." + key[len("label_emb.layers."):]
+    if key.startswith("out.layers."):
+        return "out." + key[len("out.layers."):]
+    if ".ff.layers." in key:
+        return key.replace(".ff.layers.", ".ff.net.")
+    for token in _SEQUENTIAL_INSERTS:
+        wrapped = token[:-1] + ".layers."
+        if wrapped in key:
+            return key.replace(wrapped, token)
+    return key
+
+
 def map_sdxl_to_native(state_dict: dict[str, mx.array]) -> dict[str, mx.array]:
     """Map a normalized SDXL UNet state dict to our module naming."""
     result: dict[str, mx.array] = {}
