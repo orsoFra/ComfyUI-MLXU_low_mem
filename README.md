@@ -14,7 +14,7 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
 | Family | Latent | Notes |
 |--------|--------|-------|
 | FLUX.1 (dev / kontext) | 16ch | Kontext KV cache for reference-image conditioning |
-| Krea2 | 16ch | Identity Edit (source-token attention), txtfusion enhancer |
+| Krea2 | 16ch | Identity Edit (source-token attention), txtfusion enhancer, image-grounded prompt encoding |
 | Z-Image (+ turbo) | 16ch | Distinct patch-token axis order from FLUX |
 | Flux2 / Klein | 128ch | 16x VAE downscale |
 | SDXL (incl. Illustrious/Pony/NoobAI-style) | 4ch | Direct UNet latent grid, no 2x2 patchify |
@@ -81,7 +81,7 @@ from the safetensors header marker keys, never guessed from dtype alone.
 ### Conditioning
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL) |
+| `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL); optional image-grounded encoding for Krea2 (Identity Edit) |
 | `🍏 ASDX Conditioning Merger` | Merge conditioning inputs |
 
 ### Sampling
@@ -158,6 +158,7 @@ from the safetensors header marker keys, never guessed from dtype alone.
 - **Multi-LoRA Stacking**: Up to 5 LoRAs applied simultaneously with strength scheduling
 - **Kontext KV Cache**: Reference image tokens cached and injected into transformer attention layers
 - **Quantized checkpoints**: FP8_SCALED and INT8 ConvRot/tensorwise dequantized on load
+- **Krea2 image-grounded encoding**: prompt is encoded alongside a source image through the CLIP's vision tower, matching the krea2_edit LoRA's training-time conditioning
 
 ## Comparison with SDMLX
 
