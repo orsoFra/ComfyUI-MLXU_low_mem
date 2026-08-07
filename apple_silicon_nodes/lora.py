@@ -508,6 +508,20 @@ class ASDX_LoraLoader:
         applied = 0
         for flat_key, value in model_flat:
             delta = lora.deltas.get(flat_key)
+            if delta is None:
+                # kohya-ss (sd-scripts) flat naming -- used by essentially all SD/
+                # SDXL LoRAs (e.g. Illustrious): dots replaced by underscores and
+                # prefixed "lora_unet_", e.g. "input_blocks.4.1.proj_in.weight" ->
+                # "lora_unet_input_blocks_4_1_proj_in.weight". `_load_lora_file`
+                # only strips a few known *dotted* prefixes, so these flat kohya
+                # keys land in `lora.deltas` unchanged and never match `flat_key`
+                # directly. Build the candidate the same direction comfy's real
+                # `comfy/lora.py::model_lora_keys_unet` does (FROM the known real
+                # key, not reverse-engineered from the flat one, which is
+                # ambiguous whenever a module name itself contains an underscore,
+                # e.g. "proj_in"/"ff_net_0_proj").
+                stem, _, suffix = flat_key.rpartition(".")
+                delta = lora.deltas.get(f"lora_unet_{stem.replace('.', '_')}.{suffix}")
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)
                 new_flat.append((flat_key, value + delta_mapped * lora.scale))
