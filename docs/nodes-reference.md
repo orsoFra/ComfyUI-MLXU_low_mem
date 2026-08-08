@@ -1,7 +1,7 @@
 # Reference des nodes ComfyUI-MLXU
 
 **Date de generation :** 2026-08-02
-**Version du projet :** 0.2.0
+**Version du projet :** 0.2.1
 
 ---
 

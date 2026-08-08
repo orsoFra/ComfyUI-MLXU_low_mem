@@ -23,7 +23,7 @@ root pending a revisit -- not deleted, just not registered/importable here.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _WEB_DIRECTORY = "web"
 

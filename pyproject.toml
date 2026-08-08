@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asdx-apple-silicon-diffusion-nodes"
-version = "0.2.0"
+version = "0.2.1"
 description = "Custom ComfyUI nodes for Apple Silicon (M1-M5) using MLX native inference with zero-copy unified memory"
 readme = "README.md"
 license = { text = "MIT" }
