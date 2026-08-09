@@ -93,8 +93,10 @@ class ASDX_MLXSampler(io.ComfyNode):
                             "boost (ported from ComfyUI-Krea2T-Enhancer). 0 = off "
                             "(vanilla Krea2, weaker prompt adherence and lower final "
                             "latent amplitude); 1.0 matches the reference node's "
-                            "default (max -- only strength=1.0 has been verified "
-                            "NaN/overflow-safe against the real node). No effect on "
+                            "default (max). Its internal ~x75 amplification can "
+                            "overflow in float16 (silently falls back to unamplified "
+                            "conditioning if it does) -- use bfloat16 precision for "
+                            "the full effect at strength=1.0. No effect on "
                             "non-Krea2 models.",
                 ),
                 # Legacy

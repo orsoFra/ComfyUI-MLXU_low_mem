@@ -61,3 +61,37 @@ runtime (`comfy_api.latest`, via the installed ComfyUI's own venv) — every nod
 `py_compile`d. Every `node_id` was kept identical to its old V1 mapping key, so
 existing saved workflows keep resolving to the same nodes. The old `_WEB_DIRECTORY
 = "web"` dead variable (wrong name, no `web/` dir) was dropped in the same pass.
+
+## Krea2T enhancer's ~x75 amplification needs a finite-value guard and bfloat16
+kind: gotcha | date: 2026-08-09 | status: canon
+`krea2t_enhance_conditioning` (`native/krea2/model.py`) multiplies chunks of the
+stacked Qwen3-VL taps by up to 5x (per-chunk gain) times 15x (global multiplier) =
+~75x before re-running `txtfusion` on the amplified copy. At `strength=1.0` (the
+default, matching the reference node) this can overflow float16 (max ~65504) on
+real Qwen3-VL hidden-state outliers that already reach into the thousands; the
+resulting NaN/Inf in `candidate_out` propagated through `post_delta`/`token_scale`
+with no guard, silently corrupting the final fused embedding to 100% NaN --
+sampling and VAE decode still "succeeded" but produced a black image, with the
+corruption invisible until `encode_text`'s output (confirmed via targeted
+`[ASDX][DEBUG]` stat prints at 4 pipeline checkpoints: clean input, 100%-NaN
+output right after `encode_text`). Fixed by (1) a finite-check in
+`krea2t_enhance_conditioning` that falls back to the unamplified `reference_out`
+if `candidate_out` isn't finite, and (2) recommending bfloat16 precision
+(float32-range exponent, no overflow at these magnitudes) for full-strength
+enhancer use -- confirmed no overflow warning at `precision=bfloat16` vs. a
+reproducible one at `precision=float16`, same checkpoint/prompt/seed.
+
+## CLIP `clip_type` must be set manually outside ASDX_CheckpointLoader
+kind: gotcha | date: 2026-08-09 | status: canon
+Only `ASDX_CheckpointLoader` auto-detects the text-encoder architecture from the
+checkpoint's own embedded CLIP weights (`comfy.sd.load_checkpoint_guess_config`).
+The standalone `ASDX_CLIPLoader`/`ASDX_DualCLIPLoader` nodes require the user to
+pick the right `clip_type` value themselves; leaving it at a generic default (not
+"krea2") silently loads a plain single-layer Qwen3-VL encoder instead of
+`Krea2TEModel` (`comfy/text_encoders/krea2.py`, 12-layer tap, 30720-dim fused
+output) -- this project's own `bridge.py::conditioning_krea2_to_mlx` then falls
+back to tiling that single layer 12x (the `"repeating single-layer embedding"`
+warning), discarding most of the real conditioning signal. Result: a valid,
+non-NaN image that doesn't match the prompt at all, not a crash -- easy to miss.
+Same class of footgun already flagged for Klein-4B in `loader.py`; confirmed here
+to also apply to Krea2.

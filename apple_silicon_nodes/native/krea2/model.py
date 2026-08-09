@@ -396,9 +396,13 @@ def krea2t_enhance_conditioning(
         Fused text embeddings [B, seq, txtdim], same shape as
         `txtfusion(x)`.
     """
-    # Only strength<=1.0 has been verified NaN/overflow-safe against the
-    # real reference node (see the ComfyUI widget's tooltip) -- clamp here
-    # so every caller inherits the guarantee, not just the current widget.
+    # strength is clamped to <=1.0 so every caller matches the reference
+    # node's own range, not just the current widget. Even at strength<=1.0,
+    # the ~x75 amplification below (gains x global_multiplier) can overflow
+    # in float16 (max ~65504) on real Qwen3-VL activations, which routinely
+    # reach into the thousands -- bfloat16 (float32-range exponent) doesn't
+    # have this problem. The finite-check below after `candidate_out` is
+    # the actual safety net; this clamp alone does not guarantee safety.
     strength = max(0.0, min(strength, 1.0))
     if (
         strength == 0.0
@@ -419,6 +423,21 @@ def krea2t_enhance_conditioning(
         * global_multiplier
     ).reshape(B, seq, taps, dim)
     candidate_out = txtfusion(scaled_x)
+
+    # The amplified branch can overflow to NaN/Inf on out-of-distribution
+    # inputs (e.g. a degenerate stacked-layer input where all 12 "layers"
+    # are identical, from the tiling fallback in sampler/bridge.py when the
+    # CLIP encode doesn't produce genuine per-layer taps). Without this
+    # guard, a NaN/Inf `candidate_out` propagates through `post_delta`/
+    # `token_scale` below and corrupts the final output even though
+    # `reference_out` (computed on the un-amplified input) is fine --
+    # confirmed via [ASDX][DEBUG] instrumentation on a real Krea2 run where
+    # `context` came out 100% NaN despite a finite `txt_fused` input.
+    if not bool(mx.all(mx.isfinite(candidate_out)).item()):
+        print("[ASDX] WARNING: Krea2T enhancer amplification overflowed "
+              "(NaN/Inf) -- falling back to the unamplified conditioning "
+              "for this generation.")
+        return reference_out
 
     post_delta = candidate_out.astype(mx.float32) - reference_out.astype(mx.float32)
     token_base_rms = mx.sqrt(mx.mean(reference_out.astype(mx.float32) ** 2, axis=-1, keepdims=True))
