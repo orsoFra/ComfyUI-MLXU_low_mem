@@ -655,7 +655,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         # both resolve through the same relative-import chain.
         checkpoint_stem_fn = None
         if isinstance(transformer, SDXLUNetModel):
-            from apple_silicon_nodes.native.sdxl.weight_map import native_key_to_checkpoint_stem
+            from .native.sdxl.weight_map import native_key_to_checkpoint_stem
             checkpoint_stem_fn = native_key_to_checkpoint_stem
 
         # BFL-native FLUX.1 (native/__init__.py's FluxTransformer -- Krea2 reuses
