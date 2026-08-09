@@ -767,6 +767,68 @@ def _dequantize_comfy_quant_int8(
     return new_state
 
 
+def _dequantize_fp8_scaled(
+    state: dict[str, "torch.Tensor"], filename: str
+) -> dict[str, "torch.Tensor"]:
+    """Replace every per-tensor-scaled FP8 '.weight' with a dense float32
+    '.weight', undoing ComfyUI's "scaled fp8" convention -- ported from
+    `comfy_kitchen.backends.eager.quantization.dequantize_per_tensor_fp8`
+    (`dq = qdata.to(dtype) * scale.to(dtype)`, the same math the real
+    `TensorCoreFP8Layout.dequantize()` calls). `.input_scale` (activation-side
+    scale for a fused FP8xFP8 GEMM) is irrelevant once we materialize a dense
+    weight for a plain float matmul, so it's dropped along with the weight
+    scale rather than applied.
+
+    Verified against a real checkpoint (`flux2_dev_fp8mixed.safetensors`:
+    128 F8_E4M3 weights, each with exactly one scalar `.weight_scale` +
+    `.input_scale` pair, no `.comfy_quant` marker at all -- see
+    `weight_format.py` module docstring for the convention this predates).
+    Any weight missing its scale, or a scale that isn't a 0-d/1-element
+    tensor, raises rather than guessing, per this project's fail-closed
+    doctrine (see `_dequantize_comfy_quant_int8` above for the same pattern).
+    """
+    import torch
+
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    fp8_weight_keys = [
+        k for k, v in state.items()
+        if v.dtype in fp8_dtypes and k.endswith(".weight")
+    ]
+    if not fp8_weight_keys:
+        return state
+
+    new_state = dict(state)
+    for weight_key in fp8_weight_keys:
+        prefix = weight_key[: -len(".weight")]
+        scale_key = None
+        for candidate in (f"{prefix}.weight_scale", f"{prefix}.scale_weight"):
+            if candidate in state:
+                scale_key = candidate
+                break
+        if scale_key is None:
+            raise ValueError(
+                f"ASDX: '{filename}': FP8 weight '{weight_key}' has no matching "
+                f"'.weight_scale'/'.scale_weight' -- refusing to guess a scale "
+                f"of 1.0 (that's exactly the FP8_NAIVE convention, a different "
+                f"format this checkpoint doesn't declare)."
+            )
+        scale = state[scale_key]
+        if scale.numel() != 1:
+            raise ValueError(
+                f"ASDX: '{filename}': '{scale_key}' has {scale.numel()} elements "
+                f"-- only per-tensor (scalar) FP8 scaling is implemented, not "
+                f"per-channel/per-block."
+            )
+        q = state[weight_key]
+        dense = q.to(torch.float32) * scale.to(torch.float32)
+        new_state[weight_key] = dense
+        del new_state[scale_key]
+        input_scale_key = f"{prefix}.input_scale"
+        if input_scale_key in new_state:
+            del new_state[input_scale_key]
+    return new_state
+
+
 def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     """Load a safetensors file into MLX arrays.
 
@@ -780,7 +842,9 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     INT8_TENSORWISE checkpoints (ComfyUI's per-row int8, optionally with an
     offline Hadamard 'ConvRot' rotation) are dequantized to dense float32
     weights before that same upcast path, via
-    `_dequantize_comfy_quant_int8`.
+    `_dequantize_comfy_quant_int8`. FP8_SCALED checkpoints (per-tensor
+    `.weight_scale`/`.scale_weight`) are likewise dequantized first, via
+    `_dequantize_fp8_scaled`.
 
     Single entry point for all 5 model families (flux1 directly, krea2/
     sdxl/zimage/flux2 via `from .. import _load_safetensors`), so the
@@ -801,13 +865,6 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
             f"this project has hit silent-corruption bugs from optimistic "
             f"fallbacks before."
         )
-    if quant_format == QuantFormat.FP8_SCALED:
-        raise NotImplementedError(
-            f"ASDX: '{Path(path).name}' uses ComfyUI's scaled-fp8 convention "
-            f"(per-layer .scale_weight/.input_scale) -- dequantization for this "
-            f"format is not implemented yet. Naively upcasting it like plain "
-            f"fp8 would silently produce wrong weights, so loading is refused."
-        )
     if quant_format == QuantFormat.FP4_PACKED:
         raise NotImplementedError(
             f"ASDX: '{Path(path).name}' uses the '{quant_format.value}' "
@@ -820,6 +877,8 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     state = safetensors.torch.load_file(path, device="cpu")
     if quant_format == QuantFormat.INT8_TENSORWISE:
         state = _dequantize_comfy_quant_int8(state, Path(path).name)
+    elif quant_format == QuantFormat.FP8_SCALED:
+        state = _dequantize_fp8_scaled(state, Path(path).name)
     result = {}
     for k, v in state.items():
         if v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):

@@ -1,27 +1,35 @@
 """Fail-closed classification of a safetensors checkpoint's quantization format.
 
-Classifies by MARKER KEYS (companion `.scale_weight`/`.input_scale`/`.comfy_quant`
-tensors), never by dtype alone -- two files that are both "F8_E4M3" can need
-completely different dequantization math depending on which scale convention
-accompanies them. An unrecognized convention is reported as `Unrecognized`,
-never silently treated as plain-castable: `_load_safetensors()` (native/__init__.py)
-already upcasts naive FP8 correctly, but naively upcasting a *scaled* FP8
-checkpoint through that same path would decode to noise, not raise an error --
-exactly the silent-corruption failure mode this project has hit before with the
-string/tuple checkpoint-key bug.
+Classifies by MARKER KEYS (companion `.scale_weight`/`.weight_scale`/
+`.input_scale`/`.comfy_quant` tensors), never by dtype alone -- two files that
+are both "F8_E4M3" can need completely different dequantization math depending
+on which scale convention accompanies them. An unrecognized convention is
+reported as `Unrecognized`, never silently treated as plain-castable:
+`_load_safetensors()` (native/__init__.py) already upcasts naive FP8 correctly,
+but naively upcasting a *scaled* FP8 checkpoint through that same path would
+decode to noise, not raise an error -- exactly the silent-corruption failure
+mode this project has hit before with the string/tuple checkpoint-key bug.
 
-No diffusion-transformer checkpoint on this machine uses `scaled_fp8`/`fp4`/
-`int8` -- only FP8_NAIVE is confirmed there (`darkBeast_dbkleinv2BFS.safetensors`,
-see commit c6a4724). A real `.comfy_quant`-marked file does exist on this
-machine (`qwen_3_8b_fp8mixed.safetensors`, a Flux.2 text encoder -- never
-routed through `_load_safetensors`, so irrelevant to the loader gate itself),
-and it mixes F8_E4M3- and U8-payload `.comfy_quant` weights in the same file;
-testing against it is what caught the classifier's original bug where a mixed
-file was confidently misclassified as FP4_PACKED (fixed: any dtype mix under
-`.comfy_quant` now falls through to Unrecognized). FP8_SCALED and the
-single-dtype-uniform INT8_TENSORWISE/FP4_PACKED branches remain covered by
-synthetic-header tests only; treat them as unverified against a uniform real
-file until one surfaces.
+FP8_NAIVE is confirmed on this machine (`darkBeast_dbkleinv2BFS.safetensors`,
+see commit c6a4724). FP8_SCALED is ALSO confirmed on this machine: `Flux.2 D/
+base model/flux2_dev_fp8mixed.safetensors` uses bare `.weight_scale`/
+`.input_scale` suffixes (scalar F32, one pair per F8_E4M3 weight, 128/128) with
+NO `.comfy_quant` marker at all -- an older/simpler convention than the
+`.comfy_quant`-metadata-driven `float8_e4m3fn` format `comfy/ops.py::
+_load_quantized_module` handles, and different from the historical
+`.scale_weight` (verb-noun) spelling `comfy/utils.py::convert_old_quants`
+upgrades to `.weight_scale` -- this checkpoint already uses the `.weight_scale`
+(noun-verb) spelling directly. Both `.scale_weight` and `.weight_scale` are
+checked below for robustness against either era. A real `.comfy_quant`-marked
+file does exist on this machine (`qwen_3_8b_fp8mixed.safetensors`, a Flux.2
+text encoder -- never routed through `_load_safetensors`, so irrelevant to the
+loader gate itself), and it mixes F8_E4M3- and U8-payload `.comfy_quant`
+weights in the same file; testing against it is what caught the classifier's
+original bug where a mixed file was confidently misclassified as FP4_PACKED
+(fixed: any dtype mix under `.comfy_quant` now falls through to Unrecognized).
+FP4_PACKED and INT8_TENSORWISE-via-`.comfy_quant` remain covered by synthetic-
+header tests only for FP4_PACKED specifically; treat FP4_PACKED as unverified
+against a uniform real file until one surfaces.
 """
 
 from __future__ import annotations
@@ -103,7 +111,8 @@ def classify_quant_format(header: SafetensorsHeader) -> QuantFormat | Unrecogniz
 
     if dtypes_seen & _FP8_DTYPES:
         has_scale_companion = any(
-            k.endswith(".scale_weight") or k.endswith(".input_scale")
+            k.endswith(".scale_weight") or k.endswith(".weight_scale")
+            or k.endswith(".input_scale")
             for k in header.tensors
         )
         if has_scale_companion:
