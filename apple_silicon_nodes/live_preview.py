@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import mlx.core as mx
 import torch
+from comfy_api.latest import io
 
 
 # ── LivePreviewRegistry ───────────────────────────────────────────────
@@ -63,7 +64,7 @@ class LivePreviewRegistry:
 
 # ── Node: LivePreview (debug/inspection) ──────────────────────────────
 
-class ASDX_LivePreview:
+class ASDX_LivePreview(io.ComfyNode):
     """Register a live preview callback for the current sampling run.
 
     This node is primarily for debugging and advanced workflow integration.
@@ -71,19 +72,30 @@ class ASDX_LivePreview:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "callback_type": (["log", "progress", "none"], {"default": "log"}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_LivePreview",
+            display_name="🍏 ASDX Live Preview",
+            category="ASDX/Utilities",
+            inputs=[
+                io.Combo.Input("callback_type", options=["log", "progress", "none"], default="log"),
+            ],
+            outputs=[
+                io.Custom("ASDX_PREVIEW_HANDLE").Output(display_name="handle"),
+            ],
+        )
 
-    RETURN_TYPES = ("ASDX_PREVIEW_HANDLE",)
-    RETURN_NAMES = ("handle",)
-    FUNCTION = "register"
-    CATEGORY = "ASDX/Utilities"
+    @classmethod
+    def fingerprint_inputs(cls, callback_type: str) -> Any:
+        # Registration is a side effect (LivePreviewRegistry.clear() +
+        # register()) that must happen every run, not just the first time a
+        # given callback_type is queued -- same reasoning as
+        # ASDX_MemoryProfiler.fingerprint_inputs (memory.py).
+        import time
+        return time.time()
 
-    def register(self, callback_type: str) -> tuple[dict]:
+    @classmethod
+    def execute(cls, callback_type: str) -> io.NodeOutput:
         """Register a preview callback."""
         # Each run creates a brand-new closure, so the registry's own
         # dedup check (`if callback not in cls._callbacks`) never catches
@@ -132,15 +144,11 @@ class ASDX_LivePreview:
 
             LivePreviewRegistry.register(_cb)
 
-        return (handle,)
+        return io.NodeOutput(handle)
 
 
 # ── Node Mappings ─────────────────────────────────────────────────────
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_LivePreview": ASDX_LivePreview,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_LivePreview": "🍏 ASDX Live Preview",
-}
+NODE_LIST = [
+    ASDX_LivePreview,
+]

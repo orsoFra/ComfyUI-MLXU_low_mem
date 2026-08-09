@@ -23,11 +23,16 @@ root pending a revisit -- not deleted, just not registered/importable here.
 
 from __future__ import annotations
 
+from typing_extensions import override
+
+from comfy_api.latest import ComfyExtension, io
+
 __version__ = "0.2.1"
 
-_WEB_DIRECTORY = "web"
-
 # ── Node display names ────────────────────────────────────────────────
+# Only consulted on the dependency-missing fallback path below, where the
+# real node modules (and their own display_name= in define_schema) can't be
+# imported -- this is the sole remaining source of truth for those names.
 _DISPLAY = {
     # Core
     "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
@@ -36,10 +41,12 @@ _DISPLAY = {
     "ASDX_CLIPLoader": "🍏 ASDX CLIP Loader",
     "ASDX_CLIPTextEncode": "🍏 ASDX CLIP Text Encode",
     "ASDX_MLXSampler": "🍏 ASDX MLX Native Sampler",
+    "ASDX_VAELoader": "🍏 ASDX VAE Loader",
     "ASDX_VAEDecode": "🍏 ASDX VAE Decode (MLX)",
     "ASDX_VAEEncode": "🍏 ASDX VAE Encode (MLX)",
     "ASDX_EmptyLatent": "🍏 ASDX Empty Latent",
     "ASDX_MemoryProfiler": "🍏 ASDX Memory Profiler",
+    "ASDX_CacheManager": "🍏 ASDX Cache Manager",
     # Conditioning
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
     # LoRA
@@ -58,68 +65,44 @@ _DISPLAY = {
 }
 
 # ── Lazy import with graceful fallback ────────────────────────────────
+_UNAVAILABLE_REASON: str | None = None
 try:
-    from .loader import NODE_CLASS_MAPPINGS as _loader_maps
-    from .loader import NODE_DISPLAY_NAME_MAPPINGS as _loader_names
-    from .conditioning import NODE_CLASS_MAPPINGS as _cond_maps
-    from .conditioning import NODE_DISPLAY_NAME_MAPPINGS as _cond_names
-    from .sampler import NODE_CLASS_MAPPINGS as _sampler_maps
-    from .sampler import NODE_DISPLAY_NAME_MAPPINGS as _sampler_names
-    from .vae import NODE_CLASS_MAPPINGS as _vae_maps
-    from .vae import NODE_DISPLAY_NAME_MAPPINGS as _vae_names
-    from .latent import NODE_CLASS_MAPPINGS as _latent_maps
-    from .latent import NODE_DISPLAY_NAME_MAPPINGS as _latent_names
-    from .memory import NODE_CLASS_MAPPINGS as _mem_maps
-    from .memory import NODE_DISPLAY_NAME_MAPPINGS as _mem_names
-    from .lora import NODE_CLASS_MAPPINGS as _lora_maps
-    from .lora import NODE_DISPLAY_NAME_MAPPINGS as _lora_names
+    from .loader import NODE_LIST as _loader_nodes
+    from .conditioning import NODE_LIST as _cond_nodes
+    from .sampler import NODE_LIST as _sampler_nodes
+    from .vae import NODE_LIST as _vae_nodes
+    from .latent import NODE_LIST as _latent_nodes
+    from .memory import NODE_LIST as _mem_nodes
+    from .lora import NODE_LIST as _lora_nodes
 
     # Optional: image chain, depth map, live preview
     try:
-        from .image_chain import NODE_CLASS_MAPPINGS as _chain_maps
-        from .image_chain import NODE_DISPLAY_NAME_MAPPINGS as _chain_names
+        from .image_chain import NODE_LIST as _chain_nodes
     except Exception:
-        _chain_maps = {}
-        _chain_names = {}
+        _chain_nodes = []
 
     try:
-        from .depth_map import NODE_CLASS_MAPPINGS as _depth_maps
-        from .depth_map import NODE_DISPLAY_NAME_MAPPINGS as _depth_names
+        from .depth_map import NODE_LIST as _depth_nodes
     except Exception:
-        _depth_maps = {}
-        _depth_names = {}
+        _depth_nodes = []
 
     try:
-        from .live_preview import NODE_CLASS_MAPPINGS as _preview_maps
-        from .live_preview import NODE_DISPLAY_NAME_MAPPINGS as _preview_names
+        from .live_preview import NODE_LIST as _preview_nodes
     except Exception:
-        _preview_maps = {}
-        _preview_names = {}
+        _preview_nodes = []
 
-    NODE_CLASS_MAPPINGS = {
-        **_loader_maps,
-        **_cond_maps,
-        **_sampler_maps,
-        **_vae_maps,
-        **_latent_maps,
-        **_mem_maps,
-        **_lora_maps,
-        **_chain_maps,
-        **_depth_maps,
-        **_preview_maps,
-    }
-    NODE_DISPLAY_NAME_MAPPINGS = {
-        **_loader_names,
-        **_cond_names,
-        **_sampler_names,
-        **_vae_names,
-        **_latent_names,
-        **_mem_names,
-        **_lora_names,
-        **_chain_names,
-        **_depth_names,
-        **_preview_names,
-    }
+    _ALL_NODES: list[type[io.ComfyNode]] = [
+        *_loader_nodes,
+        *_cond_nodes,
+        *_sampler_nodes,
+        *_vae_nodes,
+        *_latent_nodes,
+        *_mem_nodes,
+        *_lora_nodes,
+        *_chain_nodes,
+        *_depth_nodes,
+        *_preview_nodes,
+    ]
 except ModuleNotFoundError as exc:
     # Allow import on non-macOS / non-MLX hosts (e.g. CI, Comfy Registry parser)
     _missing = {
@@ -127,31 +110,52 @@ except ModuleNotFoundError as exc:
         "huggingface_hub", "transformers", "comfy", "folder_paths",
     }
     if exc.name in _missing:
-        # Provide stub nodes that error at runtime with a helpful message
-        class _Unavailable:
-            CATEGORY = "ASDX/Utilities"
-            RETURN_TYPES = ()
-            FUNCTION = "_unavailable"
-            @classmethod
-            def INPUT_TYPES(cls):
-                return {"required": {}}
-            def _unavailable(self):
-                raise RuntimeError(
-                    "ASDX requires Apple Silicon MLX runtime dependencies. "
-                    "Install on macOS with: pip install mlx mlx-lm safetensors"
-                )
-
-        NODE_CLASS_MAPPINGS = {
-            name: type(name, (_Unavailable,), {"__doc__": None})
-            for name in _DISPLAY
-        }
-        NODE_DISPLAY_NAME_MAPPINGS = dict(_DISPLAY)
+        _ALL_NODES = []
+        _UNAVAILABLE_REASON = (
+            "ASDX requires Apple Silicon MLX runtime dependencies. "
+            "Install on macOS with: pip install mlx mlx-lm safetensors"
+        )
     else:
         raise
 
-__all__ = [
-    "NODE_CLASS_MAPPINGS",
-    "NODE_DISPLAY_NAME_MAPPINGS",
-    "_WEB_DIRECTORY",
-    "__version__",
-]
+
+def _make_unavailable_node(node_id: str, display_name: str) -> type[io.ComfyNode]:
+    """Build a stub node that errors at runtime with a helpful message,
+    used in place of the real nodes when required dependencies are missing.
+    """
+    class _Unavailable(io.ComfyNode):
+        @classmethod
+        def define_schema(cls) -> io.Schema:
+            return io.Schema(
+                node_id=node_id,
+                display_name=display_name,
+                category="ASDX/Utilities",
+                inputs=[],
+                outputs=[],
+            )
+
+        @classmethod
+        def execute(cls) -> io.NodeOutput:
+            raise RuntimeError(_UNAVAILABLE_REASON)
+
+    _Unavailable.__name__ = node_id
+    _Unavailable.__qualname__ = node_id
+    return _Unavailable
+
+
+class ASDXExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        if _UNAVAILABLE_REASON is not None:
+            return [
+                _make_unavailable_node(node_id, display_name)
+                for node_id, display_name in _DISPLAY.items()
+            ]
+        return _ALL_NODES
+
+
+async def comfy_entrypoint() -> ASDXExtension:
+    return ASDXExtension()
+
+
+__all__ = ["__version__"]

@@ -22,6 +22,8 @@ from typing import Any, Iterator
 import mlx.core as mx
 import torch
 
+from comfy_api.latest import io
+
 from . import bridge
 from .capability import CAPABILITY_PROFILES, CapabilityProfile, _resolve_capability_from_path
 from .memory_calibration import LoadShape, check_fits_or_warn
@@ -328,7 +330,7 @@ def _model_type_from_path(path: Path) -> str:
 
 # ── Node ──────────────────────────────────────────────────────────────
 
-class ASDX_DiffusionLoader:
+class ASDX_DiffusionLoader(io.ComfyNode):
     """Load a FLUX.1 diffusion model checkpoint into MLX.
 
     Reads the checkpoint, creates a FluxTransformer, and caches it.
@@ -336,27 +338,24 @@ class ASDX_DiffusionLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model_name": (cls._get_models(),),
-                "precision": (["float16", "bfloat16"], {"default": "float16"}),
-            },
-            "optional": {
-                "lora": ("ASDX_LORA", {"default": None}),
-                "controlnet": ("ASDX_CONTROLNET", {"default": None}),
-                "base_model": ("ASDX_MODEL", {"default": None}),
-                "low_memory_mode": ("BOOLEAN", {"default": False}),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-            },
-        }
-
-    RETURN_TYPES = ("asdx_model",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load"
-    CATEGORY = "ASDX/Loaders"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_DiffusionLoader",
+            display_name="🍏 ASDX Diffusion Loader",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("model_name", options=cls._get_models()),
+                io.Combo.Input("precision", options=["float16", "bfloat16"], default="float16"),
+                io.Custom("ASDX_LORA").Input("lora", optional=True),
+                io.Custom("ASDX_CONTROLNET").Input("controlnet", optional=True),
+                io.Custom("ASDX_MODEL").Input("base_model", optional=True),
+                io.Boolean.Input("low_memory_mode", default=False, optional=True),
+            ],
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+            ],
+            hidden=[io.Hidden.unique_id],
+        )
 
     @staticmethod
     def _get_models() -> list[str]:
@@ -376,16 +375,16 @@ class ASDX_DiffusionLoader:
             pass
         return ["flux1-dev-fp16.safetensors"]
 
-    def load(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model_name: str,
         precision: str,
-        unique_id: int | None = None,
         lora: str | None = None,
         controlnet: str | None = None,
         base_model: str | None = None,
         low_memory_mode: bool = False,
-    ) -> tuple[dict]:
+    ) -> io.NodeOutput:
         t0 = time.perf_counter()
 
         # Build composite cache key
@@ -402,7 +401,7 @@ class ASDX_DiffusionLoader:
         if cache_key in _MODEL_CACHE:
             cached = _MODEL_CACHE[cache_key]
             print(f"[ASDX] Model cache hit: {model_name} ({precision})")
-            return (cached,)
+            return io.NodeOutput(cached)
 
         # _MODEL_CACHE never evicted past entries -- switching the checkpoint
         # or precision across separate prompt runs in the same ComfyUI session
@@ -418,7 +417,7 @@ class ASDX_DiffusionLoader:
             bridge.clear_mlx_cache()
 
         # Find model file
-        path = self._resolve_model_path(model_name)
+        path = cls._resolve_model_path(model_name)
         model_type = _detect_model_type(path)
 
         # Resolve capability profile (see _capability_for_model_type).
@@ -461,7 +460,7 @@ class ASDX_DiffusionLoader:
               f"mem={mem['active_gb']:.1f}GB active, {mem['cache_gb']:.1f}GB cache)")
 
         _MODEL_CACHE[cache_key] = model_desc
-        return (model_desc,)
+        return io.NodeOutput(model_desc)
 
     @staticmethod
     def _resolve_model_path(name: str) -> Path:
@@ -489,7 +488,7 @@ class ASDX_DiffusionLoader:
 
 # ── Checkpoint Loader ────────────────────────────────────────────────────
 
-class ASDX_CheckpointLoader:
+class ASDX_CheckpointLoader(io.ComfyNode):
     """Load a full checkpoint (VAE + CLIP + Diffusion) into MLX.
 
     Reads the checkpoint, creates MLX model handles for the diffusion
@@ -498,18 +497,21 @@ class ASDX_CheckpointLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "ckpt_name": (cls._get_checkpoints(),),
-                "precision": (["float16", "bfloat16"], {"default": "float16"}),
-            },
-        }
-
-    RETURN_TYPES = ("asdx_model", "mlx_clip", "VAE")
-    RETURN_NAMES = ("model", "clip", "vae")
-    FUNCTION = "load"
-    CATEGORY = "ASDX/Loaders"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_CheckpointLoader",
+            display_name="🍏 ASDX Checkpoint Loader",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("ckpt_name", options=cls._get_checkpoints()),
+                io.Combo.Input("precision", options=["float16", "bfloat16"], default="float16"),
+            ],
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+                io.Custom("mlx_clip").Output(display_name="clip"),
+                io.Vae.Output(display_name="vae"),
+            ],
+        )
 
     @staticmethod
     def _get_checkpoints() -> list[str]:
@@ -523,11 +525,12 @@ class ASDX_CheckpointLoader:
             pass
         return ["flux1-dev-fp16.safetensors"]
 
-    def load(self, ckpt_name: str, precision: str) -> tuple[dict, dict, Any]:
+    @classmethod
+    def execute(cls, ckpt_name: str, precision: str) -> io.NodeOutput:
         t0 = time.perf_counter()
 
         # Resolve checkpoint path
-        path = self._resolve_checkpoint_path(ckpt_name)
+        path = cls._resolve_checkpoint_path(ckpt_name)
         model_type = _detect_model_type(path)
 
         # ASDX_CheckpointLoader has no low_memory_mode input, so gate with the
@@ -590,7 +593,7 @@ class ASDX_CheckpointLoader:
               f"(type={model_type}, precision={precision}, "
               f"mem={mem['active_gb']:.1f}GB active, {mem['cache_gb']:.1f}GB cache)")
 
-        return (model_desc, clip_desc, vae)
+        return io.NodeOutput(model_desc, clip_desc, vae)
 
     @staticmethod
     def _resolve_checkpoint_path(name: str) -> Path:
@@ -614,12 +617,7 @@ class ASDX_CheckpointLoader:
 
 # ── Node Mappings ─────────────────────────────────────────────────────
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_DiffusionLoader": ASDX_DiffusionLoader,
-    "ASDX_CheckpointLoader": ASDX_CheckpointLoader,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_DiffusionLoader": "🍏 ASDX Diffusion Loader",
-    "ASDX_CheckpointLoader": "🍏 ASDX Checkpoint Loader",
-}
+NODE_LIST = [
+    ASDX_DiffusionLoader,
+    ASDX_CheckpointLoader,
+]

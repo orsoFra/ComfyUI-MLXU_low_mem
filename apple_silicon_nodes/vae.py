@@ -12,6 +12,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from comfy_api.latest import io
+
 import mlx.core as mx
 import torch
 
@@ -23,7 +25,7 @@ _VAE_CACHE: dict[str, Any] = {}
 
 # ── VAE Loader ───────────────────────────────────────────────────────
 
-class ASDX_VAELoader:
+class ASDX_VAELoader(io.ComfyNode):
     """Load a standalone VAE checkpoint (e.g. ae.safetensors for FLUX.1,
     the Flux2/Krea2/Z-Image VAE, or a plain SDXL VAE file).
 
@@ -34,17 +36,18 @@ class ASDX_VAELoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "vae_name": (cls._get_vae_names(),),
-            },
-        }
-
-    RETURN_TYPES = ("VAE",)
-    RETURN_NAMES = ("vae",)
-    FUNCTION = "load"
-    CATEGORY = "ASDX/Loaders"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_VAELoader",
+            display_name="🍏 ASDX VAE Loader",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("vae_name", options=cls._get_vae_names()),
+            ],
+            outputs=[
+                io.Vae.Output(display_name="vae"),
+            ],
+        )
 
     @staticmethod
     def _get_vae_names() -> list[str]:
@@ -54,9 +57,10 @@ class ASDX_VAELoader:
         except Exception:
             return []
 
-    def load(self, vae_name: str) -> tuple[Any]:
+    @classmethod
+    def execute(cls, vae_name: str) -> io.NodeOutput:
         if vae_name in _VAE_CACHE:
-            return (_VAE_CACHE[vae_name],)
+            return io.NodeOutput(_VAE_CACHE[vae_name])
 
         import comfy.sd
         import comfy.utils
@@ -69,12 +73,12 @@ class ASDX_VAELoader:
 
         _VAE_CACHE[vae_name] = vae
         print(f"[ASDX] VAE loaded: {vae_name}")
-        return (vae,)
+        return io.NodeOutput(vae)
 
 
 # ── VAE Decode ───────────────────────────────────────────────────────
 
-class ASDX_VAEDecode:
+class ASDX_VAEDecode(io.ComfyNode):
     """Decode FLUX latents to images using MLX VAE.
 
     The VAE decoder runs entirely in MLX, only the final image tensor
@@ -82,20 +86,22 @@ class ASDX_VAEDecode:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "samples": ("LATENT",),
-                "vae": ("VAE",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_VAEDecode",
+            display_name="🍏 ASDX VAE Decode (MLX)",
+            category="ASDX/Latent",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Vae.Input("vae"),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-    FUNCTION = "decode"
-    CATEGORY = "ASDX/Latent"
-
-    def decode(self, samples: dict, vae: Any) -> tuple[torch.Tensor]:
+    @classmethod
+    def execute(cls, samples: dict, vae: Any) -> io.NodeOutput:
         # Get latent samples
         if not isinstance(samples, dict) or "samples" not in samples:
             raise RuntimeError("ASDX VAE Decode: expected LATENT input.")
@@ -109,9 +115,10 @@ class ASDX_VAEDecode:
         # SDXL (4ch) and Flux2 (128ch) already always used this real path.
         # Left `_decode_with_mlx_vae`/`mlx_vae.py` in place, just unreferenced
         # from here — a native MLX VAE decoder remains a separate future task.
-        return self._fallback_decode(latent, vae)
+        return io.NodeOutput(*cls._fallback_decode(latent, vae))
 
-    def _decode_with_mlx_vae(self, latent: mx.array) -> mx.array:
+    @staticmethod
+    def _decode_with_mlx_vae(latent: mx.array) -> mx.array:
         """Decode using MLX VAE.
 
         In production, this would use the native MLX VAE from sdmlx.
@@ -165,44 +172,47 @@ class ASDX_VAEDecode:
 
 # ── VAE Encode ───────────────────────────────────────────────────────
 
-class ASDX_VAEEncode:
+class ASDX_VAEEncode(io.ComfyNode):
     """Encode images to FLUX latents using MLX VAE.
 
     The encoding runs in MLX for Apple Silicon acceleration.
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pixels": ("IMAGE",),
-                "vae": ("VAE",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_VAEEncode",
+            display_name="🍏 ASDX VAE Encode (MLX)",
+            category="ASDX/Latent",
+            inputs=[
+                io.Image.Input("pixels"),
+                io.Vae.Input("vae"),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "encode"
-    CATEGORY = "ASDX/Latent"
-
-    def encode(self, pixels: torch.Tensor, vae: Any) -> tuple[dict]:
+    @classmethod
+    def execute(cls, pixels: torch.Tensor, vae: Any) -> io.NodeOutput:
         t0 = time.perf_counter()
 
         if pixels.ndim != 4:
             raise RuntimeError(f"ASDX VAE Encode: expected [B,H,W,C] image, got {pixels.shape}")
 
-        # Always use the real ComfyUI/PyTorch VAE, mirroring ASDX_VAEDecode.decode()
+        # Always use the real ComfyUI/PyTorch VAE, mirroring ASDX_VAEDecode.execute()
         # above: `_encode_with_mlx_vae()` below has no real weight loading -- it's an
         # untrained placeholder that silently returns the raw pixels (mislabeled as a
         # "latent") whenever the MLX encoder is unavailable, which it always is today.
-        latent_torch = self._fallback_encode(pixels, vae)
+        latent_torch = cls._fallback_encode(pixels, vae)
 
         elapsed = time.perf_counter() - t0
         print(f"[ASDX] VAE Encode: {latent_torch.shape}, {elapsed:.2f}s")
 
-        return ({"samples": latent_torch},)
+        return io.NodeOutput({"samples": latent_torch})
 
-    def _encode_with_mlx_vae(self, image: mx.array) -> mx.array:
+    @staticmethod
+    def _encode_with_mlx_vae(image: mx.array) -> mx.array:
         """Encode using MLX VAE encoder."""
         try:
             from .mlx_vae import get_vae_encoder
@@ -232,14 +242,8 @@ class ASDX_VAEEncode:
         return latent
 
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_VAELoader": ASDX_VAELoader,
-    "ASDX_VAEDecode": ASDX_VAEDecode,
-    "ASDX_VAEEncode": ASDX_VAEEncode,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_VAELoader": "🍏 ASDX VAE Loader",
-    "ASDX_VAEDecode": "🍏 ASDX VAE Decode (MLX)",
-    "ASDX_VAEEncode": "🍏 ASDX VAE Encode (MLX)",
-}
+NODE_LIST = [
+    ASDX_VAELoader,
+    ASDX_VAEDecode,
+    ASDX_VAEEncode,
+]

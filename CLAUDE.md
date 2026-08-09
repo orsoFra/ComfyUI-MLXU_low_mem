@@ -61,14 +61,21 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
 
 ## ComfyUI Architecture Standards
 
-1. **Custom Node Structure**:
-   * Follow standard ComfyUI conventions:
-     * `INPUT_TYPES(cls)` (class method with `required` and `optional` dicts).
-     * `RETURN_TYPES` (tuple of output types, e.g., `("IMAGE", "LATENT")`).
-     * `RETURN_NAMES` (optional tuple of strings).
-     * `FUNCTION` (string pointing to the main execution method).
-     * `CATEGORY` (logical grouping string).
-   * Expose `NODE_CLASS_MAPPINGS` and `NODE_DISPLAY_NAME_MAPPINGS` at module level.
+1. **Custom Node Structure (V3 API)**:
+   * All nodes inherit `io.ComfyNode` (`from comfy_api.latest import io`):
+     * `define_schema(cls) -> io.Schema` (classmethod; `node_id`, `display_name`,
+       `category`, `inputs=[...]`, `outputs=[...]`, `hidden=[...]`).
+     * `execute(cls, ...) -> io.NodeOutput` (classmethod, fixed name -- no `FUNCTION`
+       string, no instance state).
+     * Project-specific pseudo-types (`asdx_model`, `mlx_clip`, `mlx_conditioning`,
+       `mflux_image`, ...) use `io.Custom("type_name")`.
+   * Each node file exports a module-level `NODE_LIST` (list of node classes), merged
+     in `apple_silicon_nodes/__init__.py` into a single `ComfyExtension.get_node_list()`
+     via `comfy_entrypoint()` -- no `NODE_CLASS_MAPPINGS`/`INPUT_TYPES()`/`RETURN_TYPES`.
+   * Side-effecting utility nodes (memory profiler, cache clearer, live preview
+     registration) implement `fingerprint_inputs()` returning a fresh value (e.g.
+     `time.time()`) so ComfyUI doesn't silently serve a cached result instead of
+     re-running them.
 
 2. **Tensor Formats & Conventions**:
    * **ComfyUI Images**: `[B, H, W, C]` (Batch, Height, Width, Channels) as float32 tensors in range `[0.0, 1.0]`.

@@ -13,6 +13,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 import torch
+from comfy_api.latest import io
 
 
 # ── MFLUX_IMAGE dataclass ─────────────────────────────────────────────
@@ -74,7 +75,7 @@ class MFLUX_IMAGE:
 
 # ── Node: ImageToLatent ───────────────────────────────────────────────
 
-class ASDX_ImageToLatent:
+class ASDX_ImageToLatent(io.ComfyNode):
     """VAE-encode an image to latent, return MFLUX_IMAGE.
 
     Encodes a [B, H, W, C] image tensor to a [B, 16, H/8, W/8] FLUX
@@ -82,19 +83,21 @@ class ASDX_ImageToLatent:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_ImageToLatent",
+            display_name="🍏 ASDX Image → Latent",
+            category="ASDX/ImageChain",
+            inputs=[
+                io.Image.Input("image"),
+            ],
+            outputs=[
+                io.Custom("mflux_image").Output(display_name="image_latent"),
+            ],
+        )
 
-    RETURN_TYPES = ("mflux_image",)
-    RETURN_NAMES = ("image_latent",)
-    FUNCTION = "encode"
-    CATEGORY = "ASDX/ImageChain"
-
-    def encode(self, image: torch.Tensor) -> tuple[MFLUX_IMAGE]:
+    @classmethod
+    def execute(cls, image: torch.Tensor) -> io.NodeOutput:
         try:
             from . import bridge as mlx_bridge
             from .mlx_vae import MLXVAE
@@ -113,47 +116,50 @@ class ASDX_ImageToLatent:
                 np.array(latent.cpu().numpy(), dtype=np.float32)
             )
 
-            return (MFLUX_IMAGE(
+            return io.NodeOutput(MFLUX_IMAGE(
                 image=image,
                 latent=latent_pt,
                 source="input",
                 metadata={"width": image.shape[2], "height": image.shape[1]},
-            ),)
+            ))
         except Exception as e:
             print(f"[ASDX_ImageToLatent] Error: {e}")
             # Fallback: return image-only payload
-            return (MFLUX_IMAGE(image=image, source="input"),)
+            return io.NodeOutput(MFLUX_IMAGE(image=image, source="input"))
 
 
 # ── Node: MaskFromImage ───────────────────────────────────────────────
 
-class ASDX_MaskFromImage:
+class ASDX_MaskFromImage(io.ComfyNode):
     """Generate a binary mask from an image using threshold.
 
     Converts a grayscale or RGB image to a binary [0, 1] mask.
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "invert": ("BOOLEAN", {"default": False}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MaskFromImage",
+            display_name="🍏 ASDX Mask From Image",
+            category="ASDX/ImageChain",
+            inputs=[
+                io.Image.Input("image"),
+                io.Float.Input("threshold", default=0.5, min=0.0, max=1.0, step=0.01),
+                io.Boolean.Input("invert", default=False),
+            ],
+            outputs=[
+                io.Mask.Output(display_name="mask"),
+                io.Custom("mflux_image").Output(display_name="image_with_mask"),
+            ],
+        )
 
-    RETURN_TYPES = ("MASK", "mflux_image",)
-    RETURN_NAMES = ("mask", "image_with_mask",)
-    FUNCTION = "create"
-    CATEGORY = "ASDX/ImageChain"
-
-    def create(
-        self,
+    @classmethod
+    def execute(
+        cls,
         image: torch.Tensor,
         threshold: float,
         invert: bool,
-    ) -> tuple[torch.Tensor, MFLUX_IMAGE]:
+    ) -> io.NodeOutput:
         # Convert to grayscale if needed
         if image.ndim == 4 and image.shape[-1] > 1:
             mask = image.mean(dim=-1, keepdim=True).squeeze(-1)
@@ -175,35 +181,38 @@ class ASDX_MaskFromImage:
             source="mask",
             metadata={"threshold": threshold, "invert": invert},
         )
-        return (mask, payload)
+        return io.NodeOutput(mask, payload)
 
 
 # ── Node: MaskBlur ────────────────────────────────────────────────────
 
-class ASDX_MaskBlur:
+class ASDX_MaskBlur(io.ComfyNode):
     """Apply Gaussian blur to a mask for soft edges."""
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mask": ("MASK",),
-                "blur_radius": ("INT", {"default": 4, "min": 0, "max": 64}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MaskBlur",
+            display_name="🍏 ASDX Mask Blur",
+            category="ASDX/ImageChain",
+            inputs=[
+                io.Mask.Input("mask"),
+                io.Int.Input("blur_radius", default=4, min=0, max=64),
+            ],
+            outputs=[
+                io.Mask.Output(display_name="blurred_mask"),
+                io.Custom("mflux_image").Output(display_name="image_with_mask"),
+            ],
+        )
 
-    RETURN_TYPES = ("MASK", "mflux_image",)
-    RETURN_NAMES = ("blurred_mask", "image_with_mask",)
-    FUNCTION = "blur"
-    CATEGORY = "ASDX/ImageChain"
-
-    def blur(
-        self,
+    @classmethod
+    def execute(
+        cls,
         mask: torch.Tensor,
         blur_radius: int,
-    ) -> tuple[torch.Tensor, MFLUX_IMAGE]:
+    ) -> io.NodeOutput:
         if blur_radius <= 0:
-            return (mask, MFLUX_IMAGE(mask=mask, source="mask"))
+            return io.NodeOutput(mask, MFLUX_IMAGE(mask=mask, source="mask"))
 
         try:
             import torch.nn.functional as F
@@ -214,7 +223,7 @@ class ASDX_MaskBlur:
                 padded = F.pad(mask, (pad, pad, pad, pad), mode="reflect")
                 # 2D Gaussian blur via separable convolution
                 k_size = blur_radius if blur_radius % 2 == 1 else blur_radius + 1
-                kernel = self._gaussian_kernel(k_size, blur_radius / 3.0)
+                kernel = cls._gaussian_kernel(k_size, blur_radius / 3.0)
                 blurred = F.conv2d(
                     padded.unsqueeze(1), kernel, padding=k_size // 2
                 ).squeeze(1)
@@ -231,7 +240,7 @@ class ASDX_MaskBlur:
         elif blurred.ndim == 2:
             blurred = blurred.unsqueeze(0)
 
-        return (blurred, MFLUX_IMAGE(mask=blurred, source="mask_blur"))
+        return io.NodeOutput(blurred, MFLUX_IMAGE(mask=blurred, source="mask_blur"))
 
     @staticmethod
     def _gaussian_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
@@ -248,7 +257,7 @@ class ASDX_MaskBlur:
 
 # ── Node: ImageCompositor ─────────────────────────────────────────────
 
-class ASDX_ImageCompositor:
+class ASDX_ImageCompositor(io.ComfyNode):
     """Composite a generated image over an original using a mask.
 
     Implements mask-preserve compositing: where mask=1, keep the original;
@@ -256,26 +265,29 @@ class ASDX_ImageCompositor:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "original_image": ("IMAGE",),
-                "generated_image": ("IMAGE",),
-                "mask": ("MASK",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_ImageCompositor",
+            display_name="🍏 ASDX Image Compositor",
+            category="ASDX/ImageChain",
+            inputs=[
+                io.Image.Input("original_image"),
+                io.Image.Input("generated_image"),
+                io.Mask.Input("mask"),
+            ],
+            outputs=[
+                io.Image.Output(display_name="composited"),
+                io.Custom("mflux_image").Output(display_name="image_chain"),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE", "mflux_image",)
-    RETURN_NAMES = ("composited", "image_chain",)
-    FUNCTION = "composite"
-    CATEGORY = "ASDX/ImageChain"
-
-    def composite(
-        self,
+    @classmethod
+    def execute(
+        cls,
         original_image: torch.Tensor,
         generated_image: torch.Tensor,
         mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, MFLUX_IMAGE]:
+    ) -> io.NodeOutput:
         # Expand mask to match image dimensions
         if mask.ndim == 2:
             mask = mask.unsqueeze(-1).expand(-1, -1, original_image.shape[-1])
@@ -304,4 +316,12 @@ class ASDX_ImageCompositor:
             source="composited",
             metadata={"mask_used": True},
         )
-        return (composited, payload)
+        return io.NodeOutput(composited, payload)
+
+
+NODE_LIST = [
+    ASDX_ImageToLatent,
+    ASDX_MaskFromImage,
+    ASDX_MaskBlur,
+    ASDX_ImageCompositor,
+]

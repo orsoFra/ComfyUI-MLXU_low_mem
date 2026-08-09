@@ -13,6 +13,7 @@ Supports:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,8 +22,12 @@ from typing import Any
 import mlx.core as mx
 import torch
 
+from comfy_api.latest import io
+
 from . import bridge
+from .native import FluxTransformer
 from .native.safetensors_header import read_safetensors_header
+from .native.sdxl import UNetModel as SDXLUNetModel
 
 
 # ── LoRA↔model family compatibility ─────────────────────────────────
@@ -209,6 +214,120 @@ def base_lora_scale(alpha: float | None, rank: int) -> float:
     return alpha / max(rank, 1) if alpha is not None else 1.0
 
 
+# ── Diffusers/PEFT FLUX.1 LoRA key mapping ──────────────────────────────
+#
+# A diffusers-trained FLUX.1 LoRA (e.g. ai-toolkit, SimpleTuner, kohya's
+# sd-scripts diffusers mode) uses HF's `transformer_blocks`/
+# `single_transformer_blocks` naming with separate `to_q`/`to_k`/`to_v`
+# projections, not BFL's fused `double_blocks`/`single_blocks` `qkv`/
+# `linear1`. Ported directly from comfy's own `comfy/utils.py::
+# flux_to_diffusers` (the exact table comfy uses for this same file
+# convention) rather than guessed. comfy applies each component as an
+# independent sliced patch via `weight.narrow(dim, start, length)` because
+# each of q/k/v/mlp keeps its own (possibly different) LoRA rank and can't
+# be concatenated at the A/B stage -- `_assemble_fused_delta` below
+# reproduces that by zero-padding each already-computed (B @ A) delta to
+# the fused weight's full output width and concatenating.
+#
+# Native attribute names (see native/__init__.py's DoubleBlock/SingleBlock)
+# match the BFL checkpoint 1:1 EXCEPT the MLP layers, which are flat
+# `img_mlp_0`/`img_mlp_2` attributes (underscore) instead of a dotted
+# Sequential `img_mlp.0`/`img_mlp.2` -- see native/weight_map.py's own
+# docstring for the same rename applied at checkpoint-load time.
+_FLUX_DOUBLE_QKV_RE = re.compile(r"^double_blocks\.(\d+)\.(img_attn|txt_attn)\.qkv\.weight$")
+_FLUX_SINGLE_LINEAR1_RE = re.compile(r"^single_blocks\.(\d+)\.linear1\.weight$")
+_FLUX_DOUBLE_RENAME_RE = re.compile(r"^double_blocks\.(\d+)\.(.+)$")
+_FLUX_SINGLE_RENAME_RE = re.compile(r"^single_blocks\.(\d+)\.(.+)$")
+
+_FLUX_DOUBLE_DIFFUSERS_RENAME: dict[str, str] = {
+    "img_attn.proj.weight": "attn.to_out.0.weight",
+    "txt_attn.proj.weight": "attn.to_add_out.weight",
+    "img_mod.lin.weight": "norm1.linear.weight",
+    "txt_mod.lin.weight": "norm1_context.linear.weight",
+    "img_mlp_0.weight": "ff.net.0.proj.weight",
+    "img_mlp_2.weight": "ff.net.2.weight",
+    "txt_mlp_0.weight": "ff_context.net.0.proj.weight",
+    "txt_mlp_2.weight": "ff_context.net.2.weight",
+}
+_FLUX_SINGLE_DIFFUSERS_RENAME: dict[str, str] = {
+    "modulation.lin.weight": "norm.linear.weight",
+    "linear2.weight": "proj_out.weight",
+}
+
+
+def _assemble_fused_delta(
+    pieces: list[mx.array | None], lengths: list[int]
+) -> tuple[mx.array | None, int]:
+    """Concatenate disjoint per-slice LoRA deltas (q/k/v[/mlp]) into one
+    fused-weight delta. `pieces`/`lengths` are in output-axis order and
+    span the fused weight's full output width contiguously -- a missing
+    slice (LoRA doesn't target that component) becomes zeros so the
+    concatenation still lines up. Returns (delta, num_pieces_consumed) --
+    the count lets the caller's applied/total log line reflect actual raw
+    delta entries consumed, since one fused native key here can absorb
+    multiple raw file entries (e.g. 3 for a qkv projection).
+    """
+    consumed = sum(p is not None for p in pieces)
+    if consumed == 0:
+        return None, 0
+    in_features = next(p.shape[1] for p in pieces if p is not None)
+    dtype = next(p.dtype for p in pieces if p is not None)
+    blocks = [
+        p.astype(mx.float32) if p is not None else mx.zeros((length, in_features), dtype=mx.float32)
+        for p, length in zip(pieces, lengths)
+    ]
+    return mx.concatenate(blocks, axis=0).astype(dtype), consumed
+
+
+def _resolve_flux_diffusers_lora(
+    flat_key: str, deltas: dict[str, mx.array], hidden_dim: int, mlp_dim: int
+) -> tuple[mx.array | None, int]:
+    """Resolve a native FLUX.1 flat parameter key against a diffusers/PEFT-
+    style LoRA's already-computed per-component deltas (see module-level
+    comment above). Returns (None, 0) if `flat_key` has no diffusers
+    counterpart in `deltas` -- callers fall through to leaving the
+    parameter unchanged.
+    """
+    m = _FLUX_DOUBLE_QKV_RE.match(flat_key)
+    if m:
+        idx, stream = m.group(1), m.group(2)
+        sub_names = ("to_q", "to_k", "to_v") if stream == "img_attn" else \
+            ("add_q_proj", "add_k_proj", "add_v_proj")
+        pieces = [deltas.get(f"transformer_blocks.{idx}.attn.{name}.weight") for name in sub_names]
+        return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim])
+
+    m = _FLUX_SINGLE_LINEAR1_RE.match(flat_key)
+    if m:
+        idx = m.group(1)
+        pieces = [
+            deltas.get(f"single_transformer_blocks.{idx}.attn.to_q.weight"),
+            deltas.get(f"single_transformer_blocks.{idx}.attn.to_k.weight"),
+            deltas.get(f"single_transformer_blocks.{idx}.attn.to_v.weight"),
+            deltas.get(f"single_transformer_blocks.{idx}.proj_mlp.weight"),
+        ]
+        return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim, mlp_dim])
+
+    m = _FLUX_DOUBLE_RENAME_RE.match(flat_key)
+    if m:
+        idx, rest = m.group(1), m.group(2)
+        diffusers_suffix = _FLUX_DOUBLE_DIFFUSERS_RENAME.get(rest)
+        if diffusers_suffix is not None:
+            delta = deltas.get(f"transformer_blocks.{idx}.{diffusers_suffix}")
+            return delta, (1 if delta is not None else 0)
+        return None, 0
+
+    m = _FLUX_SINGLE_RENAME_RE.match(flat_key)
+    if m:
+        idx, rest = m.group(1), m.group(2)
+        diffusers_suffix = _FLUX_SINGLE_DIFFUSERS_RENAME.get(rest)
+        if diffusers_suffix is not None:
+            delta = deltas.get(f"single_transformer_blocks.{idx}.{diffusers_suffix}")
+            return delta, (1 if delta is not None else 0)
+        return None, 0
+
+    return None, 0
+
+
 def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any:
     """Patch a CLIP text encoder with a LoRA file.
 
@@ -223,13 +342,16 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
     are common (kohya `lora_te1_`/`lora_te2_` keys) and silently dropping
     them under-applies the LoRA's intended effect.
 
-    `raw` is filtered to drop `lora_unet_*` keys before the comfy call:
+    `raw` is filtered to drop transformer-only keys before the comfy call:
     with `model=None`, comfy's internal key_map only covers CLIP, so every
-    `lora_unet_*` key in the file (already applied separately by
+    transformer-side key in the file (already applied separately by
     `_apply_lora_to_transformer`) would otherwise log a spurious
     "lora key not loaded" warning -- for a real kohya SDXL LoRA (e.g.
     Illustrious) that is thousands of warning lines burying any genuine
-    CLIP-side mismatch.
+    CLIP-side mismatch. Covers both the kohya `lora_unet_*` convention and
+    the diffusers/PEFT FLUX convention (`transformer.{...}_blocks.*`) --
+    real CLIP LoRA keys use `lora_te*_`/`text_model.` naming, never a
+    `transformer.` prefix, so this can't drop a genuine CLIP-side key.
     """
     if clip is None or strength_clip == 0:
         return clip
@@ -237,14 +359,15 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
     import comfy.utils
 
     raw = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
-    raw = {k: v for k, v in raw.items() if not k.startswith("lora_unet_")}
+    raw = {k: v for k, v in raw.items()
+           if not k.startswith("lora_unet_") and not k.startswith("transformer.")}
     _, new_clip = comfy.sd.load_lora_for_models(None, clip, raw, 0.0, strength_clip)
     return new_clip if new_clip is not None else clip
 
 
 # ── LoRA Loader Node ─────────────────────────────────────────────────
 
-class ASDX_LoraLoader:
+class ASDX_LoraLoader(io.ComfyNode):
     """Load a LoRA adapter and apply it to a model.
 
     Supports standard LoRA (A/B matrices) and ComfyUI diff format.
@@ -252,23 +375,23 @@ class ASDX_LoraLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("asdx_model",),
-                "lora_name": (cls._get_loras(),),
-                "strength_model": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-            },
-            "optional": {
-                "clip": ("mlx_clip", {"default": None}),
-                "strength_clip": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-            },
-        }
-
-    RETURN_TYPES = ("asdx_model", "mlx_clip")
-    RETURN_NAMES = ("model", "clip")
-    FUNCTION = "load_lora"
-    CATEGORY = "ASDX/LoRA"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_LoraLoader",
+            display_name="🍏 ASDX LoRA Loader",
+            category="ASDX/LoRA",
+            inputs=[
+                io.Custom("asdx_model").Input("model"),
+                io.Combo.Input("lora_name", options=cls._get_loras()),
+                io.Float.Input("strength_model", default=1.0, min=-10.0, max=10.0, step=0.01),
+                io.Custom("mlx_clip").Input("clip", optional=True),
+                io.Float.Input("strength_clip", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
+            ],
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+                io.Custom("mlx_clip").Output(display_name="clip"),
+            ],
+        )
 
     @staticmethod
     def _get_loras() -> list[str]:
@@ -287,25 +410,26 @@ class ASDX_LoraLoader:
             pass
         return ["example_lora.safetensors"]
 
-    def load_lora(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model: dict,
         lora_name: str,
         strength_model: float,
         clip: Any = None,
         strength_clip: float = 1.0,
-    ) -> tuple[dict, Any]:
+    ) -> io.NodeOutput:
         """Load and apply a LoRA adapter to the model (and, if connected, the CLIP)."""
         t0 = time.perf_counter()
 
         transformer = model["transformer"]
-        lora_path = self._resolve_lora_path(lora_name)
+        lora_path = cls._resolve_lora_path(lora_name)
         _check_lora_compatibility(lora_path, model)
 
         # Load LoRA weights (alpha comes from the file itself, see
         # _load_lora_file -- matches real ComfyUI's LoraLoader, which has no
         # user-facing alpha widget either).
-        lora = self._load_lora_file(lora_path)
+        lora = cls._load_lora_file(lora_path)
 
         # Apply scale
         lora.scale = base_lora_scale(lora.alpha, lora.rank) * strength_model
@@ -313,7 +437,7 @@ class ASDX_LoraLoader:
         # Apply to transformer — returns a NEW transformer, the cached base
         # model (model["transformer"]) is never mutated (see
         # _apply_lora_to_transformer docstring).
-        new_transformer = self._apply_lora_to_transformer(transformer, lora, model["config"])
+        new_transformer = cls._apply_lora_to_transformer(transformer, lora, model["config"])
         new_model = {**model, "transformer": new_transformer}
 
         # The old (now-orphaned) transformer's arrays are unreferenced after
@@ -333,7 +457,7 @@ class ASDX_LoraLoader:
         print(f"[ASDX] LoRA '{lora_name}' applied: rank={lora.rank}, "
               f"scale={lora.scale:.4f}, {elapsed:.2f}s")
 
-        return (new_model, new_clip)
+        return io.NodeOutput(new_model, new_clip)
 
     @staticmethod
     def _load_lora_file(path: Path) -> LoRAAdapter:
@@ -519,10 +643,28 @@ class ASDX_LoraLoader:
         # FLUX/Krea2's native tree matches its checkpoint 1:1, so no un-
         # mapping is needed there (or if a future architecture needs one,
         # add it to that architecture's own weight_map.py, not here).
+        # isinstance, not type(...).__module__ string matching: ComfyUI's custom
+        # node loader imports this package under a name derived from its
+        # install path (`nodes.py::load_custom_node`'s `sys_module_name =
+        # module_path.replace(".", "_x_")`, using the FULL filesystem path, not
+        # "apple_silicon_nodes") -- a `__module__` string comparison silently
+        # never matches in a real ComfyUI install, only in a standalone script
+        # importing this package by its repo name. isinstance is immune to
+        # whatever name the outer package ends up loaded under, since the
+        # imported class objects here and the ones used to build `transformer`
+        # both resolve through the same relative-import chain.
         checkpoint_stem_fn = None
-        if type(transformer).__module__.startswith("apple_silicon_nodes.native.sdxl"):
+        if isinstance(transformer, SDXLUNetModel):
             from apple_silicon_nodes.native.sdxl.weight_map import native_key_to_checkpoint_stem
             checkpoint_stem_fn = native_key_to_checkpoint_stem
+
+        # BFL-native FLUX.1 (native/__init__.py's FluxTransformer -- Krea2 reuses
+        # this exact class, not flux2/sdxl/zimage which have their own) is the
+        # only family this diffusers/PEFT fallback covers -- see
+        # `_resolve_flux_diffusers_lora`'s module comment.
+        flux_diffusers_dims = None
+        if isinstance(transformer, FluxTransformer):
+            flux_diffusers_dims = (config.hidden_dim, config.mlp_dim)
 
         new_flat = []
         applied = 0
@@ -552,10 +694,17 @@ class ASDX_LoraLoader:
                 if checkpoint_stem_fn is not None:
                     stem = checkpoint_stem_fn(stem)
                 delta = lora.deltas.get(f"lora_unet_{stem.replace('.', '_')}.{suffix}")
+            consumed = 1 if delta is not None else 0
+            if delta is None and flux_diffusers_dims is not None:
+                # diffusers/PEFT FLUX.1 LoRA (transformer_blocks/
+                # single_transformer_blocks, separate to_q/to_k/to_v) -- see
+                # `_resolve_flux_diffusers_lora`.
+                hidden_dim, mlp_dim = flux_diffusers_dims
+                delta, consumed = _resolve_flux_diffusers_lora(flat_key, lora.deltas, hidden_dim, mlp_dim)
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)
                 new_flat.append((flat_key, value + delta_mapped * lora.scale))
-                applied += 1
+                applied += consumed
             else:
                 new_flat.append((flat_key, value))
 
@@ -591,7 +740,7 @@ class ASDX_LoraLoader:
 
 # ── Multi LoRA Loader ────────────────────────────────────────────────
 
-class ASDX_MultiLoraLoader:
+class ASDX_MultiLoraLoader(io.ComfyNode):
     """Load up to 5 LoRA adapters at once, each with its own on/off toggle
     and independent model/clip strengths.
 
@@ -599,33 +748,35 @@ class ASDX_MultiLoraLoader:
     Lora Loader (per-entry active toggle, separate strength_model/
     strength_clip) -- implemented with plain ComfyUI widgets rather than
     their dynamic add/remove JS/Vue frontends, since this project has no
-    web/ frontend infrastructure at all (`_WEB_DIRECTORY = "web"` is
-    declared in __init__.py but the directory doesn't exist).
+    web/ frontend infrastructure at all.
 
     Applies all LoRAs in a single pass for better performance.
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def define_schema(cls) -> io.Schema:
         loras = ASDX_LoraLoader._get_loras()
-        required = {"model": ("asdx_model",)}
+        inputs: list = [io.Custom("asdx_model").Input("model")]
         for i in range(1, 6):
-            required[f"lora{i}_enabled"] = ("BOOLEAN", {"default": False})
-            required[f"lora{i}_name"] = (loras,)
-            required[f"lora{i}_strength_model"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01})
-            required[f"lora{i}_strength_clip"] = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01})
-        return {
-            "required": required,
-            "optional": {"clip": ("mlx_clip", {"default": None})},
-        }
+            inputs.append(io.Boolean.Input(f"lora{i}_enabled", default=False))
+            inputs.append(io.Combo.Input(f"lora{i}_name", options=loras))
+            inputs.append(io.Float.Input(f"lora{i}_strength_model", default=1.0, min=-10.0, max=10.0, step=0.01))
+            inputs.append(io.Float.Input(f"lora{i}_strength_clip", default=1.0, min=-10.0, max=10.0, step=0.01))
+        inputs.append(io.Custom("mlx_clip").Input("clip", optional=True))
+        return io.Schema(
+            node_id="ASDX_MultiLoraLoader",
+            display_name="🍏 ASDX Multi LoRA Loader",
+            category="ASDX/LoRA",
+            inputs=inputs,
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+                io.Custom("mlx_clip").Output(display_name="clip"),
+            ],
+        )
 
-    RETURN_TYPES = ("asdx_model", "mlx_clip")
-    RETURN_NAMES = ("model", "clip")
-    FUNCTION = "load_loras"
-    CATEGORY = "ASDX/LoRA"
-
-    def load_loras(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model: dict,
         lora1_enabled: bool, lora1_name: str, lora1_strength_model: float, lora1_strength_clip: float,
         lora2_enabled: bool, lora2_name: str, lora2_strength_model: float, lora2_strength_clip: float,
@@ -633,7 +784,7 @@ class ASDX_MultiLoraLoader:
         lora4_enabled: bool, lora4_name: str, lora4_strength_model: float, lora4_strength_clip: float,
         lora5_enabled: bool, lora5_name: str, lora5_strength_model: float, lora5_strength_clip: float,
         clip: Any = None,
-    ) -> tuple[dict, Any]:
+    ) -> io.NodeOutput:
         """Apply up to 5 active LoRA adapters at once (and, if connected, the CLIP)."""
         entries = [
             (lora1_enabled, lora1_name, lora1_strength_model, lora1_strength_clip),
@@ -682,43 +833,44 @@ class ASDX_MultiLoraLoader:
 
         if not applied_any:
             print("[ASDX] MultiLoRA: no LoRAs to apply")
-            return (model, clip)
+            return io.NodeOutput(model, clip)
 
-        return ({**model, "transformer": transformer}, clip)
+        return io.NodeOutput({**model, "transformer": transformer}, clip)
 
 
 # ── LoRA Schedule (per-step strength modulation) ─────────────────────
 
-class ASDX_LoraSchedule:
+class ASDX_LoraSchedule(io.ComfyNode):
     """Schedule LoRA strength across sampling steps.
 
     Allows LoRA strength to vary per step (e.g., stronger at start, weaker at end).
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("asdx_model",),
-                "lora_name": (ASDX_LoraLoader._get_loras(),),
-                "strength_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "strength_end": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "strength_middle": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "strength_curve": (["linear", "cosine", "ease_in_out"],),
-            },
-            "optional": {
-                "clip": ("mlx_clip", {"default": None}),
-                "strength_clip": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_LoraSchedule",
+            display_name="🍏 ASDX LoRA Schedule",
+            category="ASDX/Advanced",
+            inputs=[
+                io.Custom("asdx_model").Input("model"),
+                io.Combo.Input("lora_name", options=ASDX_LoraLoader._get_loras()),
+                io.Float.Input("strength_start", default=1.0, min=0.0, max=10.0, step=0.01),
+                io.Float.Input("strength_end", default=0.5, min=0.0, max=10.0, step=0.01),
+                io.Float.Input("strength_middle", default=1.0, min=0.0, max=10.0, step=0.01),
+                io.Combo.Input("strength_curve", options=["linear", "cosine", "ease_in_out"], default="linear"),
+                io.Custom("mlx_clip").Input("clip", optional=True),
+                io.Float.Input("strength_clip", default=1.0, min=0.0, max=10.0, step=0.01, optional=True),
+            ],
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+                io.Custom("mlx_clip").Output(display_name="clip"),
+            ],
+        )
 
-    RETURN_TYPES = ("asdx_model", "mlx_clip")
-    RETURN_NAMES = ("model", "clip")
-    FUNCTION = "schedule_lora"
-    CATEGORY = "ASDX/Advanced"
-
-    def schedule_lora(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model: dict,
         lora_name: str,
         strength_start: float,
@@ -727,7 +879,7 @@ class ASDX_LoraSchedule:
         strength_curve: str,
         clip: Any = None,
         strength_clip: float = 1.0,
-    ) -> tuple[dict, Any]:
+    ) -> io.NodeOutput:
         """Attach LoRA schedule metadata to the model dict.
 
         The sampler reads this metadata and adjusts LoRA strength per step.
@@ -769,7 +921,7 @@ class ASDX_LoraSchedule:
         print(f"[ASDX] LoRA schedule: '{lora_name}' "
               f"start={strength_start:.2f} middle={strength_middle:.2f} end={strength_end:.2f}")
 
-        return (new_model, new_clip)
+        return io.NodeOutput(new_model, new_clip)
 
     @staticmethod
     def _compute_schedule_strength(
@@ -815,14 +967,8 @@ class ASDX_LoraSchedule:
 
 # ── Node Mappings ─────────────────────────────────────────────────────
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_LoraLoader": ASDX_LoraLoader,
-    "ASDX_MultiLoraLoader": ASDX_MultiLoraLoader,
-    "ASDX_LoraSchedule": ASDX_LoraSchedule,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_LoraLoader": "🍏 ASDX LoRA Loader",
-    "ASDX_MultiLoraLoader": "🍏 ASDX Multi LoRA Loader",
-    "ASDX_LoraSchedule": "🍏 ASDX LoRA Schedule",
-}
+NODE_LIST = [
+    ASDX_LoraLoader,
+    ASDX_MultiLoraLoader,
+    ASDX_LoraSchedule,
+]

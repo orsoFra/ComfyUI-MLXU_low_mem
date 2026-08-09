@@ -22,6 +22,8 @@ import torch
 import comfy.sd
 import comfy.text_encoders.krea2
 import comfy.utils
+from comfy_api.latest import io
+
 from . import bridge
 
 
@@ -68,7 +70,7 @@ def _clip_model_options(type_str: str) -> dict:
 
 # ── Dual CLIP Loader ─────────────────────────────────────────────────
 
-class ASDX_DualCLIPLoader:
+class ASDX_DualCLIPLoader(io.ComfyNode):
     """Load two CLIP text encoders for dual-CLIP architectures.
 
     Supports SDXL, SD3, FLUX, Hunyuan, HiDream, Kandinsky, LTXV, Newbie, ACE.
@@ -77,19 +79,20 @@ class ASDX_DualCLIPLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip_name1": (cls._get_clip_names(),),
-                "clip_name2": (cls._get_clip_names(),),
-                "type": (_DUAL_CLIP_TYPES, {"default": "flux"}),
-            },
-        }
-
-    RETURN_TYPES = ("mlx_clip",)
-    RETURN_NAMES = ("mlx_clip",)
-    FUNCTION = "load"
-    CATEGORY = "ASDX/Loaders"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_DualCLIPLoader",
+            display_name="🍏 ASDX Dual CLIP Loader",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("clip_name1", options=cls._get_clip_names()),
+                io.Combo.Input("clip_name2", options=cls._get_clip_names()),
+                io.Combo.Input("type", options=_DUAL_CLIP_TYPES, default="flux"),
+            ],
+            outputs=[
+                io.Custom("mlx_clip").Output(display_name="mlx_clip"),
+            ],
+        )
 
     @staticmethod
     def _get_clip_names() -> list[str]:
@@ -107,7 +110,8 @@ class ASDX_DualCLIPLoader:
         except Exception:
             return ["t5xxl.safetensors"]
 
-    def load(self, clip_name1: str, clip_name2: str, type: str) -> tuple[dict]:
+    @classmethod
+    def execute(cls, clip_name1: str, clip_name2: str, type: str) -> io.NodeOutput:
         cache_key = f"{clip_name1}:{clip_name2}:{type}"
 
         if cache_key not in _CLIP_CACHE:
@@ -120,8 +124,8 @@ class ASDX_DualCLIPLoader:
                 bridge.clear_mlx_cache()
 
             # Load the CLIP
-            clip_path1 = self._find_file("text_encoders", clip_name1)
-            clip_path2 = self._find_file("text_encoders", clip_name2)
+            clip_path1 = cls._find_file("text_encoders", clip_name1)
+            clip_path2 = cls._find_file("text_encoders", clip_name2)
             clip_type_enum = _clip_type_from_string(type)
 
             clip = comfy.sd.load_clip(
@@ -134,7 +138,7 @@ class ASDX_DualCLIPLoader:
             _CLIP_CACHE[cache_key] = clip
             print(f"[ASDX] Dual CLIP loaded: {clip_name1} + {clip_name2} (type={type})")
 
-        return (_CLIP_CACHE[cache_key],)
+        return io.NodeOutput(_CLIP_CACHE[cache_key])
 
     @staticmethod
     def _find_file(folder: str, name: str) -> str:
@@ -147,7 +151,7 @@ class ASDX_DualCLIPLoader:
 
 # ── CLIP Text Encode ─────────────────────────────────────────────────
 
-class ASDX_CLIPTextEncode:
+class ASDX_CLIPTextEncode(io.ComfyNode):
     """Encode text prompts to conditioning for any model type.
 
     Auto-detects FLUX vs SD-style encoding:
@@ -156,35 +160,40 @@ class ASDX_CLIPTextEncode:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mlx_clip": ("mlx_clip",),
-                "text": ("STRING", {"multiline": True, "default": ""}),
-            },
-            "optional": {
-                "t5xxl": ("STRING", {"multiline": True, "default": ""}),
-                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "image": ("IMAGE", {"tooltip": "Krea2 Identity Edit: source image, encoded "
-                                                "through the CLIP's vision tower alongside the "
-                                                "prompt (image-grounded conditioning). Ignored "
-                                                "for non-Krea2 CLIPs."}),
-                "grounding_px": ("INT", {"default": 768, "min": 0, "max": 4096, "step": 64,
-                                          "tooltip": "cap longest side fed to the vision tower; "
-                                                     "0 = native resolution"}),
-                "system_prompt": ("STRING", {"multiline": True, "default": "",
-                                              "tooltip": "advanced (optional): override the "
-                                                         "grounding system prompt (empty = "
-                                                         "training default). Steers what the "
-                                                         "vision encoder attends to, e.g. "
-                                                         "facial identity detail."}),
-            },
-        }
-
-    RETURN_TYPES = ("mlx_conditioning",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "encode"
-    CATEGORY = "ASDX/Conditioning"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_CLIPTextEncode",
+            display_name="🍏 ASDX CLIP Text Encode",
+            category="ASDX/Conditioning",
+            inputs=[
+                io.Custom("mlx_clip").Input("mlx_clip"),
+                io.String.Input("text", multiline=True, default=""),
+                io.String.Input("t5xxl", multiline=True, default="", optional=True),
+                io.Float.Input("guidance", default=3.5, min=0.0, max=100.0, step=0.1, optional=True),
+                io.Image.Input(
+                    "image", optional=True,
+                    tooltip="Krea2 Identity Edit: source image, encoded "
+                            "through the CLIP's vision tower alongside the "
+                            "prompt (image-grounded conditioning). Ignored "
+                            "for non-Krea2 CLIPs.",
+                ),
+                io.Int.Input(
+                    "grounding_px", default=768, min=0, max=4096, step=64, optional=True,
+                    tooltip="cap longest side fed to the vision tower; 0 = native resolution",
+                ),
+                io.String.Input(
+                    "system_prompt", multiline=True, default="", optional=True,
+                    tooltip="advanced (optional): override the "
+                            "grounding system prompt (empty = "
+                            "training default). Steers what the "
+                            "vision encoder attends to, e.g. "
+                            "facial identity detail.",
+                ),
+            ],
+            outputs=[
+                io.Custom("mlx_conditioning").Output(display_name="conditioning"),
+            ],
+        )
 
     @staticmethod
     def _prep_grounding_image(image: torch.Tensor, grounding_px: int) -> torch.Tensor:
@@ -199,8 +208,9 @@ class ASDX_CLIPTextEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(
-        self,
+    @classmethod
+    def execute(
+        cls,
         mlx_clip: Any,
         text: str,
         t5xxl: str = "",
@@ -208,7 +218,7 @@ class ASDX_CLIPTextEncode:
         image: torch.Tensor | None = None,
         grounding_px: int = 768,
         system_prompt: str = "",
-    ) -> tuple[dict]:
+    ) -> io.NodeOutput:
         if not isinstance(mlx_clip, comfy.sd.CLIP):
             raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
 
@@ -243,7 +253,7 @@ class ASDX_CLIPTextEncode:
             grounded = False
             if image is not None:
                 if isinstance(mlx_clip.tokenizer, comfy.text_encoders.krea2.Krea2Tokenizer):
-                    tokenize_kwargs["images"] = [self._prep_grounding_image(image, grounding_px)]
+                    tokenize_kwargs["images"] = [cls._prep_grounding_image(image, grounding_px)]
                     tokenize_kwargs["llama_template"] = _krea2_grounding_template(system_prompt)
                     grounded = True
                 else:
@@ -275,7 +285,7 @@ class ASDX_CLIPTextEncode:
             print(f"[ASDX] Text encoded (SD-style): {len(text)} chars, type=clip"
                   f"{', grounded on source image' if grounded else ''}")
 
-        return (result,)
+        return io.NodeOutput(result)
 
 
 # ── CLIP Types ────────────────────────────────────────────────────────
@@ -354,7 +364,7 @@ def _clip_type_from_string(s: str) -> Any:
     return getattr(comfy.sd.CLIPType, key, comfy.sd.CLIPType.STABLE_DIFFUSION)
 
 
-class ASDX_CLIPLoader:
+class ASDX_CLIPLoader(io.ComfyNode):
     """Load a single CLIP text encoder model.
 
     Supports all ComfyUI CLIP types: SD1.5, SDXL, Pony, SD3, FLUX, FLUX2,
@@ -363,18 +373,19 @@ class ASDX_CLIPLoader:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip_name": (cls._get_clip_names(),),
-                "type": (_SINGLE_CLIP_TYPES, {"default": "stable_diffusion"}),
-            },
-        }
-
-    RETURN_TYPES = ("mlx_clip",)
-    RETURN_NAMES = ("mlx_clip",)
-    FUNCTION = "load"
-    CATEGORY = "ASDX/Loaders"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_CLIPLoader",
+            display_name="🍏 ASDX CLIP Loader",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("clip_name", options=cls._get_clip_names()),
+                io.Combo.Input("type", options=_SINGLE_CLIP_TYPES, default="stable_diffusion"),
+            ],
+            outputs=[
+                io.Custom("mlx_clip").Output(display_name="mlx_clip"),
+            ],
+        )
 
     @staticmethod
     def _get_clip_names() -> list[str]:
@@ -384,18 +395,19 @@ class ASDX_CLIPLoader:
         except Exception:
             return ["clip_l.safetensors"]
 
-    def load(self, clip_name: str, type: str) -> tuple[dict]:
+    @classmethod
+    def execute(cls, clip_name: str, type: str) -> io.NodeOutput:
         cache_key = f"{clip_name}:{type}"
 
         if cache_key not in _CLIP_CACHE:
-            # See ASDX_DualCLIPLoader.load for why prior entries are evicted
-            # here (shared _CLIP_CACHE, same one-active-entry policy as
-            # loader.py's _MODEL_CACHE).
+            # See ASDX_DualCLIPLoader.execute for why prior entries are
+            # evicted here (shared _CLIP_CACHE, same one-active-entry policy
+            # as loader.py's _MODEL_CACHE).
             if _CLIP_CACHE:
                 _CLIP_CACHE.clear()
                 bridge.clear_mlx_cache()
 
-            clip_path = self._find_file("text_encoders", clip_name)
+            clip_path = cls._find_file("text_encoders", clip_name)
             clip_type_enum = _clip_type_from_string(type)
 
             clip = comfy.sd.load_clip(
@@ -408,7 +420,7 @@ class ASDX_CLIPLoader:
             _CLIP_CACHE[cache_key] = clip
             print(f"[ASDX] CLIP loaded: {clip_name} (type={type})")
 
-        return (_CLIP_CACHE[cache_key],)
+        return io.NodeOutput(_CLIP_CACHE[cache_key])
 
     @staticmethod
     def _find_file(folder: str, name: str) -> str:
@@ -421,7 +433,7 @@ class ASDX_CLIPLoader:
 
 # ── Conditioning Merger ──────────────────────────────────────────────
 
-class ASDX_ConditioningMerger:
+class ASDX_ConditioningMerger(io.ComfyNode):
     """Merge two conditioning inputs into one.
 
     Useful for combining positive and negative conditioning, or for
@@ -429,20 +441,26 @@ class ASDX_ConditioningMerger:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "positive": ("CONDITIONING,mlx_conditioning",),
-                "negative": ("CONDITIONING,mlx_conditioning",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_ConditioningMerger",
+            display_name="🍏 ASDX Conditioning Merger",
+            category="ASDX/Conditioning",
+            inputs=[
+                io.MultiType.Input(
+                    "positive", types=[io.Conditioning, io.Custom("mlx_conditioning")],
+                ),
+                io.MultiType.Input(
+                    "negative", types=[io.Conditioning, io.Custom("mlx_conditioning")],
+                ),
+            ],
+            outputs=[
+                io.Custom("mlx_conditioning").Output(display_name="conditioning"),
+            ],
+        )
 
-    RETURN_TYPES = ("mlx_conditioning",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "merge"
-    CATEGORY = "ASDX/Conditioning"
-
-    def merge(self, positive: Any, negative: Any) -> tuple[dict]:
+    @classmethod
+    def execute(cls, positive: Any, negative: Any) -> io.NodeOutput:
         """Merge conditioning - for FLUX, negative is typically ignored but accepted for compatibility."""
         # FLUX doesn't use negative conditioning in the traditional sense
         # Store both for compatibility but sampler will use positive
@@ -451,19 +469,12 @@ class ASDX_ConditioningMerger:
             "conditioning": positive,
         }
         result["_negative"] = negative
-        return (result,)
+        return io.NodeOutput(result)
 
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_DualCLIPLoader": ASDX_DualCLIPLoader,
-    "ASDX_CLIPLoader": ASDX_CLIPLoader,
-    "ASDX_CLIPTextEncode": ASDX_CLIPTextEncode,
-    "ASDX_ConditioningMerger": ASDX_ConditioningMerger,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_DualCLIPLoader": "🍏 ASDX Dual CLIP Loader",
-    "ASDX_CLIPLoader": "🍏 ASDX CLIP Loader",
-    "ASDX_CLIPTextEncode": "🍏 ASDX CLIP Text Encode",
-    "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
-}
+NODE_LIST = [
+    ASDX_DualCLIPLoader,
+    ASDX_CLIPLoader,
+    ASDX_CLIPTextEncode,
+    ASDX_ConditioningMerger,
+]

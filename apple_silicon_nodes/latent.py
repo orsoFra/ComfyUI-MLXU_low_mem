@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 import comfy.model_management
+from comfy_api.latest import io
 
 
 # ── Resolution presets ───────────────────────────────────────────────
@@ -32,7 +33,7 @@ _RESOLUTION_PRESETS = {
 }
 
 
-class ASDX_EmptyLatent:
+class ASDX_EmptyLatent(io.ComfyNode):
     """Create an empty latent tensor for FLUX/Krea2/Z-Image, Flux2/Klein, or SDXL.
 
     The latent is placed on the appropriate device (MPS when available)
@@ -50,32 +51,38 @@ class ASDX_EmptyLatent:
     }
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "width": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 16}),
-                "height": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 16}),
-                "batch_size": ("INT", {"default": 1, "min": 1, "max": 8}),
-            },
-            "optional": {
-                "aspect_ratio": (["auto"] + list(_RESOLUTION_PRESETS.keys()), {"default": "auto"}),
-                "latent_format": (list(cls._LATENT_FORMATS.keys()), {"default": "flux"}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_EmptyLatent",
+            display_name="🍏 ASDX Empty Latent",
+            category="ASDX/Latent",
+            inputs=[
+                io.Int.Input("width", default=1024, min=64, max=2048, step=16),
+                io.Int.Input("height", default=1024, min=64, max=2048, step=16),
+                io.Int.Input("batch_size", default=1, min=1, max=8),
+                io.Combo.Input(
+                    "aspect_ratio", options=["auto"] + list(_RESOLUTION_PRESETS.keys()),
+                    default="auto", optional=True,
+                ),
+                io.Combo.Input(
+                    "latent_format", options=list(cls._LATENT_FORMATS.keys()),
+                    default="flux", optional=True,
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "generate"
-    CATEGORY = "ASDX/Latent"
-
-    def generate(
-        self,
+    @classmethod
+    def execute(
+        cls,
         width: int,
         height: int,
         batch_size: int,
         aspect_ratio: str = "auto",
         latent_format: str = "flux",
-    ) -> tuple[dict]:
+    ) -> io.NodeOutput:
         # Apply aspect ratio preset if selected
         if aspect_ratio != "auto" and aspect_ratio in _RESOLUTION_PRESETS:
             width, height = _RESOLUTION_PRESETS[aspect_ratio]
@@ -84,10 +91,10 @@ class ASDX_EmptyLatent:
         width = (width // 16) * 16
         height = (height // 16) * 16
 
-        channels, downscale = self._LATENT_FORMATS.get(latent_format, self._LATENT_FORMATS["flux"])
+        channels, downscale = cls._LATENT_FORMATS.get(latent_format, cls._LATENT_FORMATS["flux"])
 
         # Create latent on MPS device for zero-copy with sampler
-        device = self._get_device()
+        device = cls._get_device()
         latent = torch.zeros(
             [batch_size, channels, height // downscale, width // downscale],
             device=device,
@@ -97,7 +104,7 @@ class ASDX_EmptyLatent:
         print(f"[ASDX] Empty Latent ({latent_format}): {width}x{height}, batch={batch_size}, "
               f"latent_shape=[{batch_size}, {channels}, {height//downscale}, {width//downscale}]")
 
-        return ({"samples": latent, "downscale_ratio_spacial": downscale},)
+        return io.NodeOutput({"samples": latent, "downscale_ratio_spacial": downscale})
 
     @staticmethod
     def _get_device() -> torch.device:
@@ -111,10 +118,6 @@ class ASDX_EmptyLatent:
         return torch.device("cpu")
 
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_EmptyLatent": ASDX_EmptyLatent,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_EmptyLatent": "🍏 ASDX Empty Latent",
-}
+NODE_LIST = [
+    ASDX_EmptyLatent,
+]

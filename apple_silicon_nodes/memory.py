@@ -14,13 +14,15 @@ import gc
 import time
 from typing import Any
 
+from comfy_api.latest import io
+
 import mlx.core as mx
 import torch
 
 
 # ── Memory Profiler ───────────────────────────────────────────────────
 
-class ASDX_MemoryProfiler:
+class ASDX_MemoryProfiler(io.ComfyNode):
     """Profile and display Apple Silicon Unified Memory usage.
 
     Reports:
@@ -34,30 +36,43 @@ class ASDX_MemoryProfiler:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "mode": (["snapshot", "alloc", "free"], {
-                    "default": "snapshot",
-                    "description": "snapshot: read stats, alloc: trigger allocation, free: clear caches"
-                }),
-                "alloc_mb": ("INT", {"default": 256, "min": 0, "max": 8192, "step": 64}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MemoryProfiler",
+            display_name="🍏 ASDX Memory Profiler",
+            category="ASDX/Utilities",
+            inputs=[
+                io.Combo.Input(
+                    "mode", options=["snapshot", "alloc", "free"], default="snapshot",
+                    tooltip="snapshot: read stats, alloc: trigger allocation, free: clear caches",
+                ),
+                io.Int.Input("alloc_mb", default=256, min=0, max=8192, step=64),
+            ],
+            outputs=[
+                io.String.Output(display_name="report"),
+                io.Float.Output(display_name="active_gb"),
+                io.Float.Output(display_name="cache_gb"),
+                io.Float.Output(display_name="peak_gb"),
+            ],
+        )
 
-    RETURN_TYPES = ("STRING", "FLOAT", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("report", "active_gb", "cache_gb", "peak_gb")
-    FUNCTION = "profile"
-    CATEGORY = "ASDX/Utilities"
+    @classmethod
+    def fingerprint_inputs(cls, mode: str, alloc_mb: int) -> Any:
+        # A memory snapshot must be taken fresh on every run -- if ComfyUI
+        # reused a cached result because mode/alloc_mb didn't change, the
+        # reported stats would silently go stale instead of reflecting the
+        # current session's actual memory state.
+        return time.time()
 
-    def profile(self, mode: str, alloc_mb: int) -> tuple[str, float, float, float]:
+    @classmethod
+    def execute(cls, mode: str, alloc_mb: int) -> io.NodeOutput:
         if mode == "alloc":
             # Allocate some memory to trigger reporting
             dummy = mx.zeros((alloc_mb * 1024 * 1024 // 4,))  # int32
             mx.eval(dummy)
             del dummy
 
-        stats = self._collect_stats()
+        stats = cls._collect_stats()
 
         report_lines = [
             f"=== ASDX Memory Report [{mode}] ===",
@@ -68,7 +83,7 @@ class ASDX_MemoryProfiler:
         ]
 
         if torch.backends.mps.is_available():
-            stats_torch = self._torch_mps_stats()
+            stats_torch = cls._torch_mps_stats()
             report_lines.extend([
                 f"MPS Allocated: {stats_torch['allocated_gb']:.2f} GB",
                 f"MPS Cached:    {stats_torch['cached_gb']:.2f} GB",
@@ -86,14 +101,15 @@ class ASDX_MemoryProfiler:
         report = "\n".join(report_lines)
         print(report)
 
-        return (
+        return io.NodeOutput(
             report,
             stats['mlx_active_gb'],
             stats['mlx_cache_gb'],
             stats['mlx_peak_gb'],
         )
 
-    def _collect_stats(self) -> dict[str, float]:
+    @staticmethod
+    def _collect_stats() -> dict[str, float]:
         """Collect MLX memory statistics."""
         active = mx.get_active_memory() / (1024 ** 3)
         cache = mx.get_cache_memory() / (1024 ** 3)
@@ -123,7 +139,7 @@ class ASDX_MemoryProfiler:
 
 # ── Cache Clearer (utility) ──────────────────────────────────────────
 
-class ASDX_CacheManager:
+class ASDX_CacheManager(io.ComfyNode):
     """Clear MLX and PyTorch MPS caches.
 
     Use between major workflow phases (e.g., after loading a model,
@@ -131,21 +147,30 @@ class ASDX_CacheManager:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clear_mlx": ("BOOLEAN", {"default": True}),
-                "clear_mps": ("BOOLEAN", {"default": True}),
-                "gc_collect": ("BOOLEAN", {"default": True}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_CacheManager",
+            display_name="🍏 ASDX Cache Manager",
+            category="ASDX/Utilities",
+            inputs=[
+                io.Boolean.Input("clear_mlx", default=True),
+                io.Boolean.Input("clear_mps", default=True),
+                io.Boolean.Input("gc_collect", default=True),
+            ],
+            outputs=[
+                io.String.Output(display_name="report"),
+            ],
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("report",)
-    FUNCTION = "clear"
-    CATEGORY = "ASDX/Utilities"
+    @classmethod
+    def fingerprint_inputs(cls, clear_mlx: bool, clear_mps: bool, gc_collect: bool) -> Any:
+        # Cache-clearing is a side effect that must run every time this node
+        # executes, not just the first time a given combination of booleans
+        # is queued -- see ASDX_MemoryProfiler.fingerprint_inputs above.
+        return time.time()
 
-    def clear(self, clear_mlx: bool, clear_mps: bool, gc_collect: bool) -> tuple[str]:
+    @classmethod
+    def execute(cls, clear_mlx: bool, clear_mps: bool, gc_collect: bool) -> io.NodeOutput:
         freed = []
 
         if clear_mlx:
@@ -167,15 +192,10 @@ class ASDX_CacheManager:
         report = f"[ASDX] Cache cleared: {'; '.join(freed)}"
         print(report)
 
-        return (report,)
+        return io.NodeOutput(report)
 
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_MemoryProfiler": ASDX_MemoryProfiler,
-    "ASDX_CacheManager": ASDX_CacheManager,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_MemoryProfiler": "🍏 ASDX Memory Profiler",
-    "ASDX_CacheManager": "🍏 ASDX Cache Manager",
-}
+NODE_LIST = [
+    ASDX_MemoryProfiler,
+    ASDX_CacheManager,
+]

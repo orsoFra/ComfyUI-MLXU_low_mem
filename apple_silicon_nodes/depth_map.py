@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from comfy_api.latest import io
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ _DEPTH_CACHE: dict[str, Any] = {}
 
 # ── Node ───────────────────────────────────────────────────────────────
 
-class ASDX_DepthMap:
+class ASDX_DepthMap(io.ComfyNode):
     """Generate a depth map from an RGB image.
 
     Uses a pre-trained depth estimation model (DepthPro or similar)
@@ -33,26 +34,26 @@ class ASDX_DepthMap:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-            },
-            "optional": {
-                "resolution": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 64}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_DepthMap",
+            display_name="🍏 ASDX Depth Map",
+            category="ASDX/Depth",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("resolution", default=1024, min=256, max=2048, step=64, optional=True),
+            ],
+            outputs=[
+                io.Custom("mflux_image").Output(display_name="depth_image"),
+            ],
+        )
 
-    RETURN_TYPES = ("mflux_image",)
-    RETURN_NAMES = ("depth_image",)
-    FUNCTION = "generate"
-    CATEGORY = "ASDX/Depth"
-
-    def generate(
-        self,
+    @classmethod
+    def execute(
+        cls,
         image: torch.Tensor,
         resolution: int = 1024,
-    ) -> tuple[Any]:
+    ) -> io.NodeOutput:
         """Generate depth map from image.
 
         Returns a MFLUX_IMAGE with the depth map in the depth_map field.
@@ -60,19 +61,20 @@ class ASDX_DepthMap:
         from .image_chain import MFLUX_IMAGE
 
         try:
-            depth_array = self._run_depth_model(image, resolution)
-            return (MFLUX_IMAGE(
+            depth_array = cls._run_depth_model(image, resolution)
+            return io.NodeOutput(MFLUX_IMAGE(
                 image=image,
                 depth_map=depth_array,
                 source="depth",
                 metadata={"resolution": resolution},
-            ),)
+            ))
         except Exception as e:
             logger.error("ASDX_DepthMap failed: %s", e)
             # Fallback: return image-only payload
-            return (MFLUX_IMAGE(image=image, source="depth_error"),)
+            return io.NodeOutput(MFLUX_IMAGE(image=image, source="depth_error"))
 
-    def _run_depth_model(self, image: torch.Tensor, resolution: int) -> Any:
+    @classmethod
+    def _run_depth_model(cls, image: torch.Tensor, resolution: int) -> Any:
         """Run depth estimation on the image.
 
         Tries multiple backends in order:
@@ -83,14 +85,14 @@ class ASDX_DepthMap:
         """
         # Try transformers + DepthPro first
         try:
-            return self._depth_pro_depth(image, resolution)
+            return cls._depth_pro_depth(image, resolution)
         except ImportError:
             logger.debug("DepthPro not available, using fallback")
         except Exception as e:
             logger.debug("DepthPro failed: %s, using fallback", e)
 
         # Fallback: compute a simple depth approximation from luminance
-        return self._fallback_depth(image, resolution)
+        return cls._fallback_depth(image, resolution)
 
     @staticmethod
     def _depth_pro_depth(image: torch.Tensor, resolution: int) -> Any:
@@ -214,10 +216,6 @@ class ASDX_DepthMap:
 
 # ── Node Mappings ─────────────────────────────────────────────────────
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_DepthMap": ASDX_DepthMap,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_DepthMap": "🍏 ASDX Depth Map",
-}
+NODE_LIST = [
+    ASDX_DepthMap,
+]

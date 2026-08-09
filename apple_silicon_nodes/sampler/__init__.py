@@ -16,10 +16,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from comfy_api.latest import io
 
 from .. import metadata as metadata_util
-from . import bridge
+from . import bridge, solvers
 from .core import _SamplerCore
+from .scheduling import SCHEDULER_NAMES
 
 
 # ── Preview cache ─────────────────────────────────────────────────────
@@ -29,7 +31,7 @@ _PREVIEW_CACHE: dict[str, Any] = {}
 
 # ── Sampler Node ──────────────────────────────────────────────────────
 
-class ASDX_MLXSampler:
+class ASDX_MLXSampler(io.ComfyNode):
     """MLX-native FLUX sampler with SeaCache acceleration.
 
     Runs the full denoising loop in MLX, only bridging to PyTorch
@@ -37,71 +39,82 @@ class ASDX_MLXSampler:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("asdx_model",),
-                "positive": ("mlx_conditioning",),
-                "latent_image": ("LATENT",),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
-                                 "control_after_generate": True}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 20.0, "step": 0.1}),
-                "teacache": ("BOOLEAN", {"default": False}),
-                "teacache_threshold": ("FLOAT", {"default": 0.08, "min": 0.01, "max": 1.0, "step": 0.01}),
-                "kontext": ("BOOLEAN", {"default": False}),
-                "kontext_reference_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "seacache": ("BOOLEAN", {"default": False}),
-                "preview": ("BOOLEAN", {"default": False}),
-                "low_memory_mode": ("BOOLEAN", {"default": False}),
-                "save_metadata": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MLXSampler",
+            display_name="🍏 ASDX MLX Native Sampler",
+            category="ASDX/Sampling",
+            inputs=[
+                io.Custom("asdx_model").Input("model"),
+                io.Custom("mlx_conditioning").Input("positive"),
+                io.Latent.Input("latent_image"),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
+                             control_after_generate=True),
+                io.Int.Input("steps", default=20, min=1, max=100),
+                io.Combo.Input("sampler_name", options=solvers.SAMPLER_NAMES, default="euler"),
+                io.Combo.Input("scheduler_name", options=SCHEDULER_NAMES, default="normal"),
+                io.Float.Input("guidance", default=3.5, min=0.0, max=20.0, step=0.1),
+                io.Boolean.Input("teacache", default=False),
+                io.Float.Input("teacache_threshold", default=0.08, min=0.01, max=1.0, step=0.01),
+                io.Boolean.Input("kontext", default=False),
+                io.Float.Input("kontext_reference_strength", default=1.0, min=0.0, max=2.0, step=0.01),
+                io.Boolean.Input("seacache", default=False),
+                io.Boolean.Input("preview", default=False),
+                io.Boolean.Input("low_memory_mode", default=False),
+                io.Boolean.Input("save_metadata", default=False),
                 # Kontext reference — only meaningful when "kontext" above is
-                # True; must live here (not "required") so the graph doesn't
-                # force a link on every generation, including non-Kontext ones.
-                "kontext_reference_latent": ("LATENT", {"default": None}),
+                # True; must be optional so the graph doesn't force a link on
+                # every generation, including non-Kontext ones.
+                io.Latent.Input("kontext_reference_latent", optional=True),
                 # Mode routing (Phase 2)
-                "mode": (["auto", "text2img", "img2img", "inpaint", "fill", "depth"],
-                         {"default": "auto"}),
-                "image": ("IMAGE", {"default": None}),
-                "mask": ("MASK", {"default": None}),
-                "image_strength": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mask_blur": ("INT", {"default": 0, "min": 0, "max": 64}),
-                "mask_padding": ("INT", {"default": 48, "min": 32, "max": 256}),
-                "depth_image": ("IMAGE", {"default": None}),
-                "depth_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "noise_aug": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                io.Combo.Input(
+                    "mode",
+                    options=["auto", "text2img", "img2img", "inpaint", "fill", "depth"],
+                    default="auto", optional=True,
+                ),
+                io.Image.Input("image", optional=True),
+                io.Mask.Input("mask", optional=True),
+                io.Float.Input("image_strength", default=0.8, min=0.0, max=1.0, step=0.01, optional=True),
+                io.Int.Input("mask_blur", default=0, min=0, max=64, optional=True),
+                io.Int.Input("mask_padding", default=48, min=32, max=256, optional=True),
+                io.Image.Input("depth_image", optional=True),
+                io.Float.Input("depth_strength", default=1.0, min=0.0, max=2.0, step=0.01, optional=True),
+                io.Float.Input("noise_aug", default=0.0, min=0.0, max=1.0, step=0.01, optional=True),
                 # Krea2 Identity Edit
-                "source_latent": ("LATENT", {"default": None}),
-                "ref_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01,
-                                          "tooltip": "reference-fidelity dial: multiplies target->source attention. "
-                                                     "1.0 = off, >1 pulls harder toward the source's appearance."}),
-                "krea2_enhancer_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                                          "tooltip": "Krea2-only: community txtfusion conditioning-strength "
-                                                     "boost (ported from ComfyUI-Krea2T-Enhancer). 0 = off "
-                                                     "(vanilla Krea2, weaker prompt adherence and lower final "
-                                                     "latent amplitude); 1.0 matches the reference node's "
-                                                     "default (max -- only strength=1.0 has been verified "
-                                                     "NaN/overflow-safe against the real node). No effect on "
-                                                     "non-Krea2 models."}),
+                io.Latent.Input("source_latent", optional=True),
+                io.Float.Input(
+                    "ref_boost", default=1.0, min=0.0, max=1000.0, step=0.01, optional=True,
+                    tooltip="reference-fidelity dial: multiplies target->source attention. "
+                            "1.0 = off, >1 pulls harder toward the source's appearance.",
+                ),
+                io.Float.Input(
+                    "krea2_enhancer_strength", default=1.0, min=0.0, max=1.0, step=0.05, optional=True,
+                    tooltip="Krea2-only: community txtfusion conditioning-strength "
+                            "boost (ported from ComfyUI-Krea2T-Enhancer). 0 = off "
+                            "(vanilla Krea2, weaker prompt adherence and lower final "
+                            "latent amplitude); 1.0 matches the reference node's "
+                            "default (max -- only strength=1.0 has been verified "
+                            "NaN/overflow-safe against the real node). No effect on "
+                            "non-Krea2 models.",
+                ),
                 # Legacy
-                "lora_schedule": ("ASDX_LORA_SCHEDULE", {"default": None}),
-            },
-        }
+                io.Custom("ASDX_LORA_SCHEDULE").Input("lora_schedule", optional=True),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "sample"
-    CATEGORY = "ASDX/Sampling"
-
-    def sample(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model: dict,
         positive: dict,
         latent_image: dict,
         seed: int,
         steps: int,
+        sampler_name: str,
+        scheduler_name: str,
         guidance: float,
         teacache: bool,
         teacache_threshold: float,
@@ -128,13 +141,26 @@ class ASDX_MLXSampler:
         krea2_enhancer_strength: float = 1.0,
         # Legacy
         lora_schedule: dict | None = None,
-    ) -> tuple[dict]:
+    ) -> io.NodeOutput:
         """Execute the MLX-native sampling loop via _SamplerCore."""
         transformer = model["transformer"]
         config = model["config"]
         model_type = model.get("model_type", "dev")
         capability = model.get("capability")
         controlnet = model.get("controlnet")
+
+        # TeaCache/SeaCache's skip heuristic (reuse the previous step's
+        # noise_pred) assumes a solver with one model call per step and no
+        # cross-step state -- only true for "euler"/"ddim" among the
+        # supported samplers (see sampler/solvers.py module docstring).
+        if (teacache or seacache) and sampler_name not in solvers.STATELESS_SINGLE_EVAL_SAMPLERS:
+            raise RuntimeError(
+                f"ASDX: teacache/seacache are only supported with sampler_name "
+                f"in {sorted(solvers.STATELESS_SINGLE_EVAL_SAMPLERS)!r} (got "
+                f"{sampler_name!r}) -- other samplers have per-step state or "
+                f"multiple model calls that the cache skip heuristic would "
+                f"silently corrupt. Disable teacache/seacache or switch sampler."
+            )
 
         # Prepare noise. SDXL's UNet consumes the latent grid directly (no
         # 2x2 patchify like FLUX/Krea2), so it needs its own noise-prep path.
@@ -162,7 +188,7 @@ class ASDX_MLXSampler:
             )
 
         # Get previewer for real-time output
-        previewer, preview_device = self._get_previewer() if preview else (None, None)
+        previewer, preview_device = cls._get_previewer() if preview else (None, None)
 
         # Create core sampler with mode routing params
         core = _SamplerCore(
@@ -174,6 +200,8 @@ class ASDX_MLXSampler:
             width=width,
             output_shape=output_shape,
             model_type=model_type,
+            sampler_name=sampler_name,
+            scheduler_name=scheduler_name,
             guidance=guidance,
             teacache=teacache,
             teacache_threshold=teacache_threshold,
@@ -221,9 +249,11 @@ class ASDX_MLXSampler:
                 steps=steps,
                 cfg=guidance,
                 mode=mode,
+                sampler_name=sampler_name,
+                scheduler_name=scheduler_name,
             )
 
-        return (out_latent,)
+        return io.NodeOutput(out_latent)
 
     @staticmethod
     def _get_previewer():
@@ -257,10 +287,6 @@ class ASDX_MLXSampler:
 
 # ── Node Mappings ─────────────────────────────────────────────────────
 
-NODE_CLASS_MAPPINGS = {
-    "ASDX_MLXSampler": ASDX_MLXSampler,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ASDX_MLXSampler": "🍏 ASDX MLX Native Sampler",
-}
+NODE_LIST = [
+    ASDX_MLXSampler,
+]
