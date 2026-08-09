@@ -19,7 +19,8 @@ from .. import capability as cap_module
 from ..native.config import FLUX_LATENT_SCALE, FLUX_LATENT_SHIFT
 from . import bridge
 from .cache import TeaCacheState
-from .scheduling import FluxSampler, SDXLSampling, generate_sigmas, generate_sigmas_sdxl
+from . import solvers
+from .scheduling import SDXLSampling, calculate_sigmas
 
 
 class SamplerMode(enum.Enum):
@@ -79,6 +80,8 @@ class _SamplerCore:
         ref_boost: float = 1.0,
         krea2_enhancer_strength: float = 1.0,
         controlnet: dict | None = None,
+        sampler_name: str = "euler",
+        scheduler_name: str = "normal",
     ):
         self.transformer = transformer
         self.config = config
@@ -117,6 +120,9 @@ class _SamplerCore:
         self.ref_boost = ref_boost
         self.krea2_enhancer_strength = krea2_enhancer_strength
         self.controlnet = controlnet
+        self.sampler_name = sampler_name
+        self.scheduler_name = scheduler_name
+        self._is_flow_matching = model_type != "sdxl"
 
     def run(self, steps: int, seed: int) -> dict:
         """Execute the MLX-native sampling loop and return the result latent."""
@@ -129,7 +135,7 @@ class _SamplerCore:
         # (context_refiner/noise_refiner/layers, encapsulated inside
         # NextDiT.__call__). Route before any FLUX-specific calls below.
         if model_type in ("zimage", "zimage_turbo"):
-            return self._run_zimage(steps)
+            return self._run_zimage(steps, seed)
 
         # ── Flux2/Klein routing ─────────────────────────────────────────
         # Flux2 uses its own conditioning (tapped-and-concatenated text
@@ -139,7 +145,7 @@ class _SamplerCore:
         # FLUX.1-specific calls below, which assume 3-axis RoPE and 64=16*2*2
         # packed tokens that don't apply here.
         if model_type == "flux2":
-            return self._run_flux2(steps)
+            return self._run_flux2(steps, seed)
 
         # ── SDXL routing ──────────────────────────────────────────────
         # SDXL is an EPS-prediction conv UNet on a discrete DDPM schedule,
@@ -150,7 +156,7 @@ class _SamplerCore:
         # Route before mode-detection/img2img prep, which assume FLUX's
         # packed-token noise shape (txt2img only for SDXL in this phase).
         if model_type == "sdxl":
-            return self._run_sdxl(steps)
+            return self._run_sdxl(steps, seed)
 
         # Detect mode and prepare noise (Phase 2: mode routing)
         self._mode = self._detect_mode()
@@ -253,7 +259,8 @@ class _SamplerCore:
         controlnet_type = self.controlnet.get("control_type") if self.controlnet else None
 
         # Setup sigmas for the model type (adapted from DiffusionKit)
-        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+        sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
 
         # Setup TeaCache
         teacache_state: TeaCacheState | None = None
@@ -365,9 +372,35 @@ class _SamplerCore:
             if not skip_step:
                 previous_output = current_output
 
-            # Euler update: x_{t-1} = x_t + (sigma_{t-1} - sigma_t) * noise_pred
-            dt = sigma_next - sigma_t
-            self.noise = self.noise + noise_pred * dt
+            # denoised = x - noise_pred*sigma (same formula for every family
+            # in this project, see solvers.py module docstring); solver step
+            # advances x from sigma_t to sigma_next given that estimate.
+            denoised = self.noise - noise_pred * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                # Second model evaluation for multi-eval solvers (e.g.
+                # dpmpp_2s_ancestral). Reuses this step's ControlNet residuals
+                # rather than recomputing them at the intermediate point.
+                out = self.transformer.predict(
+                    img=x_at, txt=prompt_embeds, timestep=sigma_at,
+                    guidance=effective_guidance, pooled=pooled_embeds, rope=rope,
+                    control=control, ref_img=kontext_ref_packed,
+                )
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name,
+                x=self.noise,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
             mx.eval(self.noise)
 
             step_time = time.perf_counter() - step_start
@@ -989,7 +1022,8 @@ class _SamplerCore:
             )
 
         # Setup sigmas (flow matching: linear 1→0)
-        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+        sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
 
         # Setup TeaCache
         teacache_state: TeaCacheState | None = None
@@ -1099,9 +1133,29 @@ class _SamplerCore:
             if not skip_step:
                 previous_output = current_output
 
-            # Euler update (same as FLUX): x += noise_pred * dt
-            dt = sigma_next - sigma_t
-            self.noise = self.noise + noise_pred * dt
+            # denoised = x - noise_pred*sigma (see solvers.py module docstring)
+            denoised = self.noise - noise_pred * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                out = self.transformer.predict(
+                    img=x_at, context=context, timestep=sigma_at, img_h=img_h, img_w=img_w,
+                    freqs=rope_freqs, ref_boost=ref_boost, src=src_tokens, src_h=src_h, src_w=src_w,
+                )
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name,
+                x=self.noise,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
             mx.eval(self.noise)
 
             step_time = time.perf_counter() - step_start
@@ -1168,7 +1222,7 @@ class _SamplerCore:
 
         return out_latent
 
-    def _run_sdxl(self, steps: int) -> dict:
+    def _run_sdxl(self, steps: int, seed: int) -> dict:
         """Run the SDXL (conv UNet, EPS/discrete-DDPM) sampling loop.
 
         Fundamentally different from the flow-matching DiT loop above:
@@ -1213,7 +1267,8 @@ class _SamplerCore:
 
         cfg_scale = float(self.guidance) if self.guidance and self.guidance > 0 else 7.0
 
-        sigmas = generate_sigmas_sdxl(steps)
+        sigmas = calculate_sigmas("sdxl", self.scheduler_name, steps)
+        solver_state: dict[str, Any] = {}
 
         # Initial state: sigma_max * unit-gaussian noise (txt2img: no seed
         # latent to add, matching EPS.noise_scaling at sigma=sigma_max).
@@ -1238,8 +1293,28 @@ class _SamplerCore:
             eps = eps_neg + cfg_scale * (eps_pos - eps_neg)
 
             denoised = sampling.calculate_denoised(sigma_t, eps, x)
-            d = (x - denoised) / sigma_t
-            x = x + d * (sigma_next - sigma_t)
+
+            def _model_call(x_at, sigma_at):
+                xc_at = sampling.calculate_input(sigma_at, x_at)
+                timestep_at = mx.array([sampling.timestep(sigma_at)], dtype=mx.float32)
+                eps_pos_at = self.transformer(xc_at, timestep_at, cond_pos, y_pos)
+                eps_neg_at = self.transformer(xc_at, timestep_at, cond_neg, y_neg)
+                mx.eval(eps_pos_at, eps_neg_at)
+                eps_at = eps_neg_at + cfg_scale * (eps_pos_at - eps_neg_at)
+                return sampling.calculate_denoised(sigma_at, eps_at, x_at)
+
+            x, solver_state = solvers.step(
+                self.sampler_name,
+                x=x,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
             mx.eval(x)
 
             step_time = time.perf_counter() - step_start
@@ -1278,7 +1353,7 @@ class _SamplerCore:
 
         return out_latent
 
-    def _run_zimage(self, steps: int) -> dict:
+    def _run_zimage(self, steps: int, seed: int) -> dict:
         """Run the Z-Image (NextDiT) sampling loop.
 
         Flow-matching, same Euler update as FLUX/Krea2 (`sampler/
@@ -1314,7 +1389,8 @@ class _SamplerCore:
                 f"vs noise token count {self.noise.shape[1]}"
             )
 
-        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+        sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
 
         teacache_state: TeaCacheState | None = None
         if self.teacache:
@@ -1350,8 +1426,26 @@ class _SamplerCore:
                 noise_pred = current_output
                 skip_step = False
 
-            dt = sigma_next - sigma_t
-            self.noise = self.noise + noise_pred * dt
+            # denoised = x - noise_pred*sigma (see solvers.py module docstring)
+            denoised = self.noise - noise_pred * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                out = self.transformer.predict(x_at, context, sigma_at, img_h, img_w)
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name,
+                x=self.noise,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
             mx.eval(self.noise)
 
             step_time = time.perf_counter() - step_start
@@ -1410,7 +1504,7 @@ class _SamplerCore:
 
         return out_latent
 
-    def _run_flux2(self, steps: int) -> dict:
+    def _run_flux2(self, steps: int, seed: int) -> dict:
         """Run the Flux2/Klein sampling loop.
 
         Flow-matching, same Euler update as FLUX.1/Krea2/Z-Image, but with a
@@ -1474,7 +1568,8 @@ class _SamplerCore:
 
         rope = self.transformer.get_rope(img_h, img_w, txt_len)
 
-        sigmas = generate_sigmas(steps, model_type, self.width, self.height)
+        sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
 
         teacache_state: TeaCacheState | None = None
         if self.teacache:
@@ -1516,8 +1611,28 @@ class _SamplerCore:
                 noise_pred = current_output
                 skip_step = False
 
-            dt = sigma_next - sigma_t
-            self.noise = self.noise + noise_pred * dt
+            # denoised = x - noise_pred*sigma (see solvers.py module docstring)
+            denoised = self.noise - noise_pred * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                out = self.transformer.predict(
+                    img=x_at, txt=context, timestep=sigma_at, guidance=effective_guidance, rope=rope,
+                )
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name,
+                x=self.noise,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
             mx.eval(self.noise)
 
             step_time = time.perf_counter() - step_start

@@ -87,7 +87,15 @@ from the safetensors header marker keys, never guessed from dtype alone.
 ### Sampling
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX MLX Native Sampler` | Euler sampler in pure MLX with SeaCache/TeaCache |
+| `🍏 ASDX MLX Native Sampler` | Multi-sampler/scheduler MLX sampler with SeaCache/TeaCache |
+
+`sampler_name`: `euler` (default), `euler_a`, `dpmpp_2m`, `dpmpp_2m_sde`,
+`dpmpp_2s_ancestral`, `ddim`, `deis`.
+`scheduler_name`: `normal` (default), `simple`, `karras`, `sgm_uniform`, `beta`.
+Ported from ComfyUI's own sampler/scheduler algorithms (`comfy/k_diffusion/
+sampling.py`, `comfy/samplers.py`) and verified numerically against them.
+TeaCache/SeaCache require `sampler_name` in `euler`/`ddim` (their step-skip
+heuristic assumes a single, stateless model call per step).
 
 ### Latent / VAE
 | Node | Description |
@@ -154,7 +162,7 @@ from the safetensors header marker keys, never guessed from dtype alone.
 - **Precomputed text projection**: `txt_in(emb)` computed once, reused across steps
 
 ### Advanced Conditioning
-- **LoRA Runtime Loading**: Standard A/B matrices, kohya-style, and ComfyUI diff format with per-LoRA alpha scaling
+- **LoRA Runtime Loading**: Standard A/B matrices, kohya-style, ComfyUI diff format, and diffusers/PEFT-style FLUX.1 (`transformer_blocks`/`single_transformer_blocks`) with per-LoRA alpha scaling
 - **Multi-LoRA Stacking**: Up to 5 LoRAs applied simultaneously with strength scheduling
 - **Kontext KV Cache**: Reference image tokens cached and injected into transformer attention layers
 - **Quantized checkpoints**: FP8_SCALED and INT8 ConvRot/tensorwise dequantized on load

@@ -263,6 +263,13 @@ class SDXLSampling:
     def sigma_max(self) -> float:
         return self._sigmas[-1]
 
+    @property
+    def sigmas(self) -> list[float]:
+        """Public alias of the discrete table, for the generic scheduler
+        functions in calculate_sigmas() below (simple/beta need direct
+        index access, matching comfy's `model_sampling.sigmas`)."""
+        return self._sigmas
+
     def sigma(self, timestep: float) -> float:
         """Continuous sigma for a (possibly fractional) discrete timestep index."""
         t = max(0.0, min(timestep, self.num_timesteps - 1))
@@ -501,3 +508,157 @@ def generate_sigmas(
         sigmas.append(flux_time_shift(mu, 1.0, t))
     sigmas.append(0.0)
     return sigmas
+
+
+# ── Generic multi-scheduler support ─────────────────────────────────
+#
+# Everything above implements only the "normal" scheduler shape per model
+# family. calculate_sigmas() below adds ComfyUI's other scheduler shapes
+# (simple, karras, sgm_uniform, beta) as an additive layer: scheduler_name=
+# "normal" still delegates straight to generate_sigmas()/generate_sigmas_sdxl()
+# above (zero risk to the already-verified default path, see canon on the
+# krea2 time_snr_shift/flux_time_shift mixup); the others build a small
+# model_sampling object and port comfy/samplers.py's generic scheduler
+# functions exactly, verified numerically against a real ModelSamplingFlux
+# instance (comfy/model_sampling.py) run through comfy.samplers.calculate_sigmas.
+
+
+def _flow_shift_fn(model_type: str, width: int = 1024, height: int = 1024):
+    """Same per-family shift closure generate_sigmas() already uses, factored
+    out for reuse by the non-"normal" schedulers below. Not merged into
+    generate_sigmas() itself to avoid touching its already-verified body.
+    """
+    if model_type == "schnell":
+        return lambda t: t
+    if model_type in ("krea2", "krea2_turbo"):
+        return lambda t: flux_time_shift(1.15, 1.0, t)
+    if model_type in ("zimage", "zimage_turbo"):
+        return lambda t: time_snr_shift(3.0, t)
+    if model_type == "flux2":
+        return lambda t: time_snr_shift(2.02, t)
+    mu = flux_resolution_shift(width, height)
+    return lambda t: flux_time_shift(mu, 1.0, t)
+
+
+class _FlowModelSampling:
+    """Minimal comfy `ModelSamplingFlux`-equivalent for the generic scheduler
+    functions below: `timestep(sigma) == sigma` (identity) is comfy's own
+    convention for this class (comfy/model_sampling.py::ModelSamplingFlux),
+    not a physical round-trip -- ported as-is, verified numerically (see
+    calculate_sigmas() docstring) rather than derived by inspection alone.
+    """
+
+    def __init__(self, sigma_fn, num_steps: int = 10000):
+        self.num_steps = num_steps
+        self.sigmas = [sigma_fn((i + 1) / num_steps) for i in range(num_steps)]
+        self._sigma_fn = sigma_fn
+
+    @property
+    def sigma_min(self) -> float:
+        return self.sigmas[0]
+
+    @property
+    def sigma_max(self) -> float:
+        return self.sigmas[-1]
+
+    def sigma(self, t: float) -> float:
+        return self._sigma_fn(t)
+
+    def timestep(self, sigma: float) -> float:
+        return sigma
+
+
+def _simple_scheduler(model_sampling: Any, steps: int) -> list[float]:
+    """Matches comfy/samplers.py::simple_scheduler exactly."""
+    table = model_sampling.sigmas
+    n = len(table)
+    ss = n / steps
+    sigmas = [table[-(1 + int(x * ss))] for x in range(steps)]
+    sigmas.append(0.0)
+    return sigmas
+
+
+def _sgm_uniform_scheduler(model_sampling: Any, steps: int) -> list[float]:
+    """Matches comfy/samplers.py::normal_scheduler(sgm=True) exactly."""
+    start = model_sampling.timestep(model_sampling.sigma_max)
+    end = model_sampling.timestep(model_sampling.sigma_min)
+    n = steps + 1
+    timesteps = [start + (end - start) * i / (n - 1) for i in range(n)][:-1]
+    sigmas = [model_sampling.sigma(ts) for ts in timesteps]
+    sigmas.append(0.0)
+    return sigmas
+
+
+def _karras_scheduler(sigma_min: float, sigma_max: float, steps: int, rho: float = 7.0) -> list[float]:
+    """Matches k_diffusion/sampling.py::get_sigmas_karras exactly."""
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    denom = (steps - 1) if steps > 1 else 1
+    sigmas = [
+        (max_inv_rho + (i / denom) * (min_inv_rho - max_inv_rho)) ** rho
+        for i in range(steps)
+    ]
+    sigmas.append(0.0)
+    return sigmas
+
+
+def _beta_scheduler(model_sampling: Any, steps: int, alpha: float = 0.6, beta: float = 0.6) -> list[float]:
+    """Matches comfy/samplers.py::beta_scheduler exactly."""
+    import scipy.stats
+
+    table = model_sampling.sigmas
+    total_timesteps = len(table) - 1
+    percents = [1.0 - i / steps for i in range(steps)]
+    indices = [round(float(scipy.stats.beta.ppf(p, alpha, beta)) * total_timesteps) for p in percents]
+
+    sigmas: list[float] = []
+    last_t = -1
+    for t in indices:
+        if t != last_t:
+            sigmas.append(table[int(t)])
+        last_t = t
+    sigmas.append(0.0)
+    return sigmas
+
+
+SCHEDULER_NAMES = ["normal", "simple", "karras", "sgm_uniform", "beta"]
+
+
+def calculate_sigmas(
+    model_type: str,
+    scheduler_name: str,
+    steps: int,
+    width: int = 1024,
+    height: int = 1024,
+) -> list[float]:
+    """Generic scheduler dispatcher (mirrors comfy/samplers.py::calculate_sigmas
+    + SCHEDULER_HANDLERS). "normal" delegates straight to the already-verified
+    generate_sigmas()/generate_sigmas_sdxl() above; the other scheduler shapes
+    build a small model_sampling object and run comfy's generic scheduler
+    algorithms against it.
+
+    Verified against a real `comfy.model_sampling.ModelSamplingFlux(shift=1.15)`
+    (the krea2 family) run through `comfy.samplers.calculate_sigmas`: karras,
+    simple, sgm_uniform and beta all match to the displayed precision at
+    steps=8.
+    """
+    if scheduler_name == "normal":
+        if model_type == "sdxl":
+            return generate_sigmas_sdxl(steps)
+        return generate_sigmas(steps, model_type, width, height)
+
+    model_sampling: Any = (
+        SDXLSampling() if model_type == "sdxl"
+        else _FlowModelSampling(_flow_shift_fn(model_type, width, height))
+    )
+
+    if scheduler_name == "karras":
+        return _karras_scheduler(model_sampling.sigma_min, model_sampling.sigma_max, steps)
+    if scheduler_name == "simple":
+        return _simple_scheduler(model_sampling, steps)
+    if scheduler_name == "sgm_uniform":
+        return _sgm_uniform_scheduler(model_sampling, steps)
+    if scheduler_name == "beta":
+        return _beta_scheduler(model_sampling, steps)
+
+    raise ValueError(f"ASDX: unknown scheduler_name {scheduler_name!r}")
