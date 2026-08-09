@@ -45,3 +45,19 @@ looks intermittent or environment-specific, re-derive the repro from the ACTUAL
 calling code path (the buggy node's own methods) before reaching for a GPU/timing
 explanation — an early repro that bypassed `_fallback_decode` entirely (called
 `vae.decode()` directly) is what made this look racy for longer than it should have.
+
+## Node package migrated fully to ComfyUI's V3 API
+kind: choice | date: 2026-08-09 | status: canon
+All ~22 ASDX_* nodes use `io.ComfyNode` with `define_schema()` returning `io.Schema`
+and `execute()` as a classmethod returning `io.NodeOutput(...)`, registered via a
+single `ComfyExtension`/`comfy_entrypoint()` in `__init__.py` — not the V1
+`NODE_CLASS_MAPPINGS`/`INPUT_TYPES()`/instance-method style. Because: V3 gives typed
+I/O, per-node `fingerprint_inputs`/`validate_inputs` as first-class classmethods (used
+on `ASDX_MemoryProfiler`/`ASDX_CacheManager`/`ASDX_LivePreview` to force
+re-execution on side-effecting nodes instead of silently serving a stale cached
+result), and the migration was verified end-to-end against the real ComfyUI V3
+runtime (`comfy_api.latest`, via the installed ComfyUI's own venv) — every node's
+`define_schema()` and `GET_NODE_INFO_V1()` conversion was exercised, not just
+`py_compile`d. Every `node_id` was kept identical to its old V1 mapping key, so
+existing saved workflows keep resolving to the same nodes. The old `_WEB_DIRECTORY
+= "web"` dead variable (wrong name, no `web/` dir) was dropped in the same pass.
