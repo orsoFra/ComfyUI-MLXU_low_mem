@@ -232,6 +232,25 @@ class LoRAAdapter:
             self.scale = base_lora_scale(self.alpha, self.rank)
 
 
+def _normalize_native_lora_key(prefix: str) -> str:
+    """Rename a stripped native BFL LoRA key prefix to match this project's
+    live module tree, undoing the same checkpoint-convention renames
+    `native/weight_map.py` applies at checkpoint-load time (see its own
+    docstring) -- a LoRA trained against the real checkpoint's dotted
+    `img_mlp.0`/`img_mlp.2` Sequential naming otherwise never matches the
+    native module's flat `img_mlp_0`/`img_mlp_2` attributes, silently
+    dropping every double-block MLP delta (confirmed: a real Flux.2 Klein
+    LoRA lost exactly its 4 MLP keys/block, 32/112 deltas, this way).
+    """
+    if ".attn.gate." in prefix:
+        prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
+    if ".img_mlp." in prefix:
+        prefix = prefix.replace(".img_mlp.", ".img_mlp_")
+    elif ".txt_mlp." in prefix:
+        prefix = prefix.replace(".txt_mlp.", ".txt_mlp_")
+    return prefix
+
+
 def base_lora_scale(alpha: float | None, rank: int) -> float:
     """`alpha/rank` if the file declared its own alpha, else a flat 1.0 --
     matches comfy/weight_adapter/lora.py's fallback exactly (`alpha =
@@ -447,10 +466,16 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
     `_apply_lora_to_transformer`) would otherwise log a spurious
     "lora key not loaded" warning -- for a real kohya SDXL LoRA (e.g.
     Illustrious) that is thousands of warning lines burying any genuine
-    CLIP-side mismatch. Covers both the kohya `lora_unet_*` convention and
-    the diffusers/PEFT FLUX convention (`transformer.{...}_blocks.*`) --
-    real CLIP LoRA keys use `lora_te*_`/`text_model.` naming, never a
-    `transformer.` prefix, so this can't drop a genuine CLIP-side key.
+    CLIP-side mismatch. Covers the kohya `lora_unet_*` convention, the
+    diffusers/PEFT FLUX/Flux2 convention -- bare `transformer_blocks.*`/
+    `single_transformer_blocks.*`, NOT wrapped in a `transformer.` prefix,
+    confirmed against a real diffusers Flux.2 Klein LoRA whose raw keys
+    have no prefix at all -- and the BFL-native convention
+    (`diffusion_model.double_blocks./single_blocks.*`, confirmed to
+    otherwise flood the log with one warning per raw tensor on a real
+    Flux.2 Klein LoRA) -- real CLIP LoRA keys use `lora_te*_`/`text_model.`
+    naming, never any of these prefixes, so this can't drop a genuine
+    CLIP-side key.
     """
     if clip is None or strength_clip == 0:
         return clip
@@ -459,7 +484,10 @@ def _apply_lora_to_clip(clip: Any, lora_path: Path, strength_clip: float) -> Any
 
     raw = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
     raw = {k: v for k, v in raw.items()
-           if not k.startswith("lora_unet_") and not k.startswith("transformer.")}
+           if not k.startswith("lora_unet_") and not k.startswith("transformer.")
+           and not k.startswith("diffusion_model.")
+           and not k.startswith("transformer_blocks.")
+           and not k.startswith("single_transformer_blocks.")}
     _, new_clip = comfy.sd.load_lora_for_models(None, clip, raw, 0.0, strength_clip)
     return new_clip if new_clip is not None else clip
 
@@ -606,29 +634,35 @@ class ASDX_LoraLoader(io.ComfyNode):
 
             # Standard LoRA format: {prefix}.lora_A.{param} / {prefix}.lora_B.{param}
             if ".lora_A." in key:
-                prefix = key.replace(".lora_A.", ".")
+                # PEFT (HF diffusers-trained) files insert an adapter name
+                # between lora_A/B and the param, e.g. "...lora_A.default.
+                # weight" instead of comfy/kohya's "...lora_A.weight" -- a
+                # plain string replace would leave "default.weight" stuck to
+                # the prefix and never match anything downstream (confirmed:
+                # a real diffusers Flux.2 LoRA applied 0/144 deltas this
+                # way). lora_A/B always target a weight matrix, so drop
+                # whatever follows and hard-code ".weight" back on.
+                prefix = key.partition(".lora_A.")[0] + ".weight"
                 # Strip common ComfyUI prefixes (diffusion_model., model., etc.)
                 for pfx in ("diffusion_model.", "model.", "transformer."):
                     if prefix.startswith(pfx):
                         prefix = prefix[len(pfx):]
                         break
-                # Krea2 checkpoints rename attn.gate -> attn.gate_proj (see
-                # weight_map.map_krea2_to_native); LoRA files trained against the
-                # checkpoint naming need the same rename to match the live module tree.
-                if ".attn.gate.weight" in prefix:
-                    prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
+                # Native module-tree renames (Krea2 attn.gate -> attn.gate_proj,
+                # FLUX/Flux2 img_mlp./txt_mlp. -> img_mlp_/txt_mlp_) -- see
+                # _normalize_native_lora_key.
+                prefix = _normalize_native_lora_key(prefix)
                 if prefix not in deltas:
                     deltas[prefix] = (None, None)
                 deltas[prefix] = (weight_arr, deltas[prefix][1])
             elif ".lora_B." in key:
-                prefix = key.replace(".lora_B.", ".")
+                prefix = key.partition(".lora_B.")[0] + ".weight"
                 # Strip common ComfyUI prefixes
                 for pfx in ("diffusion_model.", "model.", "transformer."):
                     if prefix.startswith(pfx):
                         prefix = prefix[len(pfx):]
                         break
-                if ".attn.gate.weight" in prefix:
-                    prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
+                prefix = _normalize_native_lora_key(prefix)
                 if prefix not in deltas:
                     deltas[prefix] = (deltas[prefix][0], None)
                 deltas[prefix] = (deltas[prefix][0], weight_arr)
@@ -642,8 +676,7 @@ class ASDX_LoraLoader(io.ComfyNode):
                     if prefix.startswith(pfx):
                         prefix = prefix[len(pfx):]
                         break
-                if ".attn.gate.weight" in prefix:
-                    prefix = prefix.replace(".attn.gate.", ".attn.gate_proj.")
+                prefix = _normalize_native_lora_key(prefix)
                 down_raw = raw[down_key]
                 down_arr = down_raw if isinstance(down_raw, mx.array) else mx.array(down_raw)
                 # Route through the same (a, b) pairing dict as lora_A/lora_B so the
@@ -660,8 +693,7 @@ class ASDX_LoraLoader(io.ComfyNode):
                     if diff_key.startswith(pfx):
                         diff_key = diff_key[len(pfx):]
                         break
-                if ".attn.gate.bias" in diff_key:
-                    diff_key = diff_key.replace(".attn.gate.", ".attn.gate_proj.")
+                diff_key = _normalize_native_lora_key(diff_key)
                 lora.deltas[diff_key] = weight_arr
             elif ".diff" in key:
                 # ComfyUI diff format (weight delta). Real key is "{x}.diff" with
@@ -672,8 +704,7 @@ class ASDX_LoraLoader(io.ComfyNode):
                     if diff_key.startswith(pfx):
                         diff_key = diff_key[len(pfx):]
                         break
-                if ".attn.gate.weight" in diff_key:
-                    diff_key = diff_key.replace(".attn.gate.", ".attn.gate_proj.")
+                diff_key = _normalize_native_lora_key(diff_key)
                 lora.deltas[diff_key] = weight_arr
 
         # Convert (A, B) pairs to delta = B @ A and compute rank
