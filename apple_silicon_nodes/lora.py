@@ -26,6 +26,7 @@ from comfy_api.latest import io
 
 from . import bridge
 from .native import FluxTransformer
+from .native.flux2 import Flux2Transformer
 from .native.safetensors_header import read_safetensors_header
 from .native.sdxl import UNetModel as SDXLUNetModel
 
@@ -59,25 +60,24 @@ _LORA_COMPATIBLE_BASE: dict[str, str] = {
 #
 # Verified against real LoRA files on this machine for flux1 (BFL-native),
 # flux2, krea2, sdxl (kohya-ss, the dominant convention for
-# Illustrious/Pony/NoobAI in this project's library) and zimage. NOT every
-# real-world naming convention is covered: a diffusers/PEFT-style FLUX LoRA
-# (`transformer.single_transformer_blocks.{i}.attn.to_k.lora_A.weight`, seen
-# on this machine under loras/Flux.1 D/) returns "unknown" here rather than a
-# false match -- and separately, `_load_lora_file`/`_apply_lora_to_transformer`
-# don't parse that naming convention either (they navigate the live module
-# tree by `double_blocks`/`single_blocks`, which that file's keys never
-# contain), so such a file already silently applies 0 deltas today,
-# independent of this compatibility check. That gap is pre-existing and out
-# of scope here; noted so it isn't mistaken for something this step fixes.
+# Illustrious/Pony/NoobAI in this project's library) and zimage. A
+# diffusers/PEFT-style FLUX/Flux2 LoRA (`transformer_blocks.{i}.attn.to_q...`,
+# `single_transformer_blocks.{i}...`) returns "unknown" here rather than a
+# false match -- `_apply_lora_to_transformer` resolves that naming separately
+# via `_resolve_flux_diffusers_lora`/`_resolve_flux2_diffusers_lora`, so this
+# check only needs to not misclassify it, not parse it.
 #
-# `.double_blocks.` alone (not `.single_blocks.`) is the flux1 signal: Flux.2
-# reuses FLUX.1's `single_blocks.{i}.linear1/linear2` naming for its
-# single-stream blocks (confirmed against a real Flux.2 LoRA, which has
-# `single_blocks.*` but no `double_blocks.*` at all) -- `.single_blocks.`
-# alone cannot tell the two apart, so only Flux.2's own
-# `double_stream_modulation_img./_txt.` marker is used for flux2, and flux1
-# requires the double-block evidence that only FLUX.1 (which has BOTH double
-# and single blocks) carries.
+# `.double_blocks.` alone (not `.single_blocks.`) is the flux1 signal here,
+# but it is NOT conclusive by itself: Flux.2/Klein reuses FLUX.1's exact
+# `double_blocks`/`single_blocks`/`img_attn`/`linear1`/`linear2` naming (both
+# share the same `comfy.ldm.flux.model.Flux` class), so a genuine Flux.2 LoRA
+# also carries `.double_blocks.` keys (confirmed on a real Civitai Flux.2
+# Klein 9B LoRA). Flux.2's own `double_stream_modulation_img./_txt.` marker
+# is used as a positive signal when present, but real-world LoRA files
+# rarely train the shared top-level Modulation layers, so it's usually
+# absent -- `_check_lora_compatibility` cross-checks actual block COUNTS
+# against the loaded model's config before refusing a flux1/flux2 mismatch
+# found here, to catch this ambiguity.
 def detect_lora_family(path: Path) -> LoRAFamilySignature:
     """Header-only (no tensor data) detection of which base family a LoRA
     file targets, from distinctive key fragments. Zero or multiple matching
@@ -111,6 +111,16 @@ def detect_lora_family(path: Path) -> LoRAFamilySignature:
     return LoRAFamilySignature(family=family, evidence=(evidence,))
 
 
+def _lora_block_counts(path: Path) -> tuple[int, int]:
+    """Count of distinct double_blocks./single_blocks. indices present in a
+    LoRA file's header (BFL-native naming). Header-only, no tensor data read.
+    """
+    header = read_safetensors_header(path)
+    double_idx = {int(m.group(1)) for k in header.tensors for m in [re.search(r"double_blocks\.(\d+)\.", k)] if m}
+    single_idx = {int(m.group(1)) for k in header.tensors for m in [re.search(r"single_blocks\.(\d+)\.", k)] if m}
+    return len(double_idx), len(single_idx)
+
+
 def _check_lora_compatibility(lora_path: Path, model: dict) -> None:
     """Refuse to apply a LoRA whose detected family disagrees with the
     loaded model's family -- silently applying deltas keyed by coincidental
@@ -125,6 +135,24 @@ def _check_lora_compatibility(lora_path: Path, model: dict) -> None:
     model_base = _LORA_COMPATIBLE_BASE.get(model_family, model_family)
     lora_base = _LORA_COMPATIBLE_BASE.get(signature.family, signature.family)
     if lora_base != model_base:
+        # flux1 and flux2/Klein share the exact `comfy.ldm.flux.model.Flux`
+        # class and its double_blocks/single_blocks/img_attn/linear1/linear2
+        # naming -- only block COUNT and hidden_size differ (Klein 9B: 8
+        # double + 24 single vs FLUX.1-dev: 19 double + 38 single), so a
+        # "flux1 evidence: double_blocks." detection can be a false positive
+        # on a genuine Flux2 LoRA. Cross-check the LoRA's actual block counts
+        # against the loaded model's real config before trusting the naming
+        # alone (confirmed false positive on a real Civitai-labeled Flux.2
+        # Klein 9B LoRA: 8 double + 24 single blocks in the file, exactly
+        # matching the loaded Klein checkpoint).
+        if {lora_base, model_base} == {"flux1", "flux2"}:
+            lora_double, lora_single = _lora_block_counts(lora_path)
+            config = model["config"]
+            if (
+                lora_double == getattr(config, "num_double_blocks", -1)
+                and lora_single == getattr(config, "num_single_blocks", -1)
+            ):
+                return
         raise ValueError(
             f"ASDX: '{lora_path.name}' looks like a {signature.family} LoRA "
             f"(evidence: {', '.join(signature.evidence)}), but the loaded "
@@ -214,40 +242,64 @@ def base_lora_scale(alpha: float | None, rank: int) -> float:
     return alpha / max(rank, 1) if alpha is not None else 1.0
 
 
-# ── Diffusers/PEFT FLUX.1 LoRA key mapping ──────────────────────────────
+# ── Diffusers/PEFT FLUX.1 / Flux.2 LoRA key mapping ─────────────────────
 #
-# A diffusers-trained FLUX.1 LoRA (e.g. ai-toolkit, SimpleTuner, kohya's
-# sd-scripts diffusers mode) uses HF's `transformer_blocks`/
-# `single_transformer_blocks` naming with separate `to_q`/`to_k`/`to_v`
-# projections, not BFL's fused `double_blocks`/`single_blocks` `qkv`/
-# `linear1`. Ported directly from comfy's own `comfy/utils.py::
-# flux_to_diffusers` (the exact table comfy uses for this same file
-# convention) rather than guessed. comfy applies each component as an
-# independent sliced patch via `weight.narrow(dim, start, length)` because
-# each of q/k/v/mlp keeps its own (possibly different) LoRA rank and can't
-# be concatenated at the A/B stage -- `_assemble_fused_delta` below
-# reproduces that by zero-padding each already-computed (B @ A) delta to
-# the fused weight's full output width and concatenating.
+# A diffusers-trained FLUX.1 or Flux.2/Klein LoRA (e.g. ai-toolkit,
+# SimpleTuner, kohya's sd-scripts diffusers mode) uses HF's
+# `transformer_blocks`/`single_transformer_blocks` naming with separate
+# `to_q`/`to_k`/`to_v` projections, not BFL's fused `double_blocks`/
+# `single_blocks` `qkv`/`linear1`. Ported directly from comfy's own
+# `comfy/utils.py::flux_to_diffusers` (the exact table comfy uses for this
+# same file convention, and which already covers both families -- Flux.2's
+# single-block entries are just extra keys appended to the same
+# `block_map`) rather than guessed. comfy applies each split component as
+# an independent sliced patch via `weight.narrow(dim, start, length)`
+# because each of q/k/v/mlp keeps its own (possibly different) LoRA rank
+# and can't be concatenated at the A/B stage -- `_assemble_fused_delta`
+# below reproduces that by zero-padding each already-computed (B @ A)
+# delta to the fused weight's full output width and concatenating.
 #
-# Native attribute names (see native/__init__.py's DoubleBlock/SingleBlock)
-# match the BFL checkpoint 1:1 EXCEPT the MLP layers, which are flat
-# `img_mlp_0`/`img_mlp_2` attributes (underscore) instead of a dotted
-# Sequential `img_mlp.0`/`img_mlp.2` -- see native/weight_map.py's own
-# docstring for the same rename applied at checkpoint-load time.
+# Double-stream blocks (`transformer_blocks.{i}`) are handled identically
+# for both families by `_resolve_flux_double_diffusers_lora`: FLUX.1 and
+# Flux.2/Klein share the exact same `double_blocks` module tree (see
+# `native/flux2/config.py`'s docstring), and comfy's own key_map uses one
+# unmodified `block_map` for both. Single-stream blocks differ: FLUX.1's
+# diffusers port keeps `to_q`/`to_k`/`to_v`/`proj_mlp` split (needs the
+# same assembly as the double-block qkv), while Flux.2's diffusers port
+# already fuses them into one `attn.to_qkv_mlp_proj` weight matching
+# native `linear1` exactly (a straight rename, no assembly) and
+# `attn.to_out` covers the full `linear2` -- see comfy's
+# `flux_to_diffusers`, the `# Flux 2` entries in its single-block
+# `block_map`. Confirmed against a real Civitai Flux.2 Klein 9B diffusers
+# LoRA's actual warning keys (8 `transformer_blocks.*` + 24
+# `single_transformer_blocks.*`, matching Klein 9B's block counts).
+#
+# Native attribute names (see native/__init__.py's DoubleBlock/SingleBlock,
+# and native/flux2/model.py's DoubleBlock/SingleBlock) match their BFL
+# checkpoint 1:1 EXCEPT the MLP layers, which are flat `img_mlp_0`/
+# `img_mlp_2` attributes (underscore) instead of a dotted Sequential
+# `img_mlp.0`/`img_mlp.2` -- see native/weight_map.py's own docstring for
+# the same rename applied at checkpoint-load time.
 _FLUX_DOUBLE_QKV_RE = re.compile(r"^double_blocks\.(\d+)\.(img_attn|txt_attn)\.qkv\.weight$")
 _FLUX_SINGLE_LINEAR1_RE = re.compile(r"^single_blocks\.(\d+)\.linear1\.weight$")
 _FLUX_DOUBLE_RENAME_RE = re.compile(r"^double_blocks\.(\d+)\.(.+)$")
 _FLUX_SINGLE_RENAME_RE = re.compile(r"^single_blocks\.(\d+)\.(.+)$")
 
-_FLUX_DOUBLE_DIFFUSERS_RENAME: dict[str, str] = {
-    "img_attn.proj.weight": "attn.to_out.0.weight",
-    "txt_attn.proj.weight": "attn.to_add_out.weight",
-    "img_mod.lin.weight": "norm1.linear.weight",
-    "txt_mod.lin.weight": "norm1_context.linear.weight",
-    "img_mlp_0.weight": "ff.net.0.proj.weight",
-    "img_mlp_2.weight": "ff.net.2.weight",
-    "txt_mlp_0.weight": "ff_context.net.0.proj.weight",
-    "txt_mlp_2.weight": "ff_context.net.2.weight",
+# Native MLP suffix -> candidate diffusers suffixes, tried in order. Two
+# real-world naming variants exist for the same weight (diffusers' own
+# `ff.net.0.proj`/`ff.net.2` vs. the LyCoris/LoKr export convention's
+# `ff.linear_in`/`ff.linear_out`, seen on the actual Flux.2 Klein LoRA this
+# was verified against) -- comfy's own key_map maps both onto the same
+# native target, so both are tried here too.
+_FLUX_DOUBLE_DIFFUSERS_RENAME: dict[str, tuple[str, ...]] = {
+    "img_attn.proj.weight": ("attn.to_out.0.weight",),
+    "txt_attn.proj.weight": ("attn.to_add_out.weight",),
+    "img_mod.lin.weight": ("norm1.linear.weight",),
+    "txt_mod.lin.weight": ("norm1_context.linear.weight",),
+    "img_mlp_0.weight": ("ff.net.0.proj.weight", "ff.linear_in.weight"),
+    "img_mlp_2.weight": ("ff.net.2.weight", "ff.linear_out.weight"),
+    "txt_mlp_0.weight": ("ff_context.net.0.proj.weight", "ff_context.linear_in.weight"),
+    "txt_mlp_2.weight": ("ff_context.net.2.weight", "ff_context.linear_out.weight"),
 }
 _FLUX_SINGLE_DIFFUSERS_RENAME: dict[str, str] = {
     "modulation.lin.weight": "norm.linear.weight",
@@ -279,6 +331,35 @@ def _assemble_fused_delta(
     return mx.concatenate(blocks, axis=0).astype(dtype), consumed
 
 
+def _resolve_flux_double_diffusers_lora(
+    flat_key: str, deltas: dict[str, mx.array], hidden_dim: int
+) -> tuple[mx.array | None, int]:
+    """Resolve a native `double_blocks.*` flat parameter key against a
+    diffusers/PEFT-style LoRA's already-computed per-component deltas.
+    Shared by both FLUX.1 and Flux.2/Klein -- see module-level comment
+    above. Returns (None, 0) if `flat_key` isn't a `double_blocks.*` key or
+    has no diffusers counterpart in `deltas`.
+    """
+    m = _FLUX_DOUBLE_QKV_RE.match(flat_key)
+    if m:
+        idx, stream = m.group(1), m.group(2)
+        sub_names = ("to_q", "to_k", "to_v") if stream == "img_attn" else \
+            ("add_q_proj", "add_k_proj", "add_v_proj")
+        pieces = [deltas.get(f"transformer_blocks.{idx}.attn.{name}.weight") for name in sub_names]
+        return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim])
+
+    m = _FLUX_DOUBLE_RENAME_RE.match(flat_key)
+    if m:
+        idx, rest = m.group(1), m.group(2)
+        for diffusers_suffix in _FLUX_DOUBLE_DIFFUSERS_RENAME.get(rest, ()):
+            delta = deltas.get(f"transformer_blocks.{idx}.{diffusers_suffix}")
+            if delta is not None:
+                return delta, 1
+        return None, 0
+
+    return None, 0
+
+
 def _resolve_flux_diffusers_lora(
     flat_key: str, deltas: dict[str, mx.array], hidden_dim: int, mlp_dim: int
 ) -> tuple[mx.array | None, int]:
@@ -288,13 +369,9 @@ def _resolve_flux_diffusers_lora(
     counterpart in `deltas` -- callers fall through to leaving the
     parameter unchanged.
     """
-    m = _FLUX_DOUBLE_QKV_RE.match(flat_key)
-    if m:
-        idx, stream = m.group(1), m.group(2)
-        sub_names = ("to_q", "to_k", "to_v") if stream == "img_attn" else \
-            ("add_q_proj", "add_k_proj", "add_v_proj")
-        pieces = [deltas.get(f"transformer_blocks.{idx}.attn.{name}.weight") for name in sub_names]
-        return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim])
+    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, deltas, hidden_dim)
+    if consumed:
+        return delta, consumed
 
     m = _FLUX_SINGLE_LINEAR1_RE.match(flat_key)
     if m:
@@ -307,21 +384,43 @@ def _resolve_flux_diffusers_lora(
         ]
         return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim, mlp_dim])
 
-    m = _FLUX_DOUBLE_RENAME_RE.match(flat_key)
-    if m:
-        idx, rest = m.group(1), m.group(2)
-        diffusers_suffix = _FLUX_DOUBLE_DIFFUSERS_RENAME.get(rest)
-        if diffusers_suffix is not None:
-            delta = deltas.get(f"transformer_blocks.{idx}.{diffusers_suffix}")
-            return delta, (1 if delta is not None else 0)
-        return None, 0
-
     m = _FLUX_SINGLE_RENAME_RE.match(flat_key)
     if m:
         idx, rest = m.group(1), m.group(2)
         diffusers_suffix = _FLUX_SINGLE_DIFFUSERS_RENAME.get(rest)
         if diffusers_suffix is not None:
             delta = deltas.get(f"single_transformer_blocks.{idx}.{diffusers_suffix}")
+            return delta, (1 if delta is not None else 0)
+        return None, 0
+
+    return None, 0
+
+
+def _resolve_flux2_diffusers_lora(
+    flat_key: str, deltas: dict[str, mx.array], hidden_size: int
+) -> tuple[mx.array | None, int]:
+    """Resolve a native Flux.2/Klein flat parameter key against a
+    diffusers/PEFT-style LoRA's already-computed per-component deltas (see
+    module-level comment above). Double-stream blocks reuse
+    `_resolve_flux_double_diffusers_lora`; single-stream blocks are direct
+    renames (`attn.to_qkv_mlp_proj` -> `linear1`, `attn.to_out` ->
+    `linear2`), unlike FLUX.1 which needs 4-way assembly for `linear1`.
+    """
+    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, deltas, hidden_size)
+    if consumed:
+        return delta, consumed
+
+    m = _FLUX_SINGLE_LINEAR1_RE.match(flat_key)
+    if m:
+        idx = m.group(1)
+        delta = deltas.get(f"single_transformer_blocks.{idx}.attn.to_qkv_mlp_proj.weight")
+        return delta, (1 if delta is not None else 0)
+
+    m = _FLUX_SINGLE_RENAME_RE.match(flat_key)
+    if m:
+        idx, rest = m.group(1), m.group(2)
+        if rest == "linear2.weight":
+            delta = deltas.get(f"single_transformer_blocks.{idx}.attn.to_out.weight")
             return delta, (1 if delta is not None else 0)
         return None, 0
 
@@ -659,12 +758,17 @@ class ASDX_LoraLoader(io.ComfyNode):
             checkpoint_stem_fn = native_key_to_checkpoint_stem
 
         # BFL-native FLUX.1 (native/__init__.py's FluxTransformer -- Krea2 reuses
-        # this exact class, not flux2/sdxl/zimage which have their own) is the
-        # only family this diffusers/PEFT fallback covers -- see
-        # `_resolve_flux_diffusers_lora`'s module comment.
+        # this exact class, not flux2/sdxl/zimage which have their own) and
+        # Flux.2/Klein (native/flux2/model.py's Flux2Transformer) are the only
+        # families this diffusers/PEFT fallback covers -- see
+        # `_resolve_flux_diffusers_lora`/`_resolve_flux2_diffusers_lora`'s
+        # module comment.
         flux_diffusers_dims = None
+        flux2_diffusers_hidden_size = None
         if isinstance(transformer, FluxTransformer):
             flux_diffusers_dims = (config.hidden_dim, config.mlp_dim)
+        elif isinstance(transformer, Flux2Transformer):
+            flux2_diffusers_hidden_size = config.hidden_size
 
         new_flat = []
         applied = 0
@@ -701,6 +805,12 @@ class ASDX_LoraLoader(io.ComfyNode):
                 # `_resolve_flux_diffusers_lora`.
                 hidden_dim, mlp_dim = flux_diffusers_dims
                 delta, consumed = _resolve_flux_diffusers_lora(flat_key, lora.deltas, hidden_dim, mlp_dim)
+            if delta is None and flux2_diffusers_hidden_size is not None:
+                # diffusers/PEFT Flux.2/Klein LoRA -- see
+                # `_resolve_flux2_diffusers_lora`.
+                delta, consumed = _resolve_flux2_diffusers_lora(
+                    flat_key, lora.deltas, flux2_diffusers_hidden_size
+                )
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)
                 new_flat.append((flat_key, value + delta_mapped * lora.scale))
