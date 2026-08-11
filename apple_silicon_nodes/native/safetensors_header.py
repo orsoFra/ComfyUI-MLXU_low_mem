@@ -34,11 +34,18 @@ def read_safetensors_header(path: str | Path) -> SafetensorsHeader:
     (short read, non-JSON, missing length prefix) -- never returns a partial
     or guessed result."""
     path = Path(path)
+    file_size = path.stat().st_size
     with open(path, "rb") as f:
         length_bytes = f.read(8)
         if len(length_bytes) != 8:
             raise ValueError(f"ASDX: {path.name} is too short to contain a safetensors header")
         header_len = struct.unpack("<Q", length_bytes)[0]
+        if header_len > file_size - 8:
+            raise ValueError(
+                f"ASDX: {path.name} is not a valid safetensors file -- declared header "
+                f"length {header_len} bytes exceeds the file's own size ({file_size} bytes). "
+                f"The file is likely corrupted, truncated, or not a safetensors checkpoint."
+            )
         raw_header = f.read(header_len)
         if len(raw_header) != header_len:
             raise ValueError(
