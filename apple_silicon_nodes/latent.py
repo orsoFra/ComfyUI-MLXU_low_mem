@@ -46,6 +46,8 @@ class ASDX_EmptyLatent(io.ComfyNode):
     # SDXL uses the standard 4ch/8x VAE (see bridge.py::SDXL_LATENT_CHANNELS).
     _LATENT_FORMATS = {
         "flux": (16, 8),
+        "krea2": (16, 8),
+        "zimage": (16, 8),
         "flux2": (128, 16),
         "sdxl": (4, 8),
     }
