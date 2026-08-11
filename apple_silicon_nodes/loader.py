@@ -258,11 +258,25 @@ def _detect_model_type_from_keys(path: Path) -> str:
     return "dev"
 
 
+def _contains_asdx_model(value: Any) -> bool:
+    """Recurse into ComfyUI's nested output structure -- `execution.py`'s
+    `merge_result_data` wraps each output socket's value in its own list
+    (`output.append([o[i] for o in results])`), so a cached entry's
+    `.outputs` is `[[model_desc]]`, not `[model_desc]`. Same recursion shape
+    as `RAMPressureCache.ram_release`'s own `scan_list_for_ram_usage`.
+    """
+    if isinstance(value, dict):
+        return value.get("type") == "asdx_model"
+    if isinstance(value, (list, tuple)):
+        return any(_contains_asdx_model(v) for v in value)
+    return False
+
+
 def _cache_entry_holds_asdx_model(entry: Any) -> bool:
     outputs = getattr(entry, "outputs", None)
     if not outputs:
         return False
-    return any(isinstance(o, dict) and o.get("type") == "asdx_model" for o in outputs)
+    return _contains_asdx_model(outputs)
 
 
 def _purge_stale_asdx_cache_entries() -> int:
