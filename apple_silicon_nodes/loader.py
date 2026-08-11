@@ -181,20 +181,56 @@ def _detect_model_type(path: Path) -> str:
     Z-Image has an equally distinctive `noise_refiner.` key, and Flux2 has
     `double_stream_modulation_img.` (comfy's own detection marker for this
     exact branch — see `comfy/model_detection.py:237`).
+
+    A filename hint that resolves to one of these structurally distinctive
+    types (sdxl/zimage/flux2/krea2) is still verified against the same
+    key-based check before being trusted: a checkpoint can be named after
+    its training data/style rather than its base architecture (a
+    "Pony"-tagged FLUX finetune matched `_SDXL_HINTS["pony"]` despite having
+    FLUX `double_blocks.` keys, not SDXL's `input_blocks.`), which used to
+    silently route it into the wrong native loader (0 matched params on
+    load, garbage output with no error).
     """
     name = path.name.lower()
+
+    hint_type: str | None = None
     for hint in _KREA2_HINTS:
         if hint in name:
-            return "krea2"
-    for hint in _SDXL_HINTS:
-        if hint in name:
-            return "sdxl"
-    for hint in _ZIMAGE_HINTS:
-        if hint in name:
-            return "zimage_turbo" if "turbo" in name else "zimage"
-    for hint in _FLUX2_HINTS:
-        if hint in name:
-            return "flux2"
+            hint_type = "krea2"
+            break
+    if hint_type is None:
+        for hint in _SDXL_HINTS:
+            if hint in name:
+                hint_type = "sdxl"
+                break
+    if hint_type is None:
+        for hint in _ZIMAGE_HINTS:
+            if hint in name:
+                hint_type = "zimage_turbo" if "turbo" in name else "zimage"
+                break
+    if hint_type is None:
+        for hint in _FLUX2_HINTS:
+            if hint in name:
+                hint_type = "flux2"
+                break
+
+    if hint_type is not None:
+        # Unlike the generic dev/schnell/kontext hints below, these claim a
+        # structurally distinctive architecture -- verify against the
+        # checkpoint's own keys before trusting it. Some finetunes are named
+        # after their training data/style rather than their base architecture
+        # (e.g. a "Pony"-tagged FLUX checkpoint matching `_SDXL_HINTS["pony"]`
+        # despite having FLUX `double_blocks.`/`img_attn.` keys, not SDXL's
+        # `input_blocks.`), which used to silently route such a checkpoint
+        # into the wrong native loader (0 matched params, garbage output).
+        base_hint_type = "zimage" if hint_type == "zimage_turbo" else hint_type
+        detected = _detect_model_type_from_keys(path)
+        if detected == base_hint_type:
+            return hint_type
+        print(f"[ASDX] Filename suggests '{hint_type}' but checkpoint keys indicate "
+              f"'{detected}' -- using key-based detection for {path.name}")
+        return detected
+
     for hint in _TYPE_HINTS:
         if hint in name:
             return _TYPE_HINTS[hint]
@@ -220,6 +256,64 @@ def _detect_model_type_from_keys(path: Path) -> str:
     if any("txtfusion." in k for k in keys):
         return "krea2"
     return "dev"
+
+
+def _cache_entry_holds_asdx_model(entry: Any) -> bool:
+    outputs = getattr(entry, "outputs", None)
+    if not outputs:
+        return False
+    return any(isinstance(o, dict) and o.get("type") == "asdx_model" for o in outputs)
+
+
+def _purge_stale_asdx_cache_entries() -> int:
+    """Drop ComfyUI's own execution-level cache entries that still hold a
+    previous "asdx_model" payload, so its MLX arrays actually become
+    unreachable and `bridge.clear_mlx_cache()` can free them.
+
+    ComfyUI's node-output cache (`comfy_execution/caching.py`, RAMPressureCache
+    by default) keys entries by (node_id, input signature) -- switching
+    `model_name`/`ckpt_name` produces a *new* key, so the old entry (with the
+    old MLX transformer inside) is never overwritten, only left alongside the
+    new one. Its own RAM-pressure eviction (`RAMPressureCache.ram_release`)
+    only scores `torch.Tensor` (cpu) and `ModelPatcher` outputs; our plain
+    "asdx_model" dict falls through both checks and gets the ~0-byte default
+    weight, so it's effectively never chosen for eviction -- its MLX arrays
+    stay reachable from that cache regardless of what `_MODEL_CACHE.clear()`
+    does on our side, and `mx.clear_cache()`/`gc.collect()` can't release
+    memory still referenced from outside our own module.
+
+    Technique ported from ComfyUI-DistorchMemoryManager's
+    `_purge_detailer_segs_and_executor_cache()`: walk `gc.get_objects()` for
+    the live `PromptExecutor` and drop matching entries from its caches in
+    place. Never call `PromptExecutor.reset()` to do this instead -- that
+    swaps in a fresh cache with no `cache_key_set` initialized yet, and the
+    next `caches.outputs.get()` raises `AttributeError`. Scoped to entries
+    that actually hold an "asdx_model" payload (unlike the Distorch original,
+    which clears every cache entry) so unrelated node outputs elsewhere in
+    the graph aren't forced to recompute.
+    """
+    import gc
+
+    purged = 0
+    for obj in gc.get_objects():
+        if type(obj).__name__ != "PromptExecutor":
+            continue
+        caches = getattr(obj, "caches", None)
+        if caches is None:
+            continue
+        for cache in getattr(caches, "all", None) or []:
+            cache_dict = getattr(cache, "cache", None)
+            if not isinstance(cache_dict, dict):
+                continue
+            stale_keys = [k for k, e in cache_dict.items() if _cache_entry_holds_asdx_model(e)]
+            for key in stale_keys:
+                del cache_dict[key]
+                purged += 1
+                for bag_name in ("timestamps", "used_generation", "children", "subcaches"):
+                    bag = getattr(cache, bag_name, None)
+                    if isinstance(bag, dict):
+                        bag.pop(key, None)
+    return purged
 
 
 def _gate_memory_before_load(path: Path, model_type: str, precision: str, low_memory_mode: bool) -> None:
@@ -414,7 +508,12 @@ class ASDX_DiffusionLoader(io.ComfyNode):
         if _MODEL_CACHE:
             print(f"[ASDX] Evicting {len(_MODEL_CACHE)} cached model(s) before loading {model_name}")
             _MODEL_CACHE.clear()
-            bridge.clear_mlx_cache()
+
+        purged = _purge_stale_asdx_cache_entries()
+        if purged:
+            print(f"[ASDX] Purged {purged} stale ComfyUI executor cache entr"
+                  f"{'y' if purged == 1 else 'ies'} holding old model(s)")
+        bridge.clear_mlx_cache()
 
         # Find model file
         path = cls._resolve_model_path(model_name)
@@ -532,6 +631,15 @@ class ASDX_CheckpointLoader(io.ComfyNode):
         # Resolve checkpoint path
         path = cls._resolve_checkpoint_path(ckpt_name)
         model_type = _detect_model_type(path)
+
+        # This loader has no cache of its own (reloads every execute()), so
+        # the only place a previous asdx_model payload can linger is
+        # ComfyUI's own executor cache -- see _purge_stale_asdx_cache_entries.
+        purged = _purge_stale_asdx_cache_entries()
+        if purged:
+            print(f"[ASDX] Purged {purged} stale ComfyUI executor cache entr"
+                  f"{'y' if purged == 1 else 'ies'} holding old model(s)")
+        bridge.clear_mlx_cache()
 
         # ASDX_CheckpointLoader has no low_memory_mode input, so gate with the
         # strict default (False) -- see ASDX_DiffusionLoader.load() for the

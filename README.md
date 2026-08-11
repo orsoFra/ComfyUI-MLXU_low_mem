@@ -144,6 +144,7 @@ heuristic assumes a single, stateless model call per step).
 - **Strategic eval points**: Only at bridge boundaries (PyTorch ↔ MLX)
 - **Cache lifecycle**: `mx.clear_cache()` after sampling completes
 - **Peak memory tracking**: Built into every node for debugging OOM
+- **Stale executor cache purge**: on checkpoint switch, drops ComfyUI's own node-output cache entries still holding a previous model (invisible to its RAM-pressure eviction, which doesn't recognize MLX-backed payloads) so `mx.clear_cache()` can actually reclaim them
 
 ### Precision
 - **float16 default**: Native on Apple Silicon, best performance
