@@ -711,8 +711,29 @@ class ASDX_LoraLoader(io.ComfyNode):
         # lora_A is [rank, in_features], lora_B is [out_features, rank]
         for key, (a, b) in deltas.items():
             if a is not None and b is not None:
-                # Standard LoRA: delta = B @ A
-                delta = (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
+                if a.ndim == 4:
+                    # Conv-style (LyCORIS/LoCon) LoRA: A keeps the full conv
+                    # kernel [rank, in, kh, kw], B is the 1x1 channel-mixing
+                    # projection [out, rank, 1, 1] -- a plain 2D matmul can't
+                    # contract these directly (their trailing dims don't
+                    # align), so flatten A's spatial extent into the matmul's
+                    # contraction dim and reshape back to the conv weight
+                    # shape afterwards.
+                    rank, in_ch, kh, kw = a.shape
+                    out_ch = b.shape[0]
+                    a2d = a.reshape(rank, in_ch * kh * kw).astype(mx.float32)
+                    b2d = b.reshape(out_ch, rank).astype(mx.float32)
+                    delta = (b2d @ a2d).reshape(out_ch, in_ch, kh, kw)
+                    # The checkpoint (and this raw LoRA tensor) is PyTorch
+                    # [out, in, kh, kw], but every native MLX Conv2d parameter
+                    # this delta gets added to is [out, kh, kw, in] (see
+                    # native/sdxl/model.py's checkpoint-load transpose) --
+                    # without this, the delta silently has the wrong shape
+                    # for the target parameter it's summed into.
+                    delta = delta.transpose(0, 2, 3, 1).astype(b.dtype)
+                else:
+                    # Standard LoRA: delta = B @ A
+                    delta = (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
                 lora.deltas[key] = delta
                 if lora.rank == 0:
                     lora.rank = a.shape[0]
