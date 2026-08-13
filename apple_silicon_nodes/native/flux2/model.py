@@ -488,7 +488,7 @@ def load_flux2_transformer(
     from .weight_map import normalize_flux2_keys, map_flux2_to_native
 
     path = Path(path)
-    from .. import _load_safetensors
+    from .. import _load_safetensors, _check_weight_match
     state = _load_safetensors(path)
 
     normalized = normalize_flux2_keys(state)
@@ -511,4 +511,5 @@ def load_flux2_transformer(
     mx.eval(model.parameters())
 
     print(f"[ASDX] Flux2 transformer: matched {matched}/{len(model_flat)} params from checkpoint")
+    _check_weight_match(matched, len(model_flat), "Flux2 transformer", path)
     return model

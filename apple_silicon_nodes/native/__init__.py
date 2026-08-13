@@ -783,9 +783,19 @@ def _dequantize_fp8_scaled(
     128 F8_E4M3 weights, each with exactly one scalar `.weight_scale` +
     `.input_scale` pair, no `.comfy_quant` marker at all -- see
     `weight_format.py` module docstring for the convention this predates).
-    Any weight missing its scale, or a scale that isn't a 0-d/1-element
-    tensor, raises rather than guessing, per this project's fail-closed
-    doctrine (see `_dequantize_comfy_quant_int8` above for the same pattern).
+
+    `classify_quant_format` verdicts at whole-file granularity: one FP8
+    weight anywhere with a scale companion routes the entire file through
+    this function. A bundled "AIO" checkpoint can legitimately mix
+    conventions PER SUBMODULE though (confirmed on
+    `trueRealVisionFlux_v276AIO.safetensors`: the T5 text encoder's 169 FP8
+    weights each carry a `.scale_weight`, the FLUX transformer's 780 FP8
+    weights carry none at all) -- so a weight with no scale companion here
+    is left untouched rather than treated as an error: that is exactly the
+    FP8_NAIVE convention for that one weight, and `_load_safetensors`'s
+    final upcast loop handles it the same way a purely FP8_NAIVE file would.
+    A scale that isn't a 0-d/1-element tensor still raises rather than
+    guessing (see `_dequantize_comfy_quant_int8` above for the same pattern).
     """
     import torch
 
@@ -806,12 +816,10 @@ def _dequantize_fp8_scaled(
                 scale_key = candidate
                 break
         if scale_key is None:
-            raise ValueError(
-                f"ASDX: '{filename}': FP8 weight '{weight_key}' has no matching "
-                f"'.weight_scale'/'.scale_weight' -- refusing to guess a scale "
-                f"of 1.0 (that's exactly the FP8_NAIVE convention, a different "
-                f"format this checkpoint doesn't declare)."
-            )
+            # No companion for THIS weight specifically -- FP8_NAIVE for this
+            # tensor, not a guess (see docstring). Leave it as raw FP8; the
+            # upcast loop in `_load_safetensors` converts it to float32.
+            continue
         scale = state[scale_key]
         if scale.numel() != 1:
             raise ValueError(
@@ -827,6 +835,27 @@ def _dequantize_fp8_scaled(
         if input_scale_key in new_state:
             del new_state[input_scale_key]
     return new_state
+
+
+def _check_weight_match(matched: int, total: int, label: str, path: str | Path) -> None:
+    """Raise if a checkpoint load matched zero of the native model's params.
+
+    A legitimate checkpoint variant can still miss a real chunk of keys (a
+    bias-free-trained Krea2 Turbo checkpoint matches only 430/686 -- see
+    `krea2/model.py::load_krea2_transformer`), so this only guards the
+    unambiguous failure: zero matches means every key was a structural
+    mismatch, e.g. a checkpoint routed to the wrong model family by
+    `loader.py::_detect_model_type`. Left unchecked, the model runs on
+    randomly-initialized weights and silently produces garbage with no
+    error -- only a printed line most users won't notice.
+    """
+    if matched == 0:
+        raise RuntimeError(
+            f"ASDX: {label} matched 0/{total} params from checkpoint "
+            f"'{Path(path).name}' -- its keys don't match the expected "
+            f"architecture at all. It was likely misdetected as the wrong "
+            f"model type; check loader.py::_detect_model_type."
+        )
 
 
 def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
@@ -936,4 +965,5 @@ def load_transformer(
     mx.eval(model.parameters())
 
     print(f"[ASDX] FLUX transformer: matched {matched}/{len(model_flat)} params from checkpoint")
+    _check_weight_match(matched, len(model_flat), "FLUX transformer", path)
     return model

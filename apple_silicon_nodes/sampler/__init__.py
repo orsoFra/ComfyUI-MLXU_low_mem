@@ -150,6 +150,25 @@ class ASDX_MLXSampler(io.ComfyNode):
         model_type = model.get("model_type", "dev")
         capability = model.get("capability")
         controlnet = model.get("controlnet")
+        memory_shape = model.get("memory_shape")
+        # ASDX_LoraSchedule stores its config in the model dict, not through
+        # the legacy ASDX_LORA_SCHEDULE input above (no node produces that
+        # type) -- read it from there, keeping the legacy param as a fallback.
+        lora_schedule = model.get("lora_schedule") or lora_schedule
+
+        # Diagnostic: snapshot memory at the very start of every generation
+        # (this node always re-executes, unlike loader/LoRA nodes which may
+        # be cache-hit) -- lets us see whether the floor left over from the
+        # previous generation is growing across repeated queues, or whether
+        # a single generation's own peak is what's pushing past the jetsam
+        # ceiling.
+        _mps = bridge._mps_allocator_gb()
+        _rss = bridge._process_rss_gb()
+        if _mps is not None and _rss is not None:
+            print(
+                f"[ASDX] Sampler start: process RSS {_rss:.1f}GB, MPS allocator "
+                f"current {_mps[0]:.1f}GB, driver {_mps[1]:.1f}GB"
+            )
 
         # TeaCache/SeaCache's skip heuristic (reuse the previous step's
         # noise_pred) assumes a solver with one model call per step and no
@@ -234,6 +253,7 @@ class ASDX_MLXSampler(io.ComfyNode):
             ref_boost=ref_boost,
             krea2_enhancer_strength=krea2_enhancer_strength,
             controlnet=controlnet,
+            memory_shape=memory_shape,
         )
 
         # Run sampling

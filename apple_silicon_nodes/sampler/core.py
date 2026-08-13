@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from .. import capability as cap_module
+from ..memory_calibration import record_observation
 from ..native.config import FLUX_LATENT_SCALE, FLUX_LATENT_SHIFT
 from . import bridge
 from .cache import TeaCacheState
@@ -82,6 +83,7 @@ class _SamplerCore:
         controlnet: dict | None = None,
         sampler_name: str = "euler",
         scheduler_name: str = "normal",
+        memory_shape: Any | None = None,
     ):
         self.transformer = transformer
         self.config = config
@@ -122,6 +124,7 @@ class _SamplerCore:
         self.controlnet = controlnet
         self.sampler_name = sampler_name
         self.scheduler_name = scheduler_name
+        self.memory_shape = memory_shape
         self._is_flow_matching = model_type != "sdxl"
 
     def run(self, steps: int, seed: int) -> dict:
@@ -463,6 +466,9 @@ class _SamplerCore:
 
         print(f"[ASDX] Sampling complete: {total_time:.1f}s total, "
               f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel_str}")
+
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
 
         bridge.clear_mlx_cache()
 
@@ -1218,6 +1224,9 @@ class _SamplerCore:
             f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak"
         )
 
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
+
         bridge.clear_mlx_cache()
 
         return out_latent
@@ -1282,6 +1291,13 @@ class _SamplerCore:
             step_start = time.perf_counter()
             sigma_t = sigmas[t]
             sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            # Update LoRA schedule
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
 
             xc = sampling.calculate_input(sigma_t, x)
             timestep = mx.array([sampling.timestep(sigma_t)], dtype=mx.float32)
@@ -1348,6 +1364,9 @@ class _SamplerCore:
             f"[ASDX] SDXL Sampling complete: {total_time:.1f}s total, "
             f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, cfg={cfg_scale:.1f}"
         )
+
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
 
         bridge.clear_mlx_cache()
 
@@ -1499,6 +1518,9 @@ class _SamplerCore:
             f"[ASDX] Z-Image Sampling complete: {total_time:.1f}s total, "
             f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel}"
         )
+
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
 
         bridge.clear_mlx_cache()
 
@@ -1674,6 +1696,9 @@ class _SamplerCore:
             f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel}, "
             f"guidance={effective_guidance:.1f}"
         )
+
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
 
         bridge.clear_mlx_cache()
 

@@ -62,16 +62,12 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
 ## ComfyUI Architecture Standards
 
 1. **Custom Node Structure (V3 API)**:
-   * All nodes inherit `io.ComfyNode` (`from comfy_api.latest import io`):
-     * `define_schema(cls) -> io.Schema` (classmethod; `node_id`, `display_name`,
-       `category`, `inputs=[...]`, `outputs=[...]`, `hidden=[...]`).
-     * `execute(cls, ...) -> io.NodeOutput` (classmethod, fixed name -- no `FUNCTION`
-       string, no instance state).
-     * Project-specific pseudo-types (`asdx_model`, `mlx_clip`, `mlx_conditioning`,
-       `mflux_image`, ...) use `io.Custom("type_name")`.
-   * Each node file exports a module-level `NODE_LIST` (list of node classes), merged
-     in `apple_silicon_nodes/__init__.py` into a single `ComfyExtension.get_node_list()`
-     via `comfy_entrypoint()` -- no `NODE_CLASS_MAPPINGS`/`INPUT_TYPES()`/`RETURN_TYPES`.
+   * All nodes inherit `io.ComfyNode` (`from comfy_api.latest import io`). Generic V3
+     API mechanics (`define_schema`/`execute` classmethods, `NODE_LIST`/
+     `comfy_entrypoint()`) are covered by the `comfyui-node-basics` skill -- never fall
+     back to the deprecated V1 `NODE_CLASS_MAPPINGS`/`INPUT_TYPES()`/`RETURN_TYPES`.
+   * Project-specific pseudo-types (`asdx_model`, `mlx_clip`, `mlx_conditioning`,
+     `mflux_image`, ...) use `io.Custom("type_name")`.
    * Side-effecting utility nodes (memory profiler, cache clearer, live preview
      registration) implement `fingerprint_inputs()` returning a fresh value (e.g.
      `time.time()`) so ComfyUI doesn't silently serve a cached result instead of
@@ -85,9 +81,8 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
 
 ## Coding Style & Best Practices
 
-* **Clean Python**: Python 3.10+, fully type-annotated, PEP8 compliant.
-* **Error Handling**: Provide clear logging if MLX or MPS initialization fails.
-* **Performance Logs**: Include optional execution time and unified memory tracking logs.
+* Python 3.10+, fully type-annotated, PEP8 compliant. Log clearly on MLX/MPS init
+  failure; include optional execution-time and unified-memory tracking logs.
 
 ---
 

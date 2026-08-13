@@ -975,7 +975,7 @@ def load_krea2_transformer(
     """
     from mlx.utils import tree_flatten, tree_unflatten
 
-    from .. import _load_safetensors
+    from .. import _load_safetensors, _check_weight_match
 
     # Load state dict
     state_dict = _load_safetensors(path)
@@ -1042,4 +1042,5 @@ def load_krea2_transformer(
     mx.eval(transformer.parameters())
 
     print(f"[ASDX] Krea2 transformer: matched {matched}/{len(model_flat)} params from checkpoint")
+    _check_weight_match(matched, len(model_flat), "Krea2 transformer", path)
     return transformer

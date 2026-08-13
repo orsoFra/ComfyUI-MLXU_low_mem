@@ -330,12 +330,19 @@ def _purge_stale_asdx_cache_entries() -> int:
     return purged
 
 
-def _gate_memory_before_load(path: Path, model_type: str, precision: str, low_memory_mode: bool) -> None:
+def _gate_memory_before_load(
+    path: Path, model_type: str, precision: str, low_memory_mode: bool
+) -> LoadShape | None:
     """Predict the checkpoint's peak memory footprint and refuse to load if it
     clearly cannot fit -- see `memory_calibration.py` for the two-tier
     (measured vs. heuristic) prediction and the two-level refuse/warn
     threshold. Header-only read (no tensor data), independent of the
     `_load_safetensors` gate that runs later in `_load_transformer_for_type`.
+
+    Returns the `LoadShape` used for the gate (or None if the header couldn't
+    be read) so the caller can stash it on the model descriptor -- the
+    sampler needs the exact same shape later to record a real observed peak
+    against this same key, see `record_observation`.
     """
     try:
         header = read_safetensors_header(path)
@@ -343,7 +350,7 @@ def _gate_memory_before_load(path: Path, model_type: str, precision: str, low_me
         quant_format_str = "unknown" if isinstance(quant_format, Unrecognized) else quant_format.value
     except Exception as e:
         print(f"[ASDX] memory_calibration: header read failed ({e}), skipping memory gate")
-        return
+        return None
 
     shape = LoadShape(
         family=model_type,
@@ -353,6 +360,7 @@ def _gate_memory_before_load(path: Path, model_type: str, precision: str, low_me
         file_size_bytes=path.stat().st_size,
     )
     check_fits_or_warn(shape)
+    return shape
 
 
 def _load_transformer_for_type(
@@ -536,7 +544,7 @@ class ASDX_DiffusionLoader(io.ComfyNode):
         # Resolve capability profile (see _capability_for_model_type).
         capability = _capability_for_model_type(model_type, path)
 
-        _gate_memory_before_load(path, model_type, precision, low_memory_mode)
+        memory_shape = _gate_memory_before_load(path, model_type, precision, low_memory_mode)
 
         # Load transformer based on model type (FLUX.1, Krea2, SDXL, or Z-Image)
         transformer, config = _load_transformer_for_type(
@@ -562,6 +570,7 @@ class ASDX_DiffusionLoader(io.ComfyNode):
             "capability": capability,
             "load_time": 0.0,
             "low_memory_mode": low_memory_mode,
+            "memory_shape": memory_shape,
         }
 
         load_time = time.perf_counter() - t0
@@ -658,7 +667,7 @@ class ASDX_CheckpointLoader(io.ComfyNode):
         # ASDX_CheckpointLoader has no low_memory_mode input, so gate with the
         # strict default (False) -- see ASDX_DiffusionLoader.load() for the
         # variant that honors a user-supplied low_memory_mode.
-        _gate_memory_before_load(path, model_type, precision, low_memory_mode=False)
+        memory_shape = _gate_memory_before_load(path, model_type, precision, low_memory_mode=False)
 
         # Load diffusion model based on type
         transformer, config = _load_transformer_for_type(
@@ -684,6 +693,7 @@ class ASDX_CheckpointLoader(io.ComfyNode):
             "model_type": model_type,
             "precision": precision,
             "capability": capability,
+            "memory_shape": memory_shape,
         }
 
         # Real comfy.sd.CLIP + comfy.sd.VAE, extracted from the same checkpoint

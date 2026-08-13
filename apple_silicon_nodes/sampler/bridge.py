@@ -13,6 +13,8 @@ from ..bridge import (  # noqa: F401
     FLUX2_LATENT_CHANNELS,
     FLUX2_VAE_DOWNSCALE,
     SDXL_LATENT_CHANNELS,
+    _mps_allocator_gb,
+    _process_rss_gb,
     collect_mlx_memory,
     conditioning_flux2_to_mlx,
     conditioning_sdxl_to_mlx,

@@ -389,7 +389,7 @@ def load_zimage_transformer(path, dtype: str = "float16") -> NextDiT:
     """
     from mlx.utils import tree_flatten, tree_unflatten
 
-    from .. import _load_safetensors
+    from .. import _load_safetensors, _check_weight_match
     from .weight_map import normalize_zimage_keys, map_zimage_to_native
 
     state_dict = _load_safetensors(path)
@@ -413,4 +413,5 @@ def load_zimage_transformer(path, dtype: str = "float16") -> NextDiT:
     mx.eval(transformer.parameters())
 
     print(f"[ASDX] Z-Image transformer: matched {matched}/{len(model_flat)} params from checkpoint")
+    _check_weight_match(matched, len(model_flat), "Z-Image transformer", path)
     return transformer

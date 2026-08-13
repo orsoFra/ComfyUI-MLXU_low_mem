@@ -13,6 +13,7 @@ Supports:
 
 from __future__ import annotations
 
+import copy
 import re
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 import torch
 
 from comfy_api.latest import io
@@ -27,6 +29,8 @@ from comfy_api.latest import io
 from . import bridge
 from .native import FluxTransformer
 from .native.flux2 import Flux2Transformer
+from .native.krea2 import SingleStreamDiT
+from .native.zimage import NextDiT
 from .native.safetensors_header import read_safetensors_header
 from .native.sdxl import UNetModel as SDXLUNetModel
 
@@ -215,8 +219,16 @@ _KREA2_LORA_TARGETS: tuple[LoRATarget, ...] = (
 class LoRAAdapter:
     """A single LoRA adapter with its weights and scale."""
     name: str
-    # Map from (block_index, layer_type, param) -> delta weight
+    # Map from (block_index, layer_type, param) -> delta weight. Only holds
+    # already-final deltas (ComfyUI .diff/.diff_b format, or the rare
+    # single-sided A-only/B-only case) -- everything else lives in `factors`
+    # below and is never materialized here.
     deltas: dict[tuple[int, str, str], mx.array] = field(default_factory=dict)
+    # Raw (A, B) low-rank factor pairs, keyed the same way as `deltas`. Kept
+    # UNMATERIALIZED (rank*in + out*rank elements, not out*in) until a
+    # specific target is actually consumed by _materialize_delta -- see that
+    # function's docstring for why (duplication source #1 in the canon).
+    factors: dict[tuple[int, str, str], tuple[mx.array, mx.array]] = field(default_factory=dict)
     # None means the file has no ".alpha" key (see _load_lora_file) -- not
     # the same as alpha=1.0, the two fall back to different scales below.
     alpha: float | None = None
@@ -259,6 +271,677 @@ def base_lora_scale(alpha: float | None, rank: int) -> float:
     simply doesn't ship an alpha key.
     """
     return alpha / max(rank, 1) if alpha is not None else 1.0
+
+
+def _delta_from_factors(a: mx.array, b: mx.array) -> mx.array:
+    """Compute the full-size `[out, in]` delta from a raw low-rank `(A, B)`
+    factor pair -- `lora_A`/`lora_B` (or kohya `lora_down`/`lora_up`)
+    convention: A is `[rank, in_features]`, B is `[out_features, rank]`.
+
+    Split out of `_load_lora_file`'s old eager conversion loop so the same
+    logic can run lazily, once per consumed target, from `_materialize_delta`
+    below (see its docstring for why this must not run for every target up
+    front).
+    """
+    if a.ndim == 4:
+        # Conv-style (LyCORIS/LoCon) LoRA: A keeps the full conv kernel
+        # [rank, in, kh, kw], B is the 1x1 channel-mixing projection
+        # [out, rank, 1, 1] -- a plain 2D matmul can't contract these
+        # directly (their trailing dims don't align), so flatten A's
+        # spatial extent into the matmul's contraction dim and reshape back
+        # to the conv weight shape afterwards.
+        rank, in_ch, kh, kw = a.shape
+        out_ch = b.shape[0]
+        a2d = a.reshape(rank, in_ch * kh * kw).astype(mx.float32)
+        b2d = b.reshape(out_ch, rank).astype(mx.float32)
+        delta = (b2d @ a2d).reshape(out_ch, in_ch, kh, kw)
+        # The checkpoint (and this raw LoRA tensor) is PyTorch
+        # [out, in, kh, kw], but every native MLX Conv2d parameter this
+        # delta gets added to is [out, kh, kw, in] (see native/sdxl/model.py's
+        # checkpoint-load transpose) -- without this, the delta silently has
+        # the wrong shape for the target parameter it's summed into.
+        return delta.transpose(0, 2, 3, 1).astype(b.dtype)
+    # Standard LoRA: delta = B @ A
+    return (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
+
+
+def _materialize_delta(key: str, lora: "LoRAAdapter") -> mx.array | None:
+    """Resolve a single LoRA target key to its full-size `[out, in]` delta,
+    computed on demand from `lora.factors`' tiny low-rank pair rather than
+    pre-materialized for every target in the file at load time.
+
+    `_load_lora_file` used to compute `delta = B @ A` for EVERY target up
+    front, so the full set of deltas (near-full-size relative to every
+    touched base weight, for a densely-targeted LoRA) stayed alive for the
+    entire merge in `_apply_lora_to_transformer` on top of the whole-model
+    rebuild that merge also builds -- one of two independent duplication
+    sources behind the OOM crashes this was written to fix (see the canon).
+    Calling this per-target, right where `_apply_lora_to_transformer`'s
+    existing chunked eval/`clear_cache` loop already consumes the result,
+    means at most one full-size delta is transiently alive per call instead
+    of the whole file's worth concurrently.
+    """
+    delta = lora.deltas.get(key)
+    if delta is not None:
+        return delta
+    pair = lora.factors.get(key)
+    if pair is None:
+        return None
+    return _delta_from_factors(*pair)
+
+
+# ── Forward-time-residual LoRA (Phase 1: Krea2 only) ────────────────────
+#
+# See canon "LoRA target architecture is mlx-gen's forward-time residual
+# (AdaptableLinear), ported in phases; Phase 0 done" -- this is Phase 1.
+# Unlike `_apply_lora_to_transformer`'s merge below (which computes a
+# full-size `delta = B @ A` per target via `_materialize_delta` and rebuilds
+# the ENTIRE parameter tree via `type(transformer)(config)` +
+# `tree_unflatten`), this attaches each target's raw `(A, B)` factor pair
+# (or, rarely, a full diff-format delta) directly to the one Linear it
+# targets and evaluates the residual `x @ A.T @ B.T` at forward time --
+# never materializing a full-size `[out, in]` array and never rebuilding
+# anything but the object-graph path from the transformer root down to each
+# touched Linear (`copy.copy` on an MLX `Module`, a `dict` subclass, is an
+# O(1) shallow copy per level -- see mlx.nn.layers.base.Module). Krea2 is
+# the Phase 1 target because its `SingleStreamDiT` has no fused qkv/linear1
+# weights (unlike FLUX.1/Flux.2's `double_blocks.*.img_attn.qkv` etc.), so
+# every raw file key maps to exactly one Linear with no multi-adapter slice
+# assembly needed -- see Phase 2 in the canon for the fused case.
+
+class AdaptableLinear(nn.Linear):
+    """`nn.Linear` with zero or more LoRA contributions applied as a
+    forward-time residual instead of merged into `.weight`/`.bias`.
+
+    `_lora_factors` is a plain python list with a leading underscore --
+    MLX's `Module.valid_parameter_filter` excludes any dict/list attribute
+    whose key starts with `_` from `.parameters()`, so it never shows up in
+    `tree_flatten(transformer.parameters())`, `mx.eval(transformer.
+    parameters())`, or a checkpoint save -- it is per-application scratch,
+    not a model weight.
+
+    Only genuine low-rank `(A, B)` pairs live here as a forward-time
+    residual (`base(x) + scale * (x @ A.T @ B.T)`) -- cheap in both memory
+    (rank*dim, not out*in) and per-forward compute. A target that's already
+    a full `[out, in]` delta (ComfyUI `.diff`/`.diff_b`, or a diffusers/
+    PEFT LoRA's multi-component-assembled delta) is merged directly into
+    `.weight` ONCE via `merge_delta` instead -- see that method's docstring
+    for why (confirmed via a real generation log: holding a full-size delta
+    as a forever-recomputed residual instead roughly doubled both peak
+    memory and per-step latency, worsening across repeated cache-hit reuses
+    of the same model).
+    """
+
+    def __init__(self, input_dims: int, output_dims: int, bias: bool = True):
+        super().__init__(input_dims, output_dims, bias=bias)
+        self._lora_factors: list[tuple[mx.array, mx.array, float]] = []
+
+    def __call__(self, x: mx.array) -> mx.array:
+        y = super().__call__(x)
+        for a, b, scale in self._lora_factors:
+            residual = (x.astype(a.dtype) @ a.T) @ b.T
+            y = y + (scale * residual).astype(y.dtype)
+        return y
+
+    def merge_delta(self, delta: mx.array, scale: float) -> None:
+        """Merge a full-size `[out, in]` delta directly into `.weight`, a
+        ONE-TIME cost -- unlike `_lora_factors`' residual, this is never
+        held resident beyond the merge itself and never recomputed on
+        subsequent forward calls, reproducing the old merge path's exact
+        cost profile for a target that can't be represented as a cheap
+        low-rank residual. `self` must already be a private, freshly-cloned
+        leaf (see `_ensure_adaptable`) -- `weight = weight + x` never
+        mutates the underlying buffer in place (MLX arrays are immutable
+        value objects), it rebinds `self`'s own `.weight` entry to a new
+        array, so this is safe even though the clone initially shares the
+        same underlying array reference as the leaf it was cloned from.
+        """
+        self.weight = self.weight + (scale * delta).astype(self.weight.dtype)
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> "AdaptableLinear":
+        """Wrap an existing plain `nn.Linear`'s `.weight`/`.bias` BY
+        REFERENCE (no copy, no re-init) -- only the wrapper object is new,
+        the underlying base-model weight data is never duplicated.
+        """
+        new = cls.__new__(cls)
+        nn.Module.__init__(new)
+        new._lora_factors = []
+        new.weight = linear.weight
+        if "bias" in linear:
+            new.bias = linear.bias
+        return new
+
+
+def _upsert_lora_factor(leaf: AdaptableLinear, a: mx.array, b: mx.array, scale: float) -> None:
+    """Attach `(a, b, scale)` to `leaf`, ADDING `scale` onto an existing
+    entry that already uses the exact same `a`/`b` arrays (by identity)
+    instead of appending a duplicate.
+
+    This is what makes `ASDX_LoraSchedule`'s per-step re-application of the
+    SAME LoRA both correct and cheap: `sampler/core.py::_update_lora_schedule`
+    calls back into the attach path every step with `lora.scale` temporarily
+    set to `delta_scale = new_scale - scale_prev` (not the absolute new
+    scale -- see its own docstring), relying on the MERGE path's `value =
+    value + delta*delta_scale` to make repeated calls converge on
+    `orig_value + delta*new_scale` without compounding. `a`/`b` are the
+    exact same array objects across every one of those calls (they live in
+    `lora.factors`, never recreated), so adding `delta_scale` onto the
+    existing entry's scale reproduces that identical accumulation for the
+    residual path -- `scale_prev + (new_scale - scale_prev) == new_scale` --
+    with ZERO changes needed in sampler/core.py. Without this, every
+    sampling step would instead APPEND a new redundant `(a, b, delta_scale)`
+    entry, making the forward pass iterate one more low-rank matmul per step
+    per touched leaf forever (unbounded, O(steps) growth per leaf).
+
+    A genuinely different adapter targeting the same leaf (different `a`/`b`
+    identity -- e.g. `ASDX_MultiLoraLoader` chaining a second, distinct LoRA
+    file) is unaffected and still appends its own separate entry.
+    """
+    for i, (existing_a, existing_b, existing_scale) in enumerate(leaf._lora_factors):
+        if existing_a is a and existing_b is b:
+            leaf._lora_factors[i] = (a, b, existing_scale + scale)
+            return
+    leaf._lora_factors.append((a, b, scale))
+
+
+def _lookup_native_or_kohya(
+    lora: "LoRAAdapter", native_key: str
+) -> tuple[tuple[mx.array, mx.array] | None, mx.array | None]:
+    """Look up `native_key` in `lora.factors`/`lora.deltas` directly, then
+    fall back to the kohya-ss (sd-scripts) flat naming convention (dots
+    replaced by underscores, `lora_unet_` prefix) that a large fraction of
+    real community-trained FLUX/Krea2/Z-Image LoRAs (not just SD/SDXL)
+    actually ship as -- confirmed against real Civitai FLUX.1 LoRAs whose
+    raw keys are e.g. `lora_unet_double_blocks_0_img_attn_proj.lora_up.
+    weight`, not the dotted native form. The candidate is built FROM the
+    known real key, forward (native -> flat), exactly like the original
+    merge path's identical fallback -- never reverse-engineered from the
+    flat string, which is ambiguous whenever a leaf name itself contains an
+    underscore (e.g. `gate_proj`, `img_mlp_0`). Returns `(factor_pair,
+    None)`, `(None, delta)`, or `(None, None)` if neither form matches.
+    """
+    pair = lora.factors.get(native_key)
+    if pair is not None:
+        return pair, None
+    delta = lora.deltas.get(native_key)
+    if delta is not None:
+        return None, delta
+    stem, _, suffix = native_key.rpartition(".")
+    kohya_key = f"lora_unet_{stem.replace('.', '_')}.{suffix}"
+    pair = lora.factors.get(kohya_key)
+    if pair is not None:
+        return pair, None
+    return None, lora.deltas.get(kohya_key)
+
+
+_KREA2_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("attn",), "wq"), (("attn",), "wk"), (("attn",), "wv"),
+    (("attn",), "wo"), (("attn",), "gate_proj"),
+    (("mlp",), "gate"), (("mlp",), "up"), (("mlp",), "down"),
+)
+
+
+def _clone_block_path(
+    container: list, touched: dict[int, Any], idx: int, path: tuple[str, ...]
+) -> Any | None:
+    """Shallow-clone `container[idx]` (cached in `touched` so repeated
+    targets in the same block/call reuse the same clone) and each attribute
+    named in `path` in turn -- e.g. `("attn",)` for Krea2, `("img_attn",)`
+    for a FLUX double-block's image-side attention, or `()` for a leaf that
+    sits directly on the block (FLUX's `single_blocks.*.linear1`). Returns
+    the final module the leaf attribute should be looked up on, or None if
+    any name in `path` doesn't exist.
+
+    Each clone in the chain is made FROM the already-updated parent, never
+    from the pristine original, so repeated calls for the same block/path
+    within one attach call keep carrying forward every previously wrapped
+    sibling leaf by reference instead of reverting it -- no second cache is
+    needed for that.
+    """
+    block = touched.get(idx)
+    if block is None:
+        block = copy.copy(container[idx])
+        container[idx] = block
+        touched[idx] = block
+    module = block
+    for name in path:
+        sub = getattr(module, name, None)
+        if sub is None:
+            return None
+        sub = copy.copy(sub)
+        setattr(module, name, sub)
+        module = sub
+    return module
+
+
+def _ensure_adaptable(leaf: nn.Linear) -> AdaptableLinear:
+    """Return an `AdaptableLinear` for `leaf`: wrap it fresh if it's still a
+    plain `nn.Linear`, or clone it (and its adapter lists) if it's already
+    an `AdaptableLinear` from an EARLIER, separate LoRA attach call (e.g.
+    `ASDX_MultiLoraLoader` chaining several LoRAs) -- the transformer that
+    earlier leaf lives on may still be referenced elsewhere, so clone before
+    appending rather than mutating a possibly-shared object in place.
+    """
+    if isinstance(leaf, AdaptableLinear):
+        clone = copy.copy(leaf)
+        clone._lora_factors = list(leaf._lora_factors)
+        return clone
+    return AdaptableLinear.from_linear(leaf)
+
+
+def _adapt_leaf(
+    container: list, touched: dict[int, Any], idx: int, path: tuple[str, ...], leaf_name: str
+) -> AdaptableLinear | None:
+    """Resolve `container[idx].<path...>.<leaf_name>` to an
+    `AdaptableLinear`, shallow-cloning the path down to it (see
+    `_clone_block_path`) and wrapping it on first touch (see
+    `_ensure_adaptable`). Returns None if the path/leaf don't actually exist
+    (a regex match that isn't a real attribute).
+    """
+    module = _clone_block_path(container, touched, idx, path)
+    if module is None:
+        return None
+    leaf = getattr(module, leaf_name, None)
+    if leaf is None:
+        return None
+    leaf = _ensure_adaptable(leaf)
+    setattr(module, leaf_name, leaf)
+    return leaf
+
+
+def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
+    """Krea2-only Phase 1 forward-time-residual LoRA attach -- see the
+    module comment above. Returns a NEW transformer object (never mutates
+    `transformer` in place, matching `_apply_lora_to_transformer`'s own
+    contract) whose untouched blocks/layers are the exact same objects as
+    the input's.
+    """
+    new_blocks = list(transformer.blocks)
+    touched_blocks: dict[int, Any] = {}
+    applied = 0
+    total = len(lora.factors) + len(lora.deltas)
+
+    for idx in range(len(new_blocks)):
+        for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
+            native_key = f"blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
+            pair, delta = _lookup_native_or_kohya(lora, native_key)
+            if pair is None and delta is None:
+                continue
+            leaf = _adapt_leaf(new_blocks, touched_blocks, idx, path, leaf_name)
+            if leaf is None:
+                continue
+            if pair is not None:
+                a, b = pair
+                _upsert_lora_factor(leaf, a, b, lora.scale)
+            else:
+                leaf.merge_delta(delta, lora.scale)
+            applied += 1
+
+    # `txtfusion` (TextFusionTransformer) is a nested submodule with its
+    # OWN two block lists (`layerwise_blocks`/`refiner_blocks`, both
+    # `TextFusionBlock` -- identical `.attn`/`.mlp` shape to the main
+    # `SingleStreamBlock`, so `_KREA2_RESIDUAL_TARGETS` applies unchanged)
+    # plus a standalone `projector` Linear. Confirmed against real LoRA
+    # files that the MAJORITY of this project's character/clothing Krea2
+    # LoRAs target ONLY `txtfusion.*` and never touch the main `blocks.*`
+    # at all -- omitting this would silently apply zero deltas for most of
+    # a real Krea2 LoRA library, not just an edge case.
+    txtfusion_layerwise = list(transformer.txtfusion.layerwise_blocks)
+    txtfusion_refiner = list(transformer.txtfusion.refiner_blocks)
+    touched_layerwise: dict[int, Any] = {}
+    touched_refiner: dict[int, Any] = {}
+    for sub_list_name, container, touched_map in (
+        ("layerwise_blocks", txtfusion_layerwise, touched_layerwise),
+        ("refiner_blocks", txtfusion_refiner, touched_refiner),
+    ):
+        for idx in range(len(container)):
+            for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
+                native_key = (f"txtfusion.{sub_list_name}.{idx}."
+                              + "".join(f"{p}." for p in path) + f"{leaf_name}.weight")
+                pair, delta = _lookup_native_or_kohya(lora, native_key)
+                if pair is None and delta is None:
+                    continue
+                leaf = _adapt_leaf(container, touched_map, idx, path, leaf_name)
+                if leaf is None:
+                    continue
+                if pair is not None:
+                    a, b = pair
+                    _upsert_lora_factor(leaf, a, b, lora.scale)
+                else:
+                    leaf.merge_delta(delta, lora.scale)
+                applied += 1
+
+    new_projector = None
+    proj_pair, proj_delta = _lookup_native_or_kohya(lora, "txtfusion.projector.weight")
+    if proj_pair is not None or proj_delta is not None:
+        new_projector = _ensure_adaptable(transformer.txtfusion.projector)
+        if proj_pair is not None:
+            a, b = proj_pair
+            _upsert_lora_factor(new_projector, a, b, lora.scale)
+        else:
+            new_projector.merge_delta(proj_delta, lora.scale)
+        applied += 1
+
+    # `first` (image-token input projection) and `last.linear` (output
+    # projection) are standalone top-level Linears, same treatment.
+    new_first = None
+    first_pair, first_delta = _lookup_native_or_kohya(lora, "first.weight")
+    if first_pair is not None or first_delta is not None:
+        new_first = _ensure_adaptable(transformer.first)
+        if first_pair is not None:
+            a, b = first_pair
+            _upsert_lora_factor(new_first, a, b, lora.scale)
+        else:
+            new_first.merge_delta(first_delta, lora.scale)
+        applied += 1
+
+    new_last = None
+    last_pair, last_delta = _lookup_native_or_kohya(lora, "last.linear.weight")
+    if last_pair is not None or last_delta is not None:
+        new_last_linear = _ensure_adaptable(transformer.last.linear)
+        if last_pair is not None:
+            a, b = last_pair
+            _upsert_lora_factor(new_last_linear, a, b, lora.scale)
+        else:
+            new_last_linear.merge_delta(last_delta, lora.scale)
+        new_last = copy.copy(transformer.last)
+        new_last.linear = new_last_linear
+        applied += 1
+
+    touched_txtfusion = bool(touched_layerwise) or bool(touched_refiner) or new_projector is not None
+    if not touched_blocks and not touched_txtfusion and new_first is None and new_last is None:
+        print("[ASDX] LoRA: no matching weights found")
+        return transformer
+
+    new_transformer = copy.copy(transformer)
+    if touched_blocks:
+        new_transformer.blocks = new_blocks
+    if touched_txtfusion:
+        new_txtfusion = copy.copy(transformer.txtfusion)
+        if touched_layerwise:
+            new_txtfusion.layerwise_blocks = txtfusion_layerwise
+        if touched_refiner:
+            new_txtfusion.refiner_blocks = txtfusion_refiner
+        if new_projector is not None:
+            new_txtfusion.projector = new_projector
+        new_transformer.txtfusion = new_txtfusion
+    if new_first is not None:
+        new_transformer.first = new_first
+    if new_last is not None:
+        new_transformer.last = new_last
+    print(f"[ASDX] LoRA (residual): attached {applied}/{total} adapters")
+    return new_transformer
+
+
+# ── Forward-time-residual LoRA (Phase 2: FLUX.1 / Flux.2) ───────────────
+#
+# See canon Phase 2. A BFL-native LoRA file targets a fused qkv/linear1
+# weight as ONE tensor (same shape as the whole Linear it patches), so it's
+# structurally identical to Krea2's Phase 1 case -- a pure low-rank residual,
+# zero full-size materialization. A diffusers/PEFT-trained LoRA instead
+# splits that same fused weight into separate per-component factor pairs
+# (to_q/to_k/to_v[/proj_mlp]), each with its own independent rank -- these
+# can't be represented as a single low-rank residual, so they're assembled
+# into one full-width delta with the EXACT SAME math the merge path already
+# uses (`_assemble_fused_delta`, reached here via the existing
+# `_resolve_flux_diffusers_lora`/`_resolve_flux2_diffusers_lora`, unchanged
+# since Phase 0 already made them pull from `lora` lazily) and attached as a
+# single full-width residual delta instead. That still avoids the
+# whole-model rebuild and never touches any weight but this one fused
+# Linear -- it just can't skip materializing this one target the way a
+# native-format LoRA's targets can.
+#
+# Unlike the merge path, this never walks the model's full flat parameter
+# list -- only the fixed, small set of known fused/leaf target names per
+# block is probed (10 per double block, 3 per single block), so cost is
+# O(num_blocks), not O(whole model).
+#
+# `img_mod.lin`/`txt_mod.lin`/`modulation.lin` are included even though
+# FLUX.1's OWN training code rarely targets them, because
+# `_FLUX_DOUBLE_DIFFUSERS_RENAME`/`_FLUX_SINGLE_DIFFUSERS_RENAME` already
+# prove they're real, confirmed diffusers-trained LoRA targets (mapped from
+# `norm1.linear`/`norm1_context.linear`/`norm.linear`) -- omitting them here
+# would silently drop those deltas exactly like the img_mlp bug the
+# `_normalize_native_lora_key` docstring describes. Flux.2's blocks have no
+# per-block modulation Linear at all (global_modulation=True, see
+# `flux2/model.py`'s `DoubleBlock` docstring), so these three entries are
+# harmless no-ops there (`_adapt_leaf` returns None for a path/leaf that
+# doesn't exist on the block).
+
+_FLUX_DOUBLE_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("img_attn",), "qkv"), (("img_attn",), "proj"),
+    (("txt_attn",), "qkv"), (("txt_attn",), "proj"),
+    (("img_mod",), "lin"), (("txt_mod",), "lin"),
+    ((), "img_mlp_0"), ((), "img_mlp_2"),
+    ((), "txt_mlp_0"), ((), "txt_mlp_2"),
+)
+_FLUX_SINGLE_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((), "linear1"), ((), "linear2"), (("modulation",), "lin"),
+)
+
+
+def _apply_lora_residual_to_flux(transformer: Any, lora: "LoRAAdapter", config: Any, is_flux2: bool) -> Any:
+    """FLUX.1/Flux.2-only Phase 2 forward-time-residual LoRA attach -- see
+    the module comment above. Returns a NEW transformer object whose
+    untouched blocks/layers are the exact same objects as the input's.
+    """
+    double_container = list(transformer.double_blocks)
+    single_container = list(transformer.single_blocks)
+    touched_double: dict[int, Any] = {}
+    touched_single: dict[int, Any] = {}
+    applied = 0
+    total = len(lora.factors) + len(lora.deltas)
+
+    hidden_dim = config.hidden_size if is_flux2 else config.hidden_dim
+    mlp_dim = None if is_flux2 else config.mlp_dim
+
+    def _attach(container: list, touched: dict[int, Any], idx: int, native_key: str, path: tuple[str, ...], leaf_name: str) -> int:
+        # Raw low-rank pair for THIS exact fused target, native-dotted or
+        # kohya-flat -- the common case (both are whole, un-split targets),
+        # zero full-size materialization either way.
+        pair, delta = _lookup_native_or_kohya(lora, native_key)
+        if pair is not None:
+            leaf = _adapt_leaf(container, touched, idx, path, leaf_name)
+            if leaf is None:
+                return 0
+            a, b = pair
+            _upsert_lora_factor(leaf, a, b, lora.scale)
+            return 1
+        # Rare diff-format/single-sided delta already stored whole, or a
+        # diffusers/PEFT-trained LoRA's assembled multi-component delta.
+        consumed = 1 if delta is not None else 0
+        if delta is None:
+            if is_flux2:
+                delta, consumed = _resolve_flux2_diffusers_lora(native_key, lora, hidden_dim)
+            else:
+                delta, consumed = _resolve_flux_diffusers_lora(native_key, lora, hidden_dim, mlp_dim)
+        if delta is None:
+            return 0
+        leaf = _adapt_leaf(container, touched, idx, path, leaf_name)
+        if leaf is None:
+            return 0
+        leaf.merge_delta(delta, lora.scale)
+        return consumed
+
+    for idx in range(len(double_container)):
+        for path, leaf_name in _FLUX_DOUBLE_RESIDUAL_TARGETS:
+            native_key = f"double_blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
+            applied += _attach(double_container, touched_double, idx, native_key, path, leaf_name)
+
+    for idx in range(len(single_container)):
+        for path, leaf_name in _FLUX_SINGLE_RESIDUAL_TARGETS:
+            native_key = f"single_blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
+            applied += _attach(single_container, touched_single, idx, native_key, path, leaf_name)
+
+    # Top-level, non-block-list targets -- `img_in`/`txt_in`/`final_layer.
+    # linear`/the MLP embedders/Flux.2's global modulation. Confirmed
+    # against a real Flux.2 "Turbo" LoRA that targets exactly
+    # `double_stream_modulation_img.lin`/`double_stream_modulation_txt.lin`/
+    # `final_layer.linear` and nothing else in double_blocks/single_blocks
+    # -- omitting these would silently apply zero deltas for that file.
+    # `LastLayer.adaLN_modulation` and any Sequential-wrapped embedder
+    # internals are NOT covered (same pre-existing `.layers.` Sequential
+    # key-mapping gap as Krea2's `tmlp`/`tproj`/`txtmlp`, out of scope
+    # here -- see canon).
+    def _attach_standalone(native_key: str, current_leaf: Any) -> AdaptableLinear | None:
+        if current_leaf is None:
+            return None
+        pair, delta = _lookup_native_or_kohya(lora, native_key)
+        if pair is None and delta is None:
+            return None
+        leaf = _ensure_adaptable(current_leaf)
+        if pair is not None:
+            a, b = pair
+            _upsert_lora_factor(leaf, a, b, lora.scale)
+        else:
+            leaf.merge_delta(delta, lora.scale)
+        return leaf
+
+    def _attach_embedder(name: str) -> Any | None:
+        embedder = getattr(transformer, name, None)
+        if embedder is None:
+            return None
+        new_in = _attach_standalone(f"{name}.in_layer.weight", getattr(embedder, "in_layer", None))
+        new_out = _attach_standalone(f"{name}.out_layer.weight", getattr(embedder, "out_layer", None))
+        if new_in is None and new_out is None:
+            return None
+        new_embedder = copy.copy(embedder)
+        if new_in is not None:
+            new_embedder.in_layer = new_in
+        if new_out is not None:
+            new_embedder.out_layer = new_out
+        return new_embedder
+
+    new_img_in = _attach_standalone("img_in.weight", getattr(transformer, "img_in", None))
+    new_txt_in = _attach_standalone("txt_in.weight", getattr(transformer, "txt_in", None))
+    new_time_in = _attach_embedder("time_in")
+    new_vector_in = _attach_embedder("vector_in")      # FLUX.1 only
+    new_guidance_in = _attach_embedder("guidance_in")  # None on non-distilled models
+
+    new_final_layer = None
+    final_layer = getattr(transformer, "final_layer", None)
+    if final_layer is not None:
+        new_final_linear = _attach_standalone("final_layer.linear.weight", getattr(final_layer, "linear", None))
+        if new_final_linear is not None:
+            new_final_layer = copy.copy(final_layer)
+            new_final_layer.linear = new_final_linear
+
+    new_mod_img = new_mod_txt = new_mod_single = None
+    if is_flux2:
+        mod_img = getattr(transformer, "double_stream_modulation_img", None)
+        mod_txt = getattr(transformer, "double_stream_modulation_txt", None)
+        mod_single = getattr(transformer, "single_stream_modulation", None)
+        new_mod_img_lin = _attach_standalone(
+            "double_stream_modulation_img.lin.weight", getattr(mod_img, "lin", None))
+        if new_mod_img_lin is not None:
+            new_mod_img = copy.copy(mod_img)
+            new_mod_img.lin = new_mod_img_lin
+        new_mod_txt_lin = _attach_standalone(
+            "double_stream_modulation_txt.lin.weight", getattr(mod_txt, "lin", None))
+        if new_mod_txt_lin is not None:
+            new_mod_txt = copy.copy(mod_txt)
+            new_mod_txt.lin = new_mod_txt_lin
+        new_mod_single_lin = _attach_standalone(
+            "single_stream_modulation.lin.weight", getattr(mod_single, "lin", None))
+        if new_mod_single_lin is not None:
+            new_mod_single = copy.copy(mod_single)
+            new_mod_single.lin = new_mod_single_lin
+
+    top_level = (new_img_in, new_txt_in, new_time_in, new_vector_in,
+                 new_guidance_in, new_final_layer, new_mod_img, new_mod_txt, new_mod_single)
+    applied += sum(1 for v in top_level if v is not None)
+
+    if not touched_double and not touched_single and not any(top_level):
+        print("[ASDX] LoRA: no matching weights found")
+        return transformer
+
+    new_transformer = copy.copy(transformer)
+    if touched_double:
+        new_transformer.double_blocks = double_container
+    if touched_single:
+        new_transformer.single_blocks = single_container
+    if new_img_in is not None:
+        new_transformer.img_in = new_img_in
+    if new_txt_in is not None:
+        new_transformer.txt_in = new_txt_in
+    if new_time_in is not None:
+        new_transformer.time_in = new_time_in
+    if new_vector_in is not None:
+        new_transformer.vector_in = new_vector_in
+    if new_guidance_in is not None:
+        new_transformer.guidance_in = new_guidance_in
+    if new_final_layer is not None:
+        new_transformer.final_layer = new_final_layer
+    if new_mod_img is not None:
+        new_transformer.double_stream_modulation_img = new_mod_img
+    if new_mod_txt is not None:
+        new_transformer.double_stream_modulation_txt = new_mod_txt
+    if new_mod_single is not None:
+        new_transformer.single_stream_modulation = new_mod_single
+    print(f"[ASDX] LoRA (residual): attached {applied}/{total} adapters")
+    return new_transformer
+
+
+# ── Forward-time-residual LoRA (Phase 3: Z-Image) ────────────────────────
+#
+# See canon Phase 3. Z-Image's `NextDiT` has THREE independent block lists
+# (`context_refiner`, `noise_refiner`, `layers`, all `JointTransformerBlock`)
+# instead of Krea2's single `blocks` -- otherwise structurally identical to
+# Phase 1: every real target (`attention.qkv`/`attention.out`/
+# `feed_forward.w1`/`w2`/`w3`) is a whole, un-fused Linear, so a BFL/comfy-
+# native LoRA file's raw key IS the target -- pure low-rank residual, zero
+# full-size materialization. No diffusers/PEFT fused-weight fallback exists
+# for Z-Image in this codebase (same as the merge path this replaces, which
+# also has none -- see `detect_lora_family`'s zimage signature comment
+# about `.attention.to_*` naming spotted in the wild but never resolved).
+
+_ZIMAGE_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("attention",), "qkv"), (("attention",), "out"),
+    (("feed_forward",), "w1"), (("feed_forward",), "w2"), (("feed_forward",), "w3"),
+)
+
+
+def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any:
+    """Z-Image-only Phase 3 forward-time-residual LoRA attach -- see the
+    module comment above. Returns a NEW transformer object whose untouched
+    blocks/layers are the exact same objects as the input's.
+    """
+    containers = {
+        name: list(getattr(transformer, name))
+        for name in ("context_refiner", "noise_refiner", "layers")
+    }
+    touched: dict[str, dict[int, Any]] = {name: {} for name in containers}
+    applied = 0
+    total = len(lora.factors) + len(lora.deltas)
+
+    for container_name, container in containers.items():
+        for idx in range(len(container)):
+            for path, leaf_name in _ZIMAGE_RESIDUAL_TARGETS:
+                native_key = f"{container_name}.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
+                pair, delta = _lookup_native_or_kohya(lora, native_key)
+                if pair is None and delta is None:
+                    continue
+                leaf = _adapt_leaf(container, touched[container_name], idx, path, leaf_name)
+                if leaf is None:
+                    continue
+                if pair is not None:
+                    a, b = pair
+                    _upsert_lora_factor(leaf, a, b, lora.scale)
+                else:
+                    leaf.merge_delta(delta, lora.scale)
+                applied += 1
+
+    if not any(touched.values()):
+        print("[ASDX] LoRA: no matching weights found")
+        return transformer
+
+    new_transformer = copy.copy(transformer)
+    for name, touched_idx in touched.items():
+        if touched_idx:
+            setattr(new_transformer, name, containers[name])
+    print(f"[ASDX] LoRA (residual): attached {applied}/{total} adapters")
+    return new_transformer
 
 
 # ── Diffusers/PEFT FLUX.1 / Flux.2 LoRA key mapping ─────────────────────
@@ -351,27 +1034,27 @@ def _assemble_fused_delta(
 
 
 def _resolve_flux_double_diffusers_lora(
-    flat_key: str, deltas: dict[str, mx.array], hidden_dim: int
+    flat_key: str, lora: "LoRAAdapter", hidden_dim: int
 ) -> tuple[mx.array | None, int]:
     """Resolve a native `double_blocks.*` flat parameter key against a
-    diffusers/PEFT-style LoRA's already-computed per-component deltas.
-    Shared by both FLUX.1 and Flux.2/Klein -- see module-level comment
-    above. Returns (None, 0) if `flat_key` isn't a `double_blocks.*` key or
-    has no diffusers counterpart in `deltas`.
+    diffusers/PEFT-style LoRA's per-component deltas, materialized lazily
+    via `_materialize_delta`. Shared by both FLUX.1 and Flux.2/Klein -- see
+    module-level comment above. Returns (None, 0) if `flat_key` isn't a
+    `double_blocks.*` key or has no diffusers counterpart in `lora`.
     """
     m = _FLUX_DOUBLE_QKV_RE.match(flat_key)
     if m:
         idx, stream = m.group(1), m.group(2)
         sub_names = ("to_q", "to_k", "to_v") if stream == "img_attn" else \
             ("add_q_proj", "add_k_proj", "add_v_proj")
-        pieces = [deltas.get(f"transformer_blocks.{idx}.attn.{name}.weight") for name in sub_names]
+        pieces = [_materialize_delta(f"transformer_blocks.{idx}.attn.{name}.weight", lora) for name in sub_names]
         return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim])
 
     m = _FLUX_DOUBLE_RENAME_RE.match(flat_key)
     if m:
         idx, rest = m.group(1), m.group(2)
         for diffusers_suffix in _FLUX_DOUBLE_DIFFUSERS_RENAME.get(rest, ()):
-            delta = deltas.get(f"transformer_blocks.{idx}.{diffusers_suffix}")
+            delta = _materialize_delta(f"transformer_blocks.{idx}.{diffusers_suffix}", lora)
             if delta is not None:
                 return delta, 1
         return None, 0
@@ -380,15 +1063,15 @@ def _resolve_flux_double_diffusers_lora(
 
 
 def _resolve_flux_diffusers_lora(
-    flat_key: str, deltas: dict[str, mx.array], hidden_dim: int, mlp_dim: int
+    flat_key: str, lora: "LoRAAdapter", hidden_dim: int, mlp_dim: int
 ) -> tuple[mx.array | None, int]:
     """Resolve a native FLUX.1 flat parameter key against a diffusers/PEFT-
-    style LoRA's already-computed per-component deltas (see module-level
-    comment above). Returns (None, 0) if `flat_key` has no diffusers
-    counterpart in `deltas` -- callers fall through to leaving the
-    parameter unchanged.
+    style LoRA's per-component deltas, materialized lazily via
+    `_materialize_delta` (see module-level comment above). Returns (None, 0)
+    if `flat_key` has no diffusers counterpart in `lora` -- callers fall
+    through to leaving the parameter unchanged.
     """
-    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, deltas, hidden_dim)
+    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, lora, hidden_dim)
     if consumed:
         return delta, consumed
 
@@ -396,10 +1079,10 @@ def _resolve_flux_diffusers_lora(
     if m:
         idx = m.group(1)
         pieces = [
-            deltas.get(f"single_transformer_blocks.{idx}.attn.to_q.weight"),
-            deltas.get(f"single_transformer_blocks.{idx}.attn.to_k.weight"),
-            deltas.get(f"single_transformer_blocks.{idx}.attn.to_v.weight"),
-            deltas.get(f"single_transformer_blocks.{idx}.proj_mlp.weight"),
+            _materialize_delta(f"single_transformer_blocks.{idx}.attn.to_q.weight", lora),
+            _materialize_delta(f"single_transformer_blocks.{idx}.attn.to_k.weight", lora),
+            _materialize_delta(f"single_transformer_blocks.{idx}.attn.to_v.weight", lora),
+            _materialize_delta(f"single_transformer_blocks.{idx}.proj_mlp.weight", lora),
         ]
         return _assemble_fused_delta(pieces, [hidden_dim, hidden_dim, hidden_dim, mlp_dim])
 
@@ -408,7 +1091,7 @@ def _resolve_flux_diffusers_lora(
         idx, rest = m.group(1), m.group(2)
         diffusers_suffix = _FLUX_SINGLE_DIFFUSERS_RENAME.get(rest)
         if diffusers_suffix is not None:
-            delta = deltas.get(f"single_transformer_blocks.{idx}.{diffusers_suffix}")
+            delta = _materialize_delta(f"single_transformer_blocks.{idx}.{diffusers_suffix}", lora)
             return delta, (1 if delta is not None else 0)
         return None, 0
 
@@ -416,30 +1099,30 @@ def _resolve_flux_diffusers_lora(
 
 
 def _resolve_flux2_diffusers_lora(
-    flat_key: str, deltas: dict[str, mx.array], hidden_size: int
+    flat_key: str, lora: "LoRAAdapter", hidden_size: int
 ) -> tuple[mx.array | None, int]:
     """Resolve a native Flux.2/Klein flat parameter key against a
-    diffusers/PEFT-style LoRA's already-computed per-component deltas (see
-    module-level comment above). Double-stream blocks reuse
-    `_resolve_flux_double_diffusers_lora`; single-stream blocks are direct
-    renames (`attn.to_qkv_mlp_proj` -> `linear1`, `attn.to_out` ->
-    `linear2`), unlike FLUX.1 which needs 4-way assembly for `linear1`.
+    diffusers/PEFT-style LoRA's per-component deltas, materialized lazily
+    via `_materialize_delta` (see module-level comment above). Double-stream
+    blocks reuse `_resolve_flux_double_diffusers_lora`; single-stream blocks
+    are direct renames (`attn.to_qkv_mlp_proj` -> `linear1`, `attn.to_out`
+    -> `linear2`), unlike FLUX.1 which needs 4-way assembly for `linear1`.
     """
-    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, deltas, hidden_size)
+    delta, consumed = _resolve_flux_double_diffusers_lora(flat_key, lora, hidden_size)
     if consumed:
         return delta, consumed
 
     m = _FLUX_SINGLE_LINEAR1_RE.match(flat_key)
     if m:
         idx = m.group(1)
-        delta = deltas.get(f"single_transformer_blocks.{idx}.attn.to_qkv_mlp_proj.weight")
+        delta = _materialize_delta(f"single_transformer_blocks.{idx}.attn.to_qkv_mlp_proj.weight", lora)
         return delta, (1 if delta is not None else 0)
 
     m = _FLUX_SINGLE_RENAME_RE.match(flat_key)
     if m:
         idx, rest = m.group(1), m.group(2)
         if rest == "linear2.weight":
-            delta = deltas.get(f"single_transformer_blocks.{idx}.attn.to_out.weight")
+            delta = _materialize_delta(f"single_transformer_blocks.{idx}.attn.to_out.weight", lora)
             return delta, (1 if delta is not None else 0)
         return None, 0
 
@@ -548,6 +1231,11 @@ class ASDX_LoraLoader(io.ComfyNode):
     ) -> io.NodeOutput:
         """Load and apply a LoRA adapter to the model (and, if connected, the CLIP)."""
         t0 = time.perf_counter()
+        # Diagnostic: confirms whether ComfyUI actually cache-hits this node
+        # across repeated queues of an unchanged graph, or re-executes it
+        # every run (which would re-merge the LoRA and transiently hold the
+        # previous cached output's transformer alongside the new one).
+        print("[ASDX] LoraLoader.execute() running (cache miss)")
 
         transformer = model["transformer"]
         lora_path = cls._resolve_lora_path(lora_name)
@@ -566,6 +1254,21 @@ class ASDX_LoraLoader(io.ComfyNode):
         # _apply_lora_to_transformer docstring).
         new_transformer = cls._apply_lora_to_transformer(transformer, lora, model["config"])
         new_model = {**model, "transformer": new_transformer}
+
+        # The raw delta/factor arrays are already merged into new_transformer
+        # and never read again below -- `lora` otherwise stays referenced by
+        # this frame right through the clear_mlx_cache() call below, so
+        # gc.collect() finds it still live and can't reclaim it (confirmed
+        # via ASDX_RECORD_MEMORY_EVIDENCE: MPS driver memory stayed pinned
+        # near its post-merge peak instead of dropping back toward the base
+        # transformer's footprint). `lora.factors` (Phase 0) keeps this small
+        # by design even before this clear -- only the un-diffed A/B pairs
+        # ever touched it -- but it's still worth dropping the reference. Do
+        # not apply this to ASDX_LoraSchedule's `lora` -- that one is stored
+        # on the model and its deltas/factors are needed again every
+        # sampling step.
+        lora.deltas = {}
+        lora.factors = {}
 
         # The old (now-orphaned) transformer's arrays are unreferenced after
         # this reassignment, but MLX's allocator won't return that memory to
@@ -707,34 +1410,18 @@ class ASDX_LoraLoader(io.ComfyNode):
                 diff_key = _normalize_native_lora_key(diff_key)
                 lora.deltas[diff_key] = weight_arr
 
-        # Convert (A, B) pairs to delta = B @ A and compute rank
-        # lora_A is [rank, in_features], lora_B is [out_features, rank]
+        # Route each (A, B) pair into `lora.factors` as its raw low-rank
+        # pair, UNMATERIALIZED -- the old code computed `delta = B @ A` for
+        # every target right here, so the full set of full-size deltas
+        # stayed alive for the whole merge on top of the whole-model rebuild
+        # _apply_lora_to_transformer also builds (duplication source #1, see
+        # the canon). Rank is inferred from A/B's shape alone, which needs
+        # no matmul. Actual delta computation now happens lazily, one target
+        # at a time, via _materialize_delta -- called from
+        # _apply_lora_to_transformer right where the result is consumed.
         for key, (a, b) in deltas.items():
             if a is not None and b is not None:
-                if a.ndim == 4:
-                    # Conv-style (LyCORIS/LoCon) LoRA: A keeps the full conv
-                    # kernel [rank, in, kh, kw], B is the 1x1 channel-mixing
-                    # projection [out, rank, 1, 1] -- a plain 2D matmul can't
-                    # contract these directly (their trailing dims don't
-                    # align), so flatten A's spatial extent into the matmul's
-                    # contraction dim and reshape back to the conv weight
-                    # shape afterwards.
-                    rank, in_ch, kh, kw = a.shape
-                    out_ch = b.shape[0]
-                    a2d = a.reshape(rank, in_ch * kh * kw).astype(mx.float32)
-                    b2d = b.reshape(out_ch, rank).astype(mx.float32)
-                    delta = (b2d @ a2d).reshape(out_ch, in_ch, kh, kw)
-                    # The checkpoint (and this raw LoRA tensor) is PyTorch
-                    # [out, in, kh, kw], but every native MLX Conv2d parameter
-                    # this delta gets added to is [out, kh, kw, in] (see
-                    # native/sdxl/model.py's checkpoint-load transpose) --
-                    # without this, the delta silently has the wrong shape
-                    # for the target parameter it's summed into.
-                    delta = delta.transpose(0, 2, 3, 1).astype(b.dtype)
-                else:
-                    # Standard LoRA: delta = B @ A
-                    delta = (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
-                lora.deltas[key] = delta
+                lora.factors[key] = (a, b)
                 if lora.rank == 0:
                     lora.rank = a.shape[0]
             elif a is not None:
@@ -751,7 +1438,8 @@ class ASDX_LoraLoader(io.ComfyNode):
                        if not (isinstance(v, tuple) and v[0] is None and v[1] is None)}
 
         lora.alpha = alpha_value
-        mx.eval(*lora.deltas.values())
+        mx.eval(*lora.deltas.values(),
+                *(t for pair in lora.factors.values() for t in pair))
         return lora
 
     @staticmethod
@@ -779,9 +1467,26 @@ class ASDX_LoraLoader(io.ComfyNode):
         """
         from mlx.utils import tree_flatten, tree_unflatten
 
-        if not lora.deltas:
+        if not lora.deltas and not lora.factors:
             print("[ASDX] LoRA: no matching weights found")
             return transformer
+
+        if isinstance(transformer, SingleStreamDiT):
+            # Krea2 -- Phase 1 forward-time residual (see canon and the
+            # module comment above `AdaptableLinear`), not the merge below.
+            return _apply_lora_residual_to_krea2(transformer, lora)
+        if isinstance(transformer, FluxTransformer):
+            # BFL-native FLUX.1 (and Krea2's non-existent overlap aside --
+            # SingleStreamDiT is checked above and never reaches here) --
+            # Phase 2 forward-time residual, see the module comment above
+            # `_apply_lora_residual_to_flux`.
+            return _apply_lora_residual_to_flux(transformer, lora, config, is_flux2=False)
+        if isinstance(transformer, Flux2Transformer):
+            return _apply_lora_residual_to_flux(transformer, lora, config, is_flux2=True)
+        if isinstance(transformer, NextDiT):
+            # Z-Image -- Phase 3 forward-time residual, see canon and the
+            # module comment above `_apply_lora_residual_to_zimage`.
+            return _apply_lora_residual_to_zimage(transformer, lora)
 
         # key could be something like "double_blocks.0.img_attn.qkv.weight"
         # or "single_blocks.5.mlp_0.weight" — same dotted-string convention
@@ -809,23 +1514,27 @@ class ASDX_LoraLoader(io.ComfyNode):
             from .native.sdxl.weight_map import native_key_to_checkpoint_stem
             checkpoint_stem_fn = native_key_to_checkpoint_stem
 
-        # BFL-native FLUX.1 (native/__init__.py's FluxTransformer -- Krea2 reuses
-        # this exact class, not flux2/sdxl/zimage which have their own) and
-        # Flux.2/Klein (native/flux2/model.py's Flux2Transformer) are the only
-        # families this diffusers/PEFT fallback covers -- see
-        # `_resolve_flux_diffusers_lora`/`_resolve_flux2_diffusers_lora`'s
-        # module comment.
-        flux_diffusers_dims = None
-        flux2_diffusers_hidden_size = None
-        if isinstance(transformer, FluxTransformer):
-            flux_diffusers_dims = (config.hidden_dim, config.mlp_dim)
-        elif isinstance(transformer, Flux2Transformer):
-            flux2_diffusers_hidden_size = config.hidden_size
+        # FLUX.1/Flux.2's diffusers/PEFT fallback (see
+        # `_resolve_flux_diffusers_lora`/`_resolve_flux2_diffusers_lora`) no
+        # longer applies here -- both `FluxTransformer` and `Flux2Transformer`
+        # are intercepted above by `_apply_lora_residual_to_flux` (Phase 2)
+        # before reaching this merge loop, which now only ever runs for
+        # SDXL (and any future family that hasn't gotten a residual port
+        # yet).
 
         new_flat = []
         applied = 0
+        # Evaluated incrementally in chunks below (not all at once at the end)
+        # -- deferring every one of the up-to-256 touched-key delta computations
+        # to a single final mx.eval() forces MLX's lazy graph engine to schedule
+        # and hold temporaries for all of them concurrently, inflating the
+        # transient peak well past the final merged size. Evaluating in small
+        # batches as they're built lets each batch's temporaries be freed
+        # before the next one is computed.
+        _EVAL_CHUNK = 32
+        _pending_eval = []
         for flat_key, value in model_flat:
-            delta = lora.deltas.get(flat_key)
+            delta = _materialize_delta(flat_key, lora)
             if delta is None:
                 # kohya-ss (sd-scripts) flat naming -- used by essentially all SD/
                 # SDXL LoRAs (e.g. Illustrious): dots replaced by underscores and
@@ -849,31 +1558,37 @@ class ASDX_LoraLoader(io.ComfyNode):
                 stem, _, suffix = flat_key.rpartition(".")
                 if checkpoint_stem_fn is not None:
                     stem = checkpoint_stem_fn(stem)
-                delta = lora.deltas.get(f"lora_unet_{stem.replace('.', '_')}.{suffix}")
+                delta = _materialize_delta(f"lora_unet_{stem.replace('.', '_')}.{suffix}", lora)
             consumed = 1 if delta is not None else 0
-            if delta is None and flux_diffusers_dims is not None:
-                # diffusers/PEFT FLUX.1 LoRA (transformer_blocks/
-                # single_transformer_blocks, separate to_q/to_k/to_v) -- see
-                # `_resolve_flux_diffusers_lora`.
-                hidden_dim, mlp_dim = flux_diffusers_dims
-                delta, consumed = _resolve_flux_diffusers_lora(flat_key, lora.deltas, hidden_dim, mlp_dim)
-            if delta is None and flux2_diffusers_hidden_size is not None:
-                # diffusers/PEFT Flux.2/Klein LoRA -- see
-                # `_resolve_flux2_diffusers_lora`.
-                delta, consumed = _resolve_flux2_diffusers_lora(
-                    flat_key, lora.deltas, flux2_diffusers_hidden_size
-                )
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)
-                new_flat.append((flat_key, value + delta_mapped * lora.scale))
+                merged = value + delta_mapped * lora.scale
+                new_flat.append((flat_key, merged))
+                _pending_eval.append(merged)
                 applied += consumed
+                if len(_pending_eval) >= _EVAL_CHUNK:
+                    mx.eval(_pending_eval)
+                    # mx.eval() alone materializes the chunk's results but
+                    # leaves their now-unneeded scratch buffers (e.g. the
+                    # matmul intermediates behind each delta) sitting in
+                    # MLX's own allocator cache pool rather than releasing
+                    # them to the driver -- mx.clear_cache() is what actually
+                    # returns that memory, same call clear_mlx_cache() in
+                    # bridge.py makes. Without it, chunked eval alone doesn't
+                    # lower the observed transient peak (confirmed: driver
+                    # peaks were unchanged before this was added).
+                    mx.clear_cache()
+                    _pending_eval = []
             else:
                 new_flat.append((flat_key, value))
+        if _pending_eval:
+            mx.eval(_pending_eval)
+            mx.clear_cache()
 
         new_transformer = type(transformer)(config)
         new_transformer.update(tree_unflatten(new_flat))
         mx.eval(new_transformer.parameters())
-        print(f"[ASDX] LoRA: applied {applied}/{len(lora.deltas)} deltas")
+        print(f"[ASDX] LoRA: applied {applied}/{len(lora.deltas) + len(lora.factors)} deltas")
         return new_transformer
 
     @staticmethod
@@ -948,6 +1663,8 @@ class ASDX_MultiLoraLoader(io.ComfyNode):
         clip: Any = None,
     ) -> io.NodeOutput:
         """Apply up to 5 active LoRA adapters at once (and, if connected, the CLIP)."""
+        # Diagnostic: see matching comment in ASDX_LoraLoader.execute().
+        print("[ASDX] MultiLoraLoader.execute() running (cache miss)")
         entries = [
             (lora1_enabled, lora1_name, lora1_strength_model, lora1_strength_clip),
             (lora2_enabled, lora2_name, lora2_strength_model, lora2_strength_clip),
@@ -981,6 +1698,11 @@ class ASDX_MultiLoraLoader(io.ComfyNode):
                 # transformer; chaining `transformer =` here stacks LoRAs
                 # onto that new object, never onto the cached base model.
                 transformer = ASDX_LoraLoader._apply_lora_to_transformer(transformer, lora, config)
+                # Drop the now-unneeded raw delta/factor arrays before
+                # cleanup -- see the matching comment in
+                # ASDX_LoraLoader.execute().
+                lora.deltas = {}
+                lora.factors = {}
                 # Each iteration orphans the previous intermediate
                 # transformer (up to 5 full-size copies chained here) --
                 # trim MLX's idle buffer cache between iterations instead of

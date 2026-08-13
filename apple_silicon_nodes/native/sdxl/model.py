@@ -405,7 +405,7 @@ def load_sdxl_unet(path, dtype: str = "float16") -> UNetModel:
     """
     from mlx.utils import tree_flatten, tree_unflatten
 
-    from .. import _load_safetensors
+    from .. import _load_safetensors, _check_weight_match
     from .weight_map import normalize_sdxl_keys, map_sdxl_to_native
 
     state_dict = _load_safetensors(path)
@@ -434,4 +434,5 @@ def load_sdxl_unet(path, dtype: str = "float16") -> UNetModel:
     mx.eval(unet.parameters())
 
     print(f"[ASDX] SDXL UNet: matched {matched}/{len(model_flat)} params from checkpoint")
+    _check_weight_match(matched, len(model_flat), "SDXL UNet", path)
     return unet

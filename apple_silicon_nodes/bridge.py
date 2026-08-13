@@ -723,8 +723,37 @@ def collect_mlx_memory() -> dict[str, float]:
     return {"active_gb": round(active, 2), "cache_gb": round(cached, 2), "peak_gb": round(peak, 2)}
 
 
+def _process_rss_gb() -> float | None:
+    """Current process resident set size, in GB, or None if psutil is unavailable."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _mps_allocator_gb() -> tuple[float, float] | None:
+    """Current/driver MPS allocator memory, in GB, or None if unavailable.
+
+    `current_allocated_memory` is what PyTorch's MPS allocator has handed
+    out; `driver_allocated_memory` is what the Metal driver has reserved
+    for that allocator, which can stay high even after `empty_cache()` if
+    the driver hasn't returned the underlying pages to the OS.
+    """
+    if not (hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory")):
+        return None
+    try:
+        current = torch.mps.current_allocated_memory() / (1024 ** 3)
+        driver = torch.mps.driver_allocated_memory() / (1024 ** 3)
+        return current, driver
+    except Exception:
+        return None
+
+
 def clear_mlx_cache() -> None:
     """Clear MLX constant cache and trigger GC. Call between major phases."""
+    rss_before = _process_rss_gb()
+    mps_before = _mps_allocator_gb()
     mx.clear_cache()
     gc.collect()
     # Also clear MPS cache if available
@@ -733,6 +762,16 @@ def clear_mlx_cache() -> None:
             torch.mps.empty_cache()
         except Exception:
             pass
+    rss_after = _process_rss_gb()
+    mps_after = _mps_allocator_gb()
+    if rss_before is not None and rss_after is not None:
+        print(f"[ASDX] clear_mlx_cache: process RSS {rss_before:.1f}GB -> {rss_after:.1f}GB")
+    if mps_before is not None and mps_after is not None:
+        print(
+            f"[ASDX] clear_mlx_cache: MPS allocator current "
+            f"{mps_before[0]:.1f}GB -> {mps_after[0]:.1f}GB, driver "
+            f"{mps_before[1]:.1f}GB -> {mps_after[1]:.1f}GB"
+        )
 
 
 def set_mlx_cache_limit_gb(gb: float) -> None:
