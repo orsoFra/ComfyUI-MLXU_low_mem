@@ -1084,6 +1084,18 @@ class _SamplerCore:
             sigma_t = sigmas[t]
             sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
 
+            # Update LoRA schedule. NOTE: `context` above was precomputed
+            # once via `encode_text()` for performance (see that call's own
+            # comment) -- a schedule targeting only Krea2's txtfusion
+            # sub-transformer will therefore still change `self.transformer`
+            # here, but that change won't be reflected in `context` after
+            # step 0, since it's never re-encoded.
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
+
             # ── Compute transformer output ──────────────────────────
             if teacache_state is not None:
                 current_output = self.transformer.predict(
@@ -1426,6 +1438,13 @@ class _SamplerCore:
             sigma_t = sigmas[t]
             sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
 
+            # Update LoRA schedule
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
+
             current_output = self.transformer.predict(self.noise, context, sigma_t, img_h, img_w)
             mx.eval(current_output)
 
@@ -1607,6 +1626,13 @@ class _SamplerCore:
             step_start = time.perf_counter()
             sigma_t = sigmas[t]
             sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            # Update LoRA schedule
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
 
             current_output = self.transformer.predict(
                 img=self.noise,

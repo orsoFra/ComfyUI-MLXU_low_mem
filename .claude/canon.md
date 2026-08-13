@@ -438,7 +438,7 @@ the second run since the base checkpoint was already cached), and a stable
 escalation or memory doubling.
 
 ## ASDX_LoraSchedule's per-step re-application was never wired to any sampler -- the feature never worked for any family
-kind: gotcha | date: 2026-08-13 | status: canon
+kind: gotcha | date: 2026-08-13 | status: non-canon, superseded by: the SDXL schedule fix was incomplete -- Krea2/Z-Image/Flux2 had the identical wiring gap
 Two independent, stacked bugs meant `ASDX_LoraSchedule`'s `strength_middle`/
 `strength_end`/`strength_curve` had ZERO effect in every real generation
 prior to this fix, for every model family, not just SDXL: (1) `_run_sdxl`
@@ -475,3 +475,53 @@ ABSENCE of an expected per-step log line surfaced it. Any future
 "schedule"/"per-step" feature in this codebase should get an explicit
 end-to-end smoke test (real node graph, checking for the per-step log
 line), not just unit coverage of `_update_lora_schedule` in isolation.
+
+## The SDXL schedule fix was incomplete -- Krea2/Z-Image/Flux2 had the identical wiring gap
+kind: gotcha | date: 2026-08-13 | status: canon
+The previous record's fix wired `_update_lora_schedule` into `_run_sdxl`
+and mis-stated that "the shared FLUX/Krea2/Z-Image denoise loop" already
+called it -- that was wrong. Only `run()` (FLUX.1's inline loop) had the
+call; `_run_krea2`, `_run_zimage`, and `_run_flux2` (`sampler/core.py`)
+were three MORE independent loops with the exact same missing wiring, only
+discovered because the user retested the fix across every family, not just
+SDXL: FLUX.1 and (now-fixed) SDXL showed the expected per-step
+`"[ASDX] LoRA schedule: step N/..., strength=..."` lines, but Z-Image
+showed none at all despite the node's setup line running, and Flux2's test
+was inconclusive (interrupted by an unrelated latent-shape user error
+before any step ran). Fixed by adding the identical
+`if self.lora_schedule is not None: ...` block to all three loops. Because:
+`_SamplerCore` has FIVE independent per-family sampling loops (`run()`,
+`_run_krea2`, `_run_sdxl`, `_run_zimage`, `_run_flux2`), not one shared
+loop with per-family branches -- any future cross-cutting per-step
+concern (schedule, teacache-like caching, a new profiling hook) must be
+checked/added against all five explicitly; grepping for the mechanism's
+name across the whole file (not just the first loop found) is the way to
+catch this, since a fix that "compiles and works for the family just
+tested" gives no signal about the other four.
+
+Two more findings surfaced by this same multi-family retest, neither
+fixed, both worth knowing before relying on Schedule in production:
+(1) **Krea2's precomputed text context ignores schedule changes.** Krea2's
+loop precomputes `context = self.transformer.encode_text(...)` ONCE before
+the step loop (to avoid a documented ~12s/step re-encode cost). Most real
+Krea2 LoRAs target `txtfusion` only (see "Auditing the residual LoRA
+port..." above) -- so even with the wiring fixed, a schedule on a
+txtfusion-only LoRA changes `self.transformer` every step but has NO
+visible effect after step 0, since `context` is never recomputed from the
+updated transformer. Fixing this properly means re-encoding text per step,
+which reintroduces the cost the precompute exists to avoid -- a real
+trade-off, not a quick fix, left for a future decision.
+(2) **Schedule is much more expensive on the residual families than on
+SDXL's merge path.** A real FLUX.1 run (`Emma_Watson_c9fa.safetensors`,
+494 factors, `start=1.00 middle=1.00 end=0.50`) showed step time jump from
+~3s to ~13-14s (4-5x) and peak memory rise from ~48GB (unscheduled) to
+68.7GB once `delta_scale != 0` started firing every step -- because each
+call re-runs `_apply_lora_residual_to_flux`'s full non-destructive
+clone-and-wrap traversal, not a simple in-place scale bump. SDXL's
+equivalent merge-based re-apply only cost ~0.70s->~1.05s (1.5x) over the
+same kind of window. Numerically still correct (same `_upsert_lora_factor`
+identity-based accumulation as any other residual attach), just far more
+expensive per step than the merge path for a densely-targeted LoRA -- worth
+optimizing (e.g. mutate existing `_lora_factors` scale in place instead of
+re-cloning the object graph) if Schedule + a large residual-family LoRA
+becomes a common real workflow, but not done here.
