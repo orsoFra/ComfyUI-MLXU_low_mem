@@ -525,3 +525,24 @@ expensive per step than the merge path for a densely-targeted LoRA -- worth
 optimizing (e.g. mutate existing `_lora_factors` scale in place instead of
 re-cloning the object graph) if Schedule + a large residual-family LoRA
 becomes a common real workflow, but not done here.
+
+## LoRA Schedule confirmed working on all five sampling loops via real generations
+kind: gotcha | date: 2026-08-13 | status: canon
+Closes the "never tested at all" gap the previous record left for Krea2.
+A single clean log (no errors) shows all five `_SamplerCore` loops now
+printing the correct per-step `strength` curve for `start=1.00
+middle=1.00 end=0.50`: SDXL (28 steps, decaying past step 15), FLUX.1
+(20 steps, 0.750 at step 15), Flux2/Klein (8 steps, 0.875 at step 5),
+Krea2 (8 steps, 0.875 at step 5, `lace_lingerie_krea2.safetensors`,
+27.6GB peak, 61.1s total), and Z-Image (8 steps, 0.875 at step 5) -- all
+matching the linear curve exactly, all completing without exception.
+Because: this was a real end-to-end mechanism check across every family
+`_SamplerCore` supports, the kind of test the earlier records in this
+LoRA-schedule saga repeatedly found missing. The two open, unfixed
+caveats from the previous record still stand and are untouched by this
+confirmation: Krea2's precomputed text context still won't reflect a
+txtfusion-only-targeting schedule (this specific test LoRA's coverage
+wasn't verified either way -- the log only proves the wiring/mechanism
+runs correctly, not that this particular LoRA's visual effect changes
+per step), and the residual families still pay several times SDXL's
+per-step re-apply cost once the schedule is actively changing strength.
