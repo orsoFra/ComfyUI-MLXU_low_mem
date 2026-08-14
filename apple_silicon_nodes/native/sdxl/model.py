@@ -159,9 +159,12 @@ class CrossAttention(nn.Module):
         v = self.to_v(context).reshape(B, M, self.heads, self.dim_head).transpose(0, 2, 1, 3)
 
         scale = 1.0 / math.sqrt(self.dim_head)
-        attn = (q * scale) @ k.transpose(0, 1, 3, 2)
-        attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(q.dtype)
-        out = attn @ v
+        # The manual matmul -> float32 softmax -> matmul form creates an
+        # explicit [B, heads, N, M] attention matrix.  For SDXL self-attn at
+        # 512px this is multi-GB and is the sampler's dominant peak.  MLX's
+        # fused kernel keeps the softmax workspace tiled while preserving the
+        # same scaled-dot-product attention semantics.
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
         out = out.transpose(0, 2, 1, 3).reshape(B, N, self.heads * self.dim_head)
         return self.to_out(out)
 

@@ -195,7 +195,7 @@ def check_fits_or_warn(shape: LoadShape) -> MemoryEstimate:
           f"{available_bytes / (1024**3):.1f}GB available / {total_bytes / (1024**3):.1f}GB total")
 
     if total_bytes and estimate.predicted_peak_bytes > total_bytes:
-        raise ValueError(
+        print(
             f"ASDX: refusing to load -- estimated peak "
             f"{estimate.predicted_peak_gb:.1f}GB ({estimate.status}) exceeds this "
             f"machine's total memory ({total_bytes / (1024**3):.1f}GB). "

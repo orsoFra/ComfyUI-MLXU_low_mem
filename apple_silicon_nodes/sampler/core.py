@@ -1296,6 +1296,7 @@ class _SamplerCore:
         x = self.noise * sigmas[0]
 
         mx.reset_peak_memory()
+        print("[ASDX] SDXL true CFG: sequential passes (low peak memory)")
         step_times: list[float] = []
         t_sampling_start = time.perf_counter()
 
@@ -1314,9 +1315,16 @@ class _SamplerCore:
             xc = sampling.calculate_input(sigma_t, x)
             timestep = mx.array([sampling.timestep(sigma_t)], dtype=mx.float32)
 
+            # Do not build both UNet forward graphs before evaluation: on a
+            # 16GB Mac their activation workspaces overlap and dominate the
+            # peak. The two final epsilon tensors are latent-sized; keep
+            # those, but materialize/release each large forward independently.
             eps_pos = self.transformer(xc, timestep, cond_pos, y_pos)
+            mx.eval(eps_pos)
+            mx.clear_cache()
             eps_neg = self.transformer(xc, timestep, cond_neg, y_neg)
-            mx.eval(eps_pos, eps_neg)
+            mx.eval(eps_neg)
+            mx.clear_cache()
 
             eps = eps_neg + cfg_scale * (eps_pos - eps_neg)
 
@@ -1326,8 +1334,11 @@ class _SamplerCore:
                 xc_at = sampling.calculate_input(sigma_at, x_at)
                 timestep_at = mx.array([sampling.timestep(sigma_at)], dtype=mx.float32)
                 eps_pos_at = self.transformer(xc_at, timestep_at, cond_pos, y_pos)
+                mx.eval(eps_pos_at)
+                mx.clear_cache()
                 eps_neg_at = self.transformer(xc_at, timestep_at, cond_neg, y_neg)
-                mx.eval(eps_pos_at, eps_neg_at)
+                mx.eval(eps_neg_at)
+                mx.clear_cache()
                 eps_at = eps_neg_at + cfg_scale * (eps_pos_at - eps_neg_at)
                 return sampling.calculate_denoised(sigma_at, eps_at, x_at)
 

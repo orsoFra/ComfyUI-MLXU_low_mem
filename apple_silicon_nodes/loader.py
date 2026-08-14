@@ -115,7 +115,16 @@ def clear_model_cache() -> None:
     """
     if _MODEL_CACHE:
         _MODEL_CACHE.clear()
-        bridge.clear_mlx_cache()
+
+    # ASDX_CheckpointLoader does not use `_MODEL_CACHE`: its model descriptor
+    # is retained by ComfyUI's execution-output cache instead.  Sampler
+    # low-memory mode calls this function after a run, so purge that matching
+    # cache entry too; otherwise the next generation begins with the entire
+    # MLX UNet still active despite logging "model cache evicted".
+    purged = _purge_stale_asdx_cache_entries()
+    if purged:
+        print(f"[ASDX] Purged {purged} cached ASDX checkpoint model(s)")
+    bridge.clear_mlx_cache()
 
 
 def _build_cache_key(base_key: str, extra: dict[str, str] | None = None) -> str:

@@ -94,6 +94,9 @@ class ASDX_VAEDecode(io.ComfyNode):
             inputs=[
                 io.Latent.Input("samples"),
                 io.Vae.Input("vae"),
+                io.Boolean.Input("tiled_decode", default=False, optional=True),
+                io.Int.Input("tile_size", default=512, min=64, max=4096, step=32, optional=True),
+                io.Int.Input("overlap", default=64, min=0, max=1024, step=32, optional=True),
             ],
             outputs=[
                 io.Image.Output(display_name="image"),
@@ -101,7 +104,14 @@ class ASDX_VAEDecode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, samples: dict, vae: Any) -> io.NodeOutput:
+    def execute(
+        cls,
+        samples: dict,
+        vae: Any,
+        tiled_decode: bool = False,
+        tile_size: int = 512,
+        overlap: int = 64,
+    ) -> io.NodeOutput:
         # Get latent samples
         if not isinstance(samples, dict) or "samples" not in samples:
             raise RuntimeError("ASDX VAE Decode: expected LATENT input.")
@@ -115,7 +125,11 @@ class ASDX_VAEDecode(io.ComfyNode):
         # SDXL (4ch) and Flux2 (128ch) already always used this real path.
         # Left `_decode_with_mlx_vae`/`mlx_vae.py` in place, just unreferenced
         # from here — a native MLX VAE decoder remains a separate future task.
-        return io.NodeOutput(*cls._fallback_decode(latent, vae))
+        t0 = time.perf_counter()
+        image = cls._fallback_decode(latent, vae, tiled_decode, tile_size, overlap)
+        print(f"[ASDX] VAE Decode ({'tiled' if tiled_decode else 'full'}): "
+              f"{image[0].shape}, {time.perf_counter() - t0:.2f}s")
+        return io.NodeOutput(*image)
 
     @staticmethod
     def _decode_with_mlx_vae(latent: mx.array) -> mx.array:
@@ -145,7 +159,13 @@ class ASDX_VAEDecode(io.ComfyNode):
         return latent
 
     @staticmethod
-    def _fallback_decode(latent: torch.Tensor, vae: Any) -> tuple[torch.Tensor]:
+    def _fallback_decode(
+        latent: torch.Tensor,
+        vae: Any,
+        tiled_decode: bool = False,
+        tile_size: int = 512,
+        overlap: int = 64,
+    ) -> tuple[torch.Tensor]:
         """Standard PyTorch VAE decode fallback.
 
         `latent` here is already the unwrapped tensor (`decode()` extracts
@@ -164,7 +184,13 @@ class ASDX_VAEDecode(io.ComfyNode):
         """
         if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 4:
             latent = latent.unsqueeze(2)
-        image = vae.decode(latent)
+        if tiled_decode:
+            compression = vae.spacial_compression_decode()
+            tile = max(1, tile_size // compression)
+            tile_overlap = min(tile // 4, overlap // compression)
+            image = vae.decode_tiled(latent, tile_x=tile, tile_y=tile, overlap=tile_overlap)
+        else:
+            image = vae.decode(latent)
         if image.dim() == 5:
             image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
         return (image,)

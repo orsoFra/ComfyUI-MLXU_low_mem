@@ -67,7 +67,9 @@ _DISPLAY = {
 # ── Lazy import with graceful fallback ────────────────────────────────
 _UNAVAILABLE_REASON: str | None = None
 try:
-    from .loader import NODE_LIST as _loader_nodes
+    # `loader.py` is retained as the original implementation; the active
+    # checkpoint node is the streaming SDXL replacement.
+    from .loader_streaming import NODE_LIST as _loader_nodes
     from .conditioning import NODE_LIST as _cond_nodes
     from .sampler import NODE_LIST as _sampler_nodes
     from .vae import NODE_LIST as _vae_nodes

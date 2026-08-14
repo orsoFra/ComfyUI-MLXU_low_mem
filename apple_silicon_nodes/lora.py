@@ -1194,6 +1194,10 @@ class ASDX_LoraLoader(io.ComfyNode):
                 io.Custom("asdx_model").Input("model"),
                 io.Combo.Input("lora_name", options=cls._get_loras()),
                 io.Float.Input("strength_model", default=1.0, min=-10.0, max=10.0, step=0.01),
+                io.Boolean.Input(
+                    "inplace_low_memory", default=False, optional=True,
+                    tooltip="SDXL only: merge into the loaded model to avoid a second UNet copy. Reload before changing LoRAs.",
+                ),
                 io.Custom("mlx_clip").Input("clip", optional=True),
                 io.Float.Input("strength_clip", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True),
             ],
@@ -1226,6 +1230,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         model: dict,
         lora_name: str,
         strength_model: float,
+        inplace_low_memory: bool = False,
         clip: Any = None,
         strength_clip: float = 1.0,
     ) -> io.NodeOutput:
@@ -1241,19 +1246,38 @@ class ASDX_LoraLoader(io.ComfyNode):
         lora_path = cls._resolve_lora_path(lora_name)
         _check_lora_compatibility(lora_path, model)
 
-        # Load LoRA weights (alpha comes from the file itself, see
-        # _load_lora_file -- matches real ComfyUI's LoraLoader, which has no
-        # user-facing alpha widget either).
-        lora = cls._load_lora_file(lora_path)
+        inplace_already_applied = False
+        inplace_signature = (lora_name, float(strength_model))
+        if inplace_low_memory:
+            if not isinstance(transformer, SDXLUNetModel):
+                raise RuntimeError("ASDX: inplace_low_memory is currently supported for SDXL only.")
+            prior_lora = model.get("_asdx_inplace_lora")
+            if prior_lora is not None and prior_lora not in (inplace_signature, lora_name):
+                raise RuntimeError(
+                    "ASDX: this model already has an in-place LoRA. Reload the checkpoint "
+                    "before changing the LoRA or its strength."
+                )
+            inplace_already_applied = prior_lora is not None
 
-        # Apply scale
-        lora.scale = base_lora_scale(lora.alpha, lora.rank) * strength_model
-
-        # Apply to transformer — returns a NEW transformer, the cached base
-        # model (model["transformer"]) is never mutated (see
-        # _apply_lora_to_transformer docstring).
-        new_transformer = cls._apply_lora_to_transformer(transformer, lora, model["config"])
-        new_model = {**model, "transformer": new_transformer}
+        if inplace_already_applied:
+            # ComfyUI may re-execute this node for a new prompt even though
+            # its model input is the same live object. Re-merging would stack
+            # the weights, so preserve the already-merged transformer.
+            print("[ASDX] LoRA: reusing existing in-place low-memory merge")
+            new_model = model
+            lora = None
+        else:
+            # Load LoRA weights (alpha comes from the file itself, see
+            # _load_lora_file -- matches real ComfyUI's LoraLoader, which has no
+            # user-facing alpha widget either).
+            lora = cls._load_lora_file(lora_path)
+            lora.scale = base_lora_scale(lora.alpha, lora.rank) * strength_model
+            new_transformer = cls._apply_lora_to_transformer(
+                transformer, lora, model["config"], inplace=inplace_low_memory,
+            )
+            new_model = model if inplace_low_memory else {**model, "transformer": new_transformer}
+            if inplace_low_memory:
+                new_model["_asdx_inplace_lora"] = inplace_signature
 
         # The raw delta/factor arrays are already merged into new_transformer
         # and never read again below -- `lora` otherwise stays referenced by
@@ -1267,8 +1291,9 @@ class ASDX_LoraLoader(io.ComfyNode):
         # not apply this to ASDX_LoraSchedule's `lora` -- that one is stored
         # on the model and its deltas/factors are needed again every
         # sampling step.
-        lora.deltas = {}
-        lora.factors = {}
+        if lora is not None:
+            lora.deltas = {}
+            lora.factors = {}
 
         # The old (now-orphaned) transformer's arrays are unreferenced after
         # this reassignment, but MLX's allocator won't return that memory to
@@ -1284,8 +1309,9 @@ class ASDX_LoraLoader(io.ComfyNode):
         new_clip = _apply_lora_to_clip(clip, lora_path, strength_clip)
 
         elapsed = time.perf_counter() - t0
-        print(f"[ASDX] LoRA '{lora_name}' applied: rank={lora.rank}, "
-              f"scale={lora.scale:.4f}, {elapsed:.2f}s")
+        if lora is not None:
+            print(f"[ASDX] LoRA '{lora_name}' applied: rank={lora.rank}, "
+                  f"scale={lora.scale:.4f}, {elapsed:.2f}s")
 
         return io.NodeOutput(new_model, new_clip)
 
@@ -1447,11 +1473,12 @@ class ASDX_LoraLoader(io.ComfyNode):
         transformer: Any,
         lora: LoRAAdapter,
         config: Any,
+        inplace: bool = False,
     ) -> Any:
-        """Apply LoRA delta weights to transformer parameters and return a
-        NEW transformer instance — never mutates `transformer` in place.
+        """Apply LoRA delta weights and return a transformer.
 
-        `transformer` may be the same object cached in loader.py's
+        By default, a new transformer is returned because `transformer` may
+        be the same object cached in loader.py's
         `_MODEL_CACHE` and shared across separate ComfyUI executions; an
         in-place `setattr` here would permanently bake the LoRA into that
         cached base model, so a later cache hit (e.g. re-running the same
@@ -1459,7 +1486,9 @@ class ASDX_LoraLoader(io.ComfyNode):
         re-apply the delta on top of an already-modified transformer and
         silently compound the LoRA's effect. Every sibling MLX project
         checked (mflux, SDMLX) applies LoRA non-destructively for this same
-        reason.
+        reason. ``inplace=True`` is the explicit low-memory SDXL exception:
+        it replaces each target immediately and the caller marks the model so
+        a later LoRA change requires a checkpoint reload.
 
         Untouched parameters are carried over by reference (no copy), so
         this is cheap relative to a real checkpoint reload — only the
@@ -1533,7 +1562,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         # before the next one is computed.
         _EVAL_CHUNK = 32
         _pending_eval = []
-        for flat_key, value in model_flat:
+        for index, (flat_key, value) in enumerate(model_flat):
             delta = _materialize_delta(flat_key, lora)
             if delta is None:
                 # kohya-ss (sd-scripts) flat naming -- used by essentially all SD/
@@ -1563,10 +1592,22 @@ class ASDX_LoraLoader(io.ComfyNode):
             if delta is not None:
                 delta_mapped = delta.astype(value.dtype)
                 merged = value + delta_mapped * lora.scale
-                new_flat.append((flat_key, merged))
-                _pending_eval.append(merged)
                 applied += consumed
-                if len(_pending_eval) >= _EVAL_CHUNK:
+                if inplace:
+                    # Replace the base parameter immediately. Keeping the
+                    # previous array in `model_flat` would retain a second
+                    # full SDXL model through the merge, so overwrite that
+                    # reference as well before moving to the next target.
+                    mx.eval(merged)
+                    transformer.update(tree_unflatten([(flat_key, merged)]))
+                    model_flat[index] = (flat_key, merged)
+                    del delta_mapped, merged
+                    if applied % _EVAL_CHUNK == 0:
+                        mx.clear_cache()
+                else:
+                    new_flat.append((flat_key, merged))
+                    _pending_eval.append(merged)
+                if not inplace and len(_pending_eval) >= _EVAL_CHUNK:
                     mx.eval(_pending_eval)
                     # mx.eval() alone materializes the chunk's results but
                     # leaves their now-unneeded scratch buffers (e.g. the
@@ -1579,8 +1620,13 @@ class ASDX_LoraLoader(io.ComfyNode):
                     # peaks were unchanged before this was added).
                     mx.clear_cache()
                     _pending_eval = []
-            else:
+            elif not inplace:
                 new_flat.append((flat_key, value))
+        if inplace:
+            del model_flat
+            mx.clear_cache()
+            print(f"[ASDX] LoRA: in-place low-memory merge applied {applied}/{len(lora.deltas) + len(lora.factors)} deltas")
+            return transformer
         if _pending_eval:
             mx.eval(_pending_eval)
             mx.clear_cache()
