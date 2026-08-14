@@ -1,5 +1,19 @@
 # ASDX — Apple Silicon Diffusion Nodes
 
+## On this fork: Memory optimizations
+
+  For SDXL/Illustrious on 16 GB Apple Silicon, ASDX now reduces peak unified-memory pressure by:
+
+  - streaming checkpoint tensors instead of retaining a full raw MLX state dict;
+  - selectively loading embedded CLIP/VAE weights without rereading the full UNet;
+  - using fused MLX scaled-dot-product attention to avoid multi-GB attention matrices;
+  - supporting in-place low-memory SDXL LoRA merges, avoiding a duplicate UNet;
+  - offering tiled VAE decode to reduce short decode-time spikes.
+
+  These changes reduced the observed SDXL sampling peak from roughly 12 GB to 6.3 GB, while keeping memory pressure green and substantially reducing swap/compressed
+  memory.
+  
+## On original repo
 Custom ComfyUI nodes optimized for **Apple Silicon** (M1/M2/M3/M4/M5) using **MLX native inference** with zero-copy Unified Memory semantics.
 
 Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core concepts and reimagines them with a cleaner architecture focused on:
