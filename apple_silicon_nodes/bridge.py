@@ -138,6 +138,7 @@ def _to_numpy(value: Any) -> np.ndarray:
 def conditioning_sdxl_to_mlx(
     conditioning: Any,
     precision: mx.Dtype,
+    batch_size: int = 1,
 ) -> tuple[mx.array, mx.array]:
     """Extract cross-attn context and pooled CLIP-G from SD-style Comfy conditioning.
 
@@ -149,6 +150,11 @@ def conditioning_sdxl_to_mlx(
     `comfy/sdxl_clip.py::SDXLClipModel.encode_token_weights`.
 
     Returns (cond, pooled). cond: [B, T, 2048]. pooled: [B, 1280] (CLIP-G only).
+
+    ComfyUI text encoding normally produces one conditioning row for a
+    prompt even when the latent requests several images.  Repeat that row
+    across the latent batch here; explicitly-batched conditioning must
+    already match it to avoid silently pairing prompts with the wrong image.
     """
     if isinstance(conditioning, dict):
         conditioning = conditioning.get("conditioning", conditioning)
@@ -169,8 +175,21 @@ def conditioning_sdxl_to_mlx(
         raise RuntimeError(f"ASDX: expected SDXL context [B,T,2048], got {cond_np.shape}")
     if pooled_np.ndim != 2 or pooled_np.shape[-1] != 1280:
         raise RuntimeError(f"ASDX: expected pooled CLIP-G [B,1280], got {pooled_np.shape}")
-    if cond_np.shape[0] != 1 or pooled_np.shape[0] != 1:
-        raise RuntimeError("ASDX: currently supports batch_size=1 only.")
+    if cond_np.shape[0] != pooled_np.shape[0]:
+        raise RuntimeError(
+            "ASDX: SDXL conditioning batch mismatch: "
+            f"context has {cond_np.shape[0]}, pooled output has {pooled_np.shape[0]}."
+        )
+    if batch_size < 1:
+        raise RuntimeError(f"ASDX: SDXL batch_size must be positive, got {batch_size}.")
+    if cond_np.shape[0] == 1 and batch_size > 1:
+        cond_np = np.repeat(cond_np, batch_size, axis=0)
+        pooled_np = np.repeat(pooled_np, batch_size, axis=0)
+    elif cond_np.shape[0] != batch_size:
+        raise RuntimeError(
+            "ASDX: SDXL conditioning batch must be 1 or match the latent batch: "
+            f"conditioning={cond_np.shape[0]}, latent={batch_size}."
+        )
 
     cond_mlx = mx.array(cond_np).astype(precision)
     pooled_mlx = mx.array(pooled_np).astype(precision)

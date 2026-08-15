@@ -1271,6 +1271,7 @@ class _SamplerCore:
 
         precision = self.config.mlx_dtype
         sampling = SDXLSampling()
+        batch_size = int(self.noise.shape[0])
 
         negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
         if negative is None:
@@ -1280,8 +1281,12 @@ class _SamplerCore:
                 "positive and negative ASDX_CLIPTextEncode outputs before the sampler)."
             )
 
-        cond_pos, pooled_pos = bridge.conditioning_sdxl_to_mlx(self.positive, precision)
-        cond_neg, pooled_neg = bridge.conditioning_sdxl_to_mlx(negative, precision)
+        cond_pos, pooled_pos = bridge.conditioning_sdxl_to_mlx(
+            self.positive, precision, batch_size,
+        )
+        cond_neg, pooled_neg = bridge.conditioning_sdxl_to_mlx(
+            negative, precision, batch_size,
+        )
 
         y_pos = encode_adm(pooled_pos, height=self.height, width=self.width).astype(precision)
         y_neg = encode_adm(pooled_neg, height=self.height, width=self.width).astype(precision)
@@ -1296,7 +1301,7 @@ class _SamplerCore:
         x = self.noise * sigmas[0]
 
         mx.reset_peak_memory()
-        print("[ASDX] SDXL true CFG: sequential passes (low peak memory)")
+        print(f"[ASDX] SDXL true CFG: sequential passes (low peak memory, batch={batch_size})")
         step_times: list[float] = []
         t_sampling_start = time.perf_counter()
 
@@ -1313,7 +1318,7 @@ class _SamplerCore:
                 )
 
             xc = sampling.calculate_input(sigma_t, x)
-            timestep = mx.array([sampling.timestep(sigma_t)], dtype=mx.float32)
+            timestep = mx.full((batch_size,), sampling.timestep(sigma_t), dtype=mx.float32)
 
             # Do not build both UNet forward graphs before evaluation: on a
             # 16GB Mac their activation workspaces overlap and dominate the
@@ -1332,7 +1337,7 @@ class _SamplerCore:
 
             def _model_call(x_at, sigma_at):
                 xc_at = sampling.calculate_input(sigma_at, x_at)
-                timestep_at = mx.array([sampling.timestep(sigma_at)], dtype=mx.float32)
+                timestep_at = mx.full((batch_size,), sampling.timestep(sigma_at), dtype=mx.float32)
                 eps_pos_at = self.transformer(xc_at, timestep_at, cond_pos, y_pos)
                 mx.eval(eps_pos_at)
                 mx.clear_cache()
